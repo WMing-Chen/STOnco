@@ -1,4 +1,4 @@
-# 🎯 双域自适应方案（Cancer Domain + Slide Domain）
+# 双域自适应方案（Cancer Domain + Slide Domain）
 
 ## 1. 目标
 
@@ -114,7 +114,7 @@ Total_Loss = Task_Loss
 
 ---
 
-✅ **最终效果**：
+**最终效果**：
 
 * 训练时用双域对抗（癌种 + 切片），强制模型学到跨癌种、跨批次的稳健特征。
 * 验证时既保证常规划分指标稳定，又能在 leave-one-cancer-out 测试泛化到新癌种的能力。
