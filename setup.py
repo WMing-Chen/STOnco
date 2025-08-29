@@ -10,11 +10,11 @@ setup(
     name="stride-spatial",
     version="1.0.0",
     author="STRIDE Team",
-    author_email="your-email@example.com",  # 请替换为您的实际邮箱地址
-    description="Spatial Transcriptomics Tumor Classification with Dual-Domain Adversarial Learning",
+    author_email="weimingchen2025@163.com",  # 请替换为您的实际邮箱地址
+    description="STRIDE: Spatial Transcriptomics Tumor Classification with Dual-Domain Adversarial Learning",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/YOUR_USERNAME/STRIDE",  # 请替换为您的实际GitHub用户名
+    url="https://github.com/ChenWeiMing-lab/STRIDE-spatial-transcriptomics",  # 请替换为您的实际GitHub用户名
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",

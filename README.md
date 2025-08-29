@@ -6,7 +6,7 @@
 
 STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
 
-## 🚀 Key Features
+## Key Features
 
 - **Dual-Domain Adversarial Learning**: Reduces dependency on cancer-specific signals and batch effects
 - **Multiple GNN Architectures**: Support for GATv2, GCN, and GraphSAGE models
@@ -15,7 +15,7 @@ STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classif
 - **Batch Processing**: Efficient inference on multiple samples
 - **Rich Visualization**: Comprehensive plotting and analysis tools
 
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## 🏃‍♂️ Quick Start
+## Quick Start
 
 ### 1. Data Preparation
 
@@ -79,7 +79,7 @@ python -m stride.utils.visualize_prediction \
     --output_path visualization.svg
 ```
 
-## 📊 Model Architecture
+## Model Architecture
 
 STRIDE employs a unified `STRIDE_Classifier` architecture with:
 
@@ -96,7 +96,7 @@ Total_Loss = Task_Loss + λ₁ × Cancer_Domain_Loss + λ₂ × Slide_Domain_Los
 - **Cancer Domain Adversarial**: Reduces cancer-type-specific bias
 - **Slide Domain Adversarial**: Mitigates batch effects between slides
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 STRIDE/
@@ -118,7 +118,7 @@ STRIDE/
 └── requirements.txt
 ```
 
-## 🔧 Advanced Usage
+## Advanced Usage
 
 ### Hyperparameter Optimization
 
@@ -148,7 +148,7 @@ python -m stride.utils.evaluate_models \
     --output_file evaluation_results.csv
 ```
 
-## 📈 Input Data Format
+## Input Data Format
 
 STRIDE expects NPZ files with the following structure:
 
@@ -164,33 +164,27 @@ STRIDE expects NPZ files with the following structure:
 - `coordinates`: Spatial coordinates
 - `slide_id`: Single slide identifier
 
-## 🎯 Examples
+## Examples
 
 Check out the `examples/` directory for:
 - `generate_synthetic_data.py`: Create synthetic data for testing
 - `*_gatv2.py`: GATv2-specific implementations
 - Complete end-to-end workflows
 
-## 📚 Documentation
 
-For detailed documentation, please refer to:
-- [Dual-Domain Adversarial Learning](docs/Dual-Domain_Adversarial_Learning.md)
-- [API Reference](docs/api_reference.md)
-- [Training Guide](docs/training_guide.md)
-
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 📞 Contact
+## Contact
 
 For questions and support, please open an issue on GitHub or contact the development team.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - Built with [PyTorch Geometric](https://pytorch-geometric.readthedocs.io/)
 - Inspired by advances in spatial transcriptomics analysis
