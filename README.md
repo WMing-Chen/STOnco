@@ -6,6 +6,9 @@
 
 STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
 
+<img width="1468" height="406" alt="image" src="https://github.com/user-attachments/assets/4b2f0acf-65d9-4a81-b52d-dc33e0460e36" />
+
+
 ## Key Features
 
 - **Dual-Domain Adversarial Learning**: Reduces dependency on cancer-specific signals and batch effects
