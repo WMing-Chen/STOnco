@@ -1,5 +1,4 @@
-# STRIDE: A Dual-Domain Adversarial Graph Attention Framework for Spatial Transcriptomics-Based Tumor Region Identification
-
+# STRIDE: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
