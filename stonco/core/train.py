@@ -1,6 +1,6 @@
 import argparse, os, numpy as np, torch
 from preprocessing import Preprocessor, GraphBuilder
-from models import STRIDE_Classifier, grad_reverse
+from .models import STOnco_Classifier, grad_reverse
 from utils import save_model, save_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 from torch_geometric.nn import global_mean_pool
@@ -385,7 +385,7 @@ def train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_doma
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
     """
-    model = STRIDE_Classifier(
+    model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
         use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
@@ -700,7 +700,7 @@ def run_kfold_training(args, cfg, device):
         best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
 
         # 保存最优模型及元信息
-        model = STRIDE_Classifier(
+        model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
             use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
@@ -834,7 +834,7 @@ def run_loco_training(args, cfg, device):
         best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
 
         # 保存模型与meta
-        model = STRIDE_Classifier(
+        model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
             use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,

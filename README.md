@@ -1,10 +1,13 @@
-# STRIDE: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
+# STOnco: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
+STOnco is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
+
+<img width="1468" height="406" alt="image" src="https://github.com/user-attachments/assets/4b2f0acf-65d9-4a81-b52d-dc33e0460e36" />
+
 
 ## Key Features
 
@@ -28,7 +31,7 @@ STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classif
 pip install -r requirements.txt
 ```
 
-### Install STRIDE
+### Install STOnco
 
 ```bash
 pip install -e .
@@ -39,7 +42,7 @@ pip install -e .
 ### 1. Data Preparation
 
 ```bash
-python -m stride.utils.prepare_data \
+python -m stonco.utils.prepare_data \
     --input_dir /path/to/visium/data \
     --output_dir ./processed_data \
     --gene_list_path genes.txt
@@ -48,7 +51,7 @@ python -m stride.utils.prepare_data \
 ### 2. Model Training
 
 ```bash
-python -m stride.core.train \
+python -m stonco.core.train \
     --train_data ./processed_data/train_data.npz \
     --val_dir ./processed_data/val_npz \
     --artifacts_dir ./artifacts \
@@ -59,13 +62,13 @@ python -m stride.core.train \
 
 ```bash
 # Single sample inference
-python -m stride.core.infer \
+python -m stonco.core.infer \
     --model_path ./artifacts/model.pt \
     --input_data sample.npz \
     --output_path predictions.csv
 
 # Batch inference
-python -m stride.core.batch_infer \
+python -m stonco.core.batch_infer \
     --model_path ./artifacts/model.pt \
     --input_dir ./test_samples \
     --output_dir ./predictions
@@ -74,14 +77,14 @@ python -m stride.core.batch_infer \
 ### 4. Visualization
 
 ```bash
-python -m stride.utils.visualize_prediction \
+python -m stonco.utils.visualize_prediction \
     --prediction_file predictions.csv \
     --output_path visualization.svg
 ```
 
 ## Model Architecture
 
-STRIDE employs a unified `STRIDE_Classifier` architecture with:
+STOnco employs a unified `STOnco_Classifier` architecture with:
 
 - **GNN Backbone**: Configurable graph neural network (GATv2/GCN/GraphSAGE)
 - **Task Head**: Binary classification for tumor/non-tumor prediction
@@ -99,8 +102,8 @@ Total_Loss = Task_Loss + λ₁ × Cancer_Domain_Loss + λ₂ × Slide_Domain_Los
 ## Project Structure
 
 ```
-STRIDE/
-├── stride/
+STOnco/
+├── stonco/
 │   ├── core/                 # Core training and inference modules
 │   │   ├── models.py         # Model architectures
 │   │   ├── train.py          # Training script
@@ -123,7 +126,7 @@ STRIDE/
 ### Hyperparameter Optimization
 
 ```bash
-python -m stride.core.train_hpo \
+python -m stonco.core.train_hpo \
     --train_data train_data.npz \
     --val_dir val_npz \
     --artifacts_dir ./hpo_results \

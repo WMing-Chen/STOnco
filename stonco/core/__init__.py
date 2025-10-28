@@ -1,4 +1,4 @@
-"""Core modules for STRIDE framework
+"""Core modules for STOnco framework
 
 This package contains the core functionality including:
 - Model definitions and architectures

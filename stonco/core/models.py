@@ -102,15 +102,20 @@ class DomainHead(nn.Module):
     def forward(self, h):
         return self.net(h)
 
-class STRIDE_Classifier(nn.Module):
+class STOnco_Classifier(nn.Module):
     """
-    合并后的大模型：包含 GNNBackbone + ClassifierHead，并可选集成 DomainHead（支持双域：癌种与切片）。
-    - 提供向后兼容的属性：.gnn, .clf, .dom（保留但不再使用，仅为兼容）
-    - forward 返回 dict：
-      {'logits': logits, 'h': h, 
-       'dom_logits_slide': dom_logits_slide 或 None,
-       'dom_logits_cancer': dom_logits_cancer 或 None,
-       'dom_logits': dom_logits_slide（兼容旧键）}
+    Unified STOnco Classifier with optional dual-domain adversarial learning.
+    
+    This is a merged model that contains:
+    - GNNBackbone: The main GNN encoder
+    - ClassifierHead: For tumor/non-tumor classification
+    - DomainHead (optional): For dual-domain adversarial learning
+    
+    Args:
+        backbone_config: Configuration for the GNN backbone
+        classifier_config: Configuration for the classifier head
+        domain_config: Configuration for domain heads (optional)
+        use_domain_adaptation: Whether to enable domain adaptation
     """
     def __init__(self, in_dim, hidden=128, num_layers=3, dropout=0.3, model='gatv2', heads=4,
                  use_domain_adv=False, n_domains=None, domain_hidden=64,
@@ -147,3 +152,7 @@ class STRIDE_Classifier(nn.Module):
                 dom_logits_cancer = self.dom_cancer(grad_reverse(pooled, lambda_cancer))
         # 保持旧键兼容：dom_logits 指向 slide 的输出
         return {'logits': logits, 'h': h, 'dom_logits_slide': dom_logits_slide, 'dom_logits_cancer': dom_logits_cancer, 'dom_logits': dom_logits_slide}
+
+
+# Backward compatibility alias
+STRIDE_Classifier = STOnco_Classifier

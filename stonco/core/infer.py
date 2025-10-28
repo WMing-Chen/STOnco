@@ -1,7 +1,7 @@
 import argparse, os, numpy as np, torch
 from preprocessing import Preprocessor, GraphBuilder
 from utils import load_json, load_model_state_dict
-from models import STRIDE_Classifier
+from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData
 import pandas as pd
 
@@ -38,7 +38,7 @@ class InferenceEngine:
 
     def build_model_if_needed(self, in_dim: int):
         if self.model is None:
-            m = STRIDE_Classifier(
+            m = STOnco_Classifier(
                 in_dim=in_dim,
                 hidden=self.cfg['hidden'],
                 num_layers=self.cfg['num_layers'],

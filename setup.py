@@ -7,14 +7,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
-    name="stride-spatial",
-    version="1.0.0",
-    author="STRIDE Team",
-    author_email="weimingchen2025@163.com",  # 请替换为您的实际邮箱地址
-    description="STRIDE: Spatial Transcriptomics Tumor Classification with Dual-Domain Adversarial Learning",
+    name="stonco-spatial",
+    version="0.1.0",
+    author="STOnco Team",
+    author_email="",
+    description="STOnco: Spatial Transcriptomics Oncology Analysis with Graph Neural Networks",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/ChenWeiMing-lab/STRIDE-spatial-transcriptomics",  # 请替换为您的实际GitHub用户名
+    url="https://github.com/WMing-Chen/STOnco/",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -46,9 +46,9 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "stride-train=stride.core.train:main",
-            "stride-infer=stride.core.infer:main",
-            "stride-prepare=stride.utils.prepare_data:main",
+            "stonco-train=stonco.core.train:main",
+            "stonco-infer=stonco.core.infer:main",
+            "stonco-prepare=stonco.utils.prepare_data:main",
         ],
     },
     include_package_data=True,

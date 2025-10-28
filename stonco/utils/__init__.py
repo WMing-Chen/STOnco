@@ -1,4 +1,4 @@
-"""Utility modules for STRIDE framework
+"""Utility modules for STOnco framework
 
 This package contains utility functions and tools including:
 - Data preparation and preprocessing

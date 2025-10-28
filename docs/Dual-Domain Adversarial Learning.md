@@ -1,4 +1,8 @@
-# 双域自适应方案（Cancer Domain + Slide Domain）
+# Dual-Domain Adversarial Learning for STOnco
+
+This document describes the dual-domain adversarial learning approach implemented in the STOnco_Classifier model.
+
+## 双域自适应方案（Cancer Domain + Slide Domain）
 
 ## 1. 目标
 
@@ -26,7 +30,7 @@
 
 ## 3. 模型结构
 
-基于你已有的 `STRIDE_Classifier`，扩展为 **双域对抗**：
+基于你已有的 `STOnco_Classifier`，扩展为 **双域对抗**：
 
 ```
                ┌──────────────┐
