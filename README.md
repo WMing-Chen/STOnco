@@ -1,9 +1,9 @@
-# STRIDE: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
+# STOnco: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
+STOnco is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
 
 <img width="1468" height="406" alt="image" src="https://github.com/user-attachments/assets/4b2f0acf-65d9-4a81-b52d-dc33e0460e36" />
 
@@ -30,7 +30,7 @@ STRIDE is a PyTorch Geometric-based framework for tumor/non-tumor binary classif
 pip install -r requirements.txt
 ```
 
-### Install STRIDE
+### Install STOnco
 
 ```bash
 pip install -e .
@@ -83,7 +83,7 @@ python -m stride.utils.visualize_prediction \
 
 ## Model Architecture
 
-STRIDE employs a unified `STRIDE_Classifier` architecture with:
+STOnco employs a unified `STRIDE_Classifier` architecture with:
 
 - **GNN Backbone**: Configurable graph neural network (GATv2/GCN/GraphSAGE)
 - **Task Head**: Binary classification for tumor/non-tumor prediction
@@ -152,7 +152,7 @@ python -m stride.utils.evaluate_models \
 
 ## Input Data Format
 
-STRIDE expects NPZ files with the following structure:
+STOnco expects NPZ files with the following structure:
 
 **Training NPZ:**
 - `features`: Gene expression matrix (n_spots × n_genes)
