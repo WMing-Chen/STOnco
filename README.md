@@ -136,7 +136,7 @@ python -m stonco.core.train_hpo \
 ### Cross-Cancer Evaluation (LOCO)
 
 ```bash
-python -m stride.core.train \
+python -m stonco.core.train \
     --train_data train_data.npz \
     --val_dir val_npz \
     --artifacts_dir ./loco_results \
@@ -146,14 +146,14 @@ python -m stride.core.train \
 ### Model Evaluation
 
 ```bash
-python -m stride.utils.evaluate_models \
+python -m stonco.utils.evaluate_models \
     --predictions_dir ./predictions \
     --output_file evaluation_results.csv
 ```
 
 ## Input Data Format
 
-STRIDE expects NPZ files with the following structure:
+STOnco expects NPZ files with the following structure:
 
 **Training NPZ:**
 - `features`: Gene expression matrix (n_spots × n_genes)

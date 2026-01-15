@@ -168,6 +168,9 @@ test_artifacts/
 synthetic_test/artifacts*/
 synthetic_test/tuning/
 
+# Claude Code configuration
+CLAUDE.md
+
 # 配置文件（如果包含敏感信息）
 config.yaml
 config.json
