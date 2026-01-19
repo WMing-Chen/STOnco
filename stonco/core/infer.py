@@ -1,6 +1,6 @@
 import argparse, os, numpy as np, torch
-from preprocessing import Preprocessor, GraphBuilder
-from utils import load_json, load_model_state_dict
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.utils import load_json, load_model_state_dict
 from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData
 import pandas as pd
@@ -126,7 +126,7 @@ class InferenceEngine:
         return attr_gene
 
 def assemble_pyg(Xp, xy, cfg):
-    from preprocessing import GraphBuilder
+    from stonco.utils.preprocessing import GraphBuilder
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, mean_nd = gb.build_knn(xy)
     # lapPE（可选：使用高斯权重并控制是否拼接）

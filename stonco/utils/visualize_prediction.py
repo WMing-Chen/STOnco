@@ -31,9 +31,9 @@ from torch_geometric.data import Data as PyGData
 # 新增：读取验证集坐标与标签
 import pandas as pd
 
-from preprocessing import Preprocessor, GraphBuilder
-from models import STRIDE_Classifier
-from utils import load_model_state_dict, load_json
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.core.models import STOnco_Classifier
+from stonco.utils.utils import load_model_state_dict, load_json
 
 
 def assemble_pyg(Xp, xy, cfg):
@@ -221,7 +221,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
     # 构建与加载模型（统一使用 SpotoncoGNNClassifier）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     in_dim = data_g.x.shape[1]
-    model = STRIDE_Classifier(
+    model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'],
         num_layers=cfg['num_layers'],

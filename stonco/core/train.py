@@ -1,7 +1,7 @@
 import argparse, os, numpy as np, torch
-from preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder
 from .models import STOnco_Classifier, grad_reverse
-from utils import save_model, save_json
+from stonco.utils.utils import save_model, save_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 from torch_geometric.nn import global_mean_pool
 import torch.nn.functional as F
@@ -97,7 +97,7 @@ def _k_random_combinations(present_ids, k, rng):
 # ---------------------------------------------------------------------------
 
 def assemble_pyg(Xp, xy, y, cfg):
-    from preprocessing import GraphBuilder
+    from stonco.utils.preprocessing import GraphBuilder
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, mean_nd = gb.build_knn(xy)
     # 计算PE（可选使用高斯距离权重）
@@ -473,7 +473,7 @@ def run_single_training(args, cfg, device):
     best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
 
     # 保存最优模型
-    model = STRIDE_Classifier(
+    model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
         use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,

@@ -1,9 +1,9 @@
 from .train import prepare_graphs, train_and_validate
 
 import argparse, os, numpy as np, torch
-from preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder
 from .models import STOnco_Classifier, grad_reverse
-from utils import save_model, save_json
+from stonco.utils.utils import save_model, save_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 from torch_geometric.nn import global_mean_pool
 import torch.nn.functional as F

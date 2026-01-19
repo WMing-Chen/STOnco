@@ -4,13 +4,13 @@ import glob
 import numpy as np
 import torch
 import pandas as pd
-from preprocessing import Preprocessor, GraphBuilder
-from utils import load_model_state_dict, load_json
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.utils import load_model_state_dict, load_json
 from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
-from plot_accuracy_bars import plot_accuracy_bars
+from stonco.utils.plot_accuracy_bars import plot_accuracy_bars
 # 新增：导入推理引擎
-from infer import InferenceEngine
+from stonco.core.infer import InferenceEngine
 
 
 def assemble_pyg(Xp: np.ndarray, xy: np.ndarray, cfg: dict) -> PyGData:
