@@ -535,7 +535,7 @@ def main():
     
     # 现有可选参数
     parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--early_patience', type=int, default=None)
+    parser.add_argument('--early_patience', type=int, default=None, help='早停耐心值，<=0 表示关闭早停')
     parser.add_argument('--batch_size_graphs', type=int, default=None)
     parser.add_argument('--disable_domain_adv', action='store_true', help='关闭域自适应（DomainAdversarial）训练')
     parser.add_argument('--model', choices=['gatv2', 'sage', 'gcn'], default=None, help='选择GNN主干')
@@ -688,5 +688,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 

@@ -1,6 +1,6 @@
 # STOnco: Visium 空间转录组 GNN 分类与域自适应
 
-本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）与可选的双域对抗（癌种域 + 切片域）。
+本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）与可选的双域对抗（癌种域 + 批次域）。
 
 ---
 
@@ -8,7 +8,7 @@
 
 - prepare_data.py：从 CSV（exp + coordinates）构建训练/单样本/验证 NPZ
 - preprocessing.py：预处理器与图构建（HVG 选择、标准化、可选 PCA，KNN 图 + 高斯边权，LapPE）
-- models.py：STRIDE_Classifier（GNN 主干 + 分类头 + 可选双域对抗头）
+- models.py：STOnco_Classifier（GNN 主干 + 分类头 + 可选双域对抗头）
 - train.py：训练与验证（单次、癌种分层、k-fold 按癌种、LOCO 留一癌种评估）
 - train_hpo.py：三阶段 HPO 流水线（含多种子复评/重打分）
 - infer.py：单切片 NPZ 推理（输出预测 CSV；可选保存基因重要性 CSV）
@@ -17,6 +17,29 @@
 - Dual-Domain Adversarial Learning.md：双域自适应设计说明
 - utils.py：模型与元信息存取
 - synthetic_data/：示例合成/模拟数据（可选）
+
+---
+
+## 1.1 核心模块与关键函数速览
+
+- `stonco/utils/prepare_data.py`
+  - `_read_expression`：读取 `*_exp.csv`，校验 Barcode 列并将基因表达转为数值矩阵。
+  - `_read_coords`：读取 `*_coordinates.csv`，解析坐标与标签列（数值/字符标签均可）。
+  - `build_train_npz`：遍历训练目录，统一基因集合并生成 `train_data.npz`。
+  - `build_single_npz`：将单张切片 CSV 生成独立 NPZ（含 `sample_id`）。
+  - `build_val_npz`：为验证目录下每个切片生成独立 NPZ。
+- `stonco/utils/preprocessing.py`
+  - `Preprocessor.fit/transform`：HVG 选择、标准化、可选 PCA。
+  - `GraphBuilder.build_knn`：基于坐标构建 KNN 图与高斯边权。
+  - `GraphBuilder.lap_pe`：生成 Laplacian 位置编码并可拼接到节点特征。
+- `stonco/core/train.py`
+  - `prepare_graphs`：加载训练 NPZ，构图并进行癌种分层/划分。
+  - `train_and_validate`：核心训练循环，支持双域对抗与指标评估。
+  - `run_single_training` / `run_kfold_training` / `run_loco_training`：三种训练模式入口。
+- `stonco/core/infer.py`
+  - `InferenceEngine`：封装预处理、构图、预测与基因重要性计算。
+- `stonco/core/batch_infer.py`
+  - `SlideNPZDataset`：批量加载 NPZ 并在 DataLoader 中并行预处理。
 
 ---
 
@@ -50,30 +73,31 @@ PRED_CSV=/path/to/preds.csv
 
 # 1) 数据准备
 # 1.1 训练集（多切片）NPZ
-python STRIDE/prepare_data.py build-train-npz \
+python -m stonco.utils.prepare_data build-train-npz \
   --train_dir $DATA_ROOT/ST_train_datasets \
   --out_npz $DATA_ROOT/train_data.npz \
   --xy_cols row col \
   --label_col true_label
 
 # 1.2 验证集目录转为一组单切片 NPZ
-python STRIDE/prepare_data.py build-val-npz \
+python -m stonco.utils.prepare_data build-val-npz \
   --val_dir $DATA_ROOT/ST_validation_datasets \
   --out_dir $VAL_NPZ_DIR \
   --xy_cols row col \
   --label_col true_label
 
 # 2) 训练（双域对抗：默认启用；未显式给出 lambda_* 时回退到 0.3）
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz $DATA_ROOT/train_data.npz \
   --artifacts_dir $ARTIFACTS \
   --use_domain_adv_slide 1 --use_domain_adv_cancer 1 \
-  --epochs 80 --early_patience 20 --batch_size_graphs 2
+  --epochs 80 --early_patience 20 --batch_size_graphs 2 \
+  --save_loss_components 1
 
 # 3) 单切片推理（对验证集中的任意一张）
 # 先任选一个 NPZ（例如第一张）
 SAMPLE_NPZ=$(ls $VAL_NPZ_DIR/*.npz | head -n 1)
-python STRIDE/infer.py \
+python -m stonco.core.infer \
   --npz "$SAMPLE_NPZ" \
   --artifacts_dir $ARTIFACTS \
   --out_csv $PRED_CSV \
@@ -81,22 +105,22 @@ python STRIDE/infer.py \
 # 将在与 out_csv 同目录生成 per_slide_gene_saliency_{...}.csv（默认解释开启）
 
 # 4) 批量推理（对整个验证集目录）
-python STRIDE/batch_infer.py \
+python -m stonco.core.batch_infer \
   --npz_glob "$VAL_NPZ_DIR/*.npz" \
   --artifacts_dir $ARTIFACTS \
   --out_csv ${PRED_CSV%.*}_batch.csv \
   --threshold 0.5 --num_threads 4 --num_workers 0
-# 将在 out_csv 同目录下创建 gene_attr/ 并为每张切片保存 per_slide_gene_saliency_{sample_id}.csv
+# 将在 out_csv 同目录下创建 gene_attr/ 并为每张切片保存 per_slide_gene_saliency_{sample_id}.npz 与 .csv
 
 # 5) 可视化（单张或批量）
 # 5.1 单张：若单 NPZ 含 y，可直接绘图并显示准确率
-python STRIDE/visualize_prediction.py \
+python -m stonco.utils.visualize_prediction \
   --npz "$SAMPLE_NPZ" \
   --artifacts_dir $ARTIFACTS \
   --out_svg ${PRED_CSV%.*}_vis.svg
 
 # 5.2 使用训练 NPZ 的最后一张（常作为验证）进行可视化
-python STRIDE/visualize_prediction.py \
+python -m stonco.utils.visualize_prediction \
   --train_npz $DATA_ROOT/train_data.npz \
   --artifacts_dir $ARTIFACTS \
   --slide_idx -1 \
@@ -107,11 +131,13 @@ python STRIDE/visualize_prediction.py \
 - prepare_data：`--xy_cols row col`、`--label_col true_label` 为默认；build-single-npz 若不传 `--sample_id`，将用坐标文件上一级目录名。
 - 训练（train.py）：
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
-  - 双域对抗：旧总开关为 `--disable_domain_adv`（不传则启用对抗）；细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制。
+  - 双域对抗：细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制；默认两者均启用（slide 对应 batch 域）。
   - 损失权重：未显式给出 `--lambda_slide/--lambda_cancer` 时回退到 `domain_lambda=0.3`。
+  - 外部验证：`--val_sample_dir` 指定外部验证 NPZ 目录（单切片），验证指标会合并计算。
+  - Loss 组件：`--save_loss_components 1`（默认开启）会保存 `loss_components.csv` 到 artifacts_dir。
   - 解释性：默认开启，`--explain_method ig`，`--ig_steps 50`；训练结束会保存 `per_gene_saliency.csv` 到 artifacts_dir。
 - 推理（infer.py/batch_infer.py）：
-  - 解释性：默认开启，仅保存 CSV（`gene, attr`）；单张通过 `--gene_attr_out` 指定路径；批量用 `--gene_attr_out_dir` 指定目录（默认为 `out_csv` 同目录下的 `gene_attr/`）。
+  - 解释性：默认开启；单张保存 CSV（`gene, attr`），可用 `--gene_attr_out` 指定路径；批量保存每张切片的 `.npz` 与 `.csv`，用 `--gene_attr_out_dir` 指定目录（默认为 `out_csv` 同目录下的 `gene_attr/`）。
   - 阈值：`--threshold 0.5`；输出 CSV 包含 `p_tumor` 与 `pred_label`（批量）。
 - 可视化：从 `artifacts_dir/meta.json` 读取 cfg 保证图构建一致；`--threshold` 默认 0.5。
 
@@ -146,14 +172,14 @@ python STRIDE/visualize_prediction.py \
 ## 4. 数据准备（prepare_data.py）
 
 具体命令：
-python prepare_data.py build-train-npz --train_dir data/data_SC_3331genes/ST_train_datasets  --out_npz data/data_SC_3331genes/train_data.npz 
-python prepare_data.py build-val-npz --val_dir data/data_SC_3331genes/ST_validation_datasets --out_dir data/data_SC_3331genes/val_npz/
+python -m stonco.utils.prepare_data build-train-npz --train_dir data/data_SC_3331genes/ST_train_datasets --out_npz data/data_SC_3331genes/train_data.npz
+python -m stonco.utils.prepare_data build-val-npz --val_dir data/data_SC_3331genes/ST_validation_datasets --out_dir data/data_SC_3331genes/val_npz/
 
 常用子命令：
 
 - 扫描训练目录构建多切片训练集 NPZ：
 ```bash
-python STRIDE/prepare_data.py build-train-npz \
+python -m stonco.utils.prepare_data build-train-npz \
   --train_dir /path/to/train_slides \
   --out_npz /path/to/train_data.npz \
   --xy_cols row col \
@@ -162,7 +188,7 @@ python STRIDE/prepare_data.py build-train-npz \
 
 - 由一对 CSV 构建单样本 NPZ（可用于推理或验证单张）：
 ```bash
-python STRIDE/prepare_data.py build-single-npz \
+python -m stonco.utils.prepare_data build-single-npz \
   --exp_csv /path/slide_exp.csv \
   --coord_csv /path/slide_coordinates.csv \
   --out_npz /path/slide.npz \
@@ -173,7 +199,7 @@ python STRIDE/prepare_data.py build-single-npz \
 
 - 为验证集目录中的每张切片各自生成一个 NPZ：
 ```bash
-python STRIDE/prepare_data.py build-val-npz \
+python -m stonco.utils.prepare_data build-val-npz \
   --val_dir /path/to/val_slides \
   --out_dir /path/to/val_npz_dir \
   --xy_cols row col \
@@ -268,9 +294,10 @@ python STRIDE/prepare_data.py build-val-npz \
 
 最小示例：
 ```bash
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
+  --val_sample_dir /path/to/val_npz_dir \
   --epochs 100 \
   --early_patience 30 \
   --batch_size_graphs 2
@@ -288,33 +315,33 @@ python STRIDE/train.py \
   - --hidden，--num_layers，--dropout
   - LapPE：--lap_pe_dim（>0 启用，默认 16）、--concat_lap_pe {0,1}、--lap_pe_use_gaussian {0,1}
 - 预处理：
-  - --use_pca {0,1}（可选 PCA；当前版本默认关闭）
+  - --use_pca {0,1}（可选 PCA；默认关闭）
   - --n_hvg N 或 'all'（默认 'all' 表示使用所有基因）
 - 优化器：--lr，--weight_decay
 - 域自适应（双域，对抗式）：
-  - 旧总开关：--disable_domain_adv（关闭域对抗；否则默认启用）
-  - 新细粒度：--use_domain_adv_slide {0,1}，--use_domain_adv_cancer {0,1}
-  - 损失权重：--lambda_slide，--lambda_cancer（未指定时回退到 domain_lambda=0.3）
+  - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
+  - 损失权重：--lambda_slide（batch 域），--lambda_cancer（未指定时回退到 domain_lambda=0.3）
 - 划分/验证：
   - --stratify_by_cancer 按癌种分层（每癌种随机 1 张验证）
   - --kfold_cancer K 基于癌种的 K 组组合评估，产物位于 artifacts_dir 的同级目录 kfold_val/fold_{i}/，并写出 kfold_val/kfold_summary.csv
   - --leave_one_cancer_out LOCO 留一癌种评估（每个癌种单独训练与验证）；产物位于 artifacts_dir 的父目录下 loco_eval/{CancerType}/
   - --split_seed 随机种子；--split_test_only 仅打印划分统计不训练
 - 其他：
-  - --out_csv 验证集预测 CSV（未指定时默认写到 artifacts_dir 同级 predictions/val_preds.csv）
   - --config_json 从 JSON 加载一组超参（支持扁平或 {"cfg": {...}} 格式）
-  - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于最佳模型对验证图计算整体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
+  - --val_sample_dir 外部验证 NPZ 目录（单切片），验证指标与内部验证合并计算
+  - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
+  - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于最佳模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
 - 模型：model.pt；元信息：meta.json（含 cfg 与 best_epoch）
-- 可视化：train_metrics.svg（1×3：Loss / AUROC / AUPRC）
+- 可视化：train_loss.svg（2×3：avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy），train_val_metrics.svg（2×2：val_accuracy/val_macro_f1/val_auroc/val_auprc）
+- Loss 组件：loss_components.csv（avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy/val_*）
 
 ### 5.1 产物路径与内容补充
 
 - 单次训练（默认模式）：
   - 模型与预处理均保存到指定的 artifacts_dir；meta.json 中的 `cfg` 为实际训练用到的完整配置，可被推理脚本复用。
-  - 若提供 --out_csv，则会将验证集（或最后一张切片）在相同预处理/图构建设置下的预测结果写出到该路径；未显式提供时，默认写到 artifacts_dir 的同级目录 `predictions/val_preds.csv`（会自动创建目录）。
 - 按癌种 KFold（--kfold_cancer）：
   - 统一在 artifacts_dir 的同级目录创建 `kfold_val/`；每一折的产物位于 `kfold_val/fold_{i}/`：
     - 预处理器产物（与单次训练一致）
@@ -324,17 +351,14 @@ python STRIDE/train.py \
   - 在 artifacts_dir 的父目录创建 `loco_eval/`，并为每个癌种建立子目录 `loco_eval/{CancerType}/`，内部包含最优 `model.pt`、`meta.json` 与该癌种的划分信息。
   - 汇总表：`loco_eval/loco_summary.csv`，字段与 KFold 类似（含 per-cancer 的最佳指标与样本统计）。
 
-> 详细实现参见 <mcfile name="train.py" path="/root/Project/Spotonco/train.py"></mcfile>
+> 详细实现参见 `stonco/core/train.py`
 
 ### 5.2 常见命令行示例：双域、KFold、LOCO
 
-- 双域对抗（癌种域 + 切片域）的典型组合：
-常用（双域）：
-python train.py --train_npz data/data_SC_3331genes/train_data.npz --artifacts_dir test_train0822_SC3331genes/artifacts_dir/ --use_domain_adv_slide 1 --use_domain_adv_cancer 1
-
+- 双域对抗（癌种域 + 批次域）的典型组合：
 ```bash
-# 仅切片域对抗（Slide-only），常用：lambda_slide=0.3
-python STRIDE/train.py \
+# 仅批次域对抗（Batch-only），常用：lambda_slide=0.3
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts_slide_only \
   --use_domain_adv_slide 1 --use_domain_adv_cancer 0 \
@@ -344,7 +368,7 @@ python STRIDE/train.py \
   --device cuda
 
 # 仅癌种域对抗（Cancer-only），常用：lambda_cancer=0.3
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts_cancer_only \
   --use_domain_adv_slide 0 --use_domain_adv_cancer 1 \
@@ -353,8 +377,8 @@ python STRIDE/train.py \
   --model gatv2 --heads 4 --hidden 128 --num_layers 3 --dropout 0.3 \
   --device cuda
 
-# 双域同时启用（Dual），示例：slide 0.2 + cancer 0.1
-python STRIDE/train.py \
+# 双域同时启用（Dual），示例：batch 0.2 + cancer 0.1
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts_dual \
   --use_domain_adv_slide 1 --use_domain_adv_cancer 1 \
@@ -370,24 +394,36 @@ python STRIDE/train.py \
 
 ```bash
 # 训练并保存每折产物到 artifacts_dir 的同级目录 kfold_val/
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
   --kfold_cancer 5 --split_seed 42 \
   --epochs 60 --early_patience 20 --num_workers 10 --device cuda
 
 # 仅查看划分，不训练
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
   --kfold_cancer 5 --split_seed 42 --split_test_only
 ```
 产物：`../kfold_val/fold_{i}/` 模型与预处理，和 `../kfold_val/kfold_summary.csv` 汇总。
 
+KFold 推理循环示例（对每一折分别批量推理）：
+```bash
+# 一次跑所有fold（示例：fold_1..fold_10）
+for i in {1..10}; do
+  python -m stonco.core.batch_infer \
+    --npz_glob '/path/to/val_npz/*.npz' \
+    --artifacts_dir "/path/to/kfold_val/fold_${i}/" \
+    --out_csv "/path/to/kfold_val/fold_${i}/batch_preds.csv" \
+    --num_threads 4 --num_workers 0
+done
+```
+
 - LOCO 留一癌种评估（逐癌种训练/验证）：
 
 ```bash
-python STRIDE/train.py \
+python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
   --leave_one_cancer_out \
@@ -399,7 +435,7 @@ python STRIDE/train.py \
 
 ## 6. 多阶段超参数优化（train_hpo.py）
 
-HPO 已独立到 <mcfile name="train_hpo.py" path="/root/Project/Spotonco/train_hpo.py"></mcfile>，提供统一三阶段流水线与可选多种子复评：
+HPO 已独立到 `stonco/core/train_hpo.py`，提供统一三阶段流水线与可选多种子复评：
 - 阶段：stage1（优化训练稳定性/学习率等）→ stage2（结构/正则）→ stage3（位置编码）
 - 复评（重打分）：对指定阶段 Top-K 以多随机种子复训，按 mean_accuracy 重排
 - 产物：按阶段保存 trial 结果，最终合并最优配置为 tuning/best_config.json
@@ -415,7 +451,7 @@ HPO 已独立到 <mcfile name="train_hpo.py" path="/root/Project/Spotonco/train_
 示例：
 ```bash
 # 全流程 + 复评（示例）
-python STRIDE/train_hpo.py \
+python -m stonco.core.train_hpo \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
   --tune all \
@@ -426,7 +462,7 @@ python STRIDE/train_hpo.py \
   --epochs 100 --early_patience 30 --num_workers 10 --device cuda
 
 # 仅搜索 stage2
-python STRIDE/train_hpo.py \
+python -m stonco.core.train_hpo \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts \
   --tune stage2 \
@@ -434,7 +470,7 @@ python STRIDE/train_hpo.py \
   --device cuda
 ```
 
-更多细节：<mcfile name="hyperparameter_optimization_plan.md" path="/root/Project/Spotonco/hyperparameter_optimization_plan.md"></mcfile> <mcfile name="train_hpo_refactor_plan.md" path="/root/Project/Spotonco/train_hpo_refactor_plan.md"></mcfile>
+更多细节：`docs/hyperparameter_optimization_plan.md` 与 `docs/train_hpo_refactor_plan.md`
 
 ---
 
@@ -442,7 +478,7 @@ python STRIDE/train_hpo.py \
 
 单切片推理（infer.py）：
 ```bash
-python STRIDE/infer.py \
+python -m stonco.core.infer \
   --npz /path/to/slide.npz \
   --artifacts_dir /path/to/artifacts \
   --out_csv /path/to/preds.csv \
@@ -457,11 +493,11 @@ python STRIDE/infer.py \
   - `--explain_saliency` 默认开启；`--no_explain` 关闭解释性计算
   - `--explain_method {ig,saliency}`（默认 ig），`--ig_steps`（默认 50）
   - `--gene_attr_out` 指定保存路径；未指定时默认与 `out_csv` 同目录，命名为 `per_slide_gene_saliency_{single|idxK}.csv`
-  - 输出仅保存 CSV（两列：`gene, attr`），不再生成 NPZ
+  - 输出保存 CSV（两列：`gene, attr`）
 
 批量推理（batch_infer.py）：
 ```bash
-python STRIDE/batch_infer.py \
+python -m stonco.core.batch_infer \
   --npz_glob '/path/to/infer_*.npz' \
   --artifacts_dir /path/to/artifacts \
   --out_csv /path/to/batch_preds.csv \
@@ -483,10 +519,10 @@ python STRIDE/batch_infer.py \
   - `--explain_saliency` 默认开启；`--no_explain` 关闭
   - `--explain_method {ig,saliency}`，`--ig_steps`（默认 50）
   - `--gene_attr_out_dir` 指定输出目录（未指定时默认写到 `out_csv` 同目录下的 `gene_attr/`）
-  - 每张切片保存一份 `per_slide_gene_saliency_{sample_id|文件名}.csv`（两列：`gene, attr`），仅 CSV
+  - 每张切片保存一份 `per_slide_gene_saliency_{sample_id|文件名}.npz` 与 `.csv`（两列：`gene, attr`）
 - 可视化：默认会自动生成“各切片准确率柱状图”（png），关闭请加 `--no_plot`；输出路径可用 `--plot_out` 自定义，标题可用 `--model_name` 指定（默认从 cfg.model 推断）。
 
-> 详细实现参见 <mcfile name="infer.py" path="/root/Project/Spotonco/infer.py"></mcfile> 与 <mcfile name="batch_infer.py" path="/root/Project/Spotonco/batch_infer.py"></mcfile>
+> 详细实现参见 `stonco/core/infer.py` 与 `stonco/core/batch_infer.py`
 
 ### 7.1 与 evaluate_models/plot_accuracy_bars 的简单联动示例
 
@@ -495,16 +531,16 @@ python STRIDE/batch_infer.py \
 步骤 1）分别对每个模型产物运行批量推理，得到各自的预测 CSV：
 ```bash
 # 模型 A（例如 GATv2）
-python STRIDE/batch_infer.py \
+python -m stonco.core.batch_infer \
   --npz_glob '/path/to/val_npz_dir/*.npz' \
   --artifacts_dir /path/to/artifacts_gatv2 \
   --out_csv /path/to/preds_gatv2.csv \
   --threshold 0.5 --num_threads 4 --num_workers 0 --model_name GATv2
 
-python batch_infer.py --npz_glob 'data/data_SC_3331genes/val_npz/*.npz' --artifacts_dir test_train0822_SC3331genes/gatv2/artifacts_dir/ --out_csv test_train0822_SC3331genes/gatv2/predictions/batch_pred.csv --num_workers 10 --model_name GATv2
+python -m stonco.core.batch_infer --npz_glob 'data/data_SC_3331genes/val_npz/*.npz' --artifacts_dir test_train0822_SC3331genes/gatv2/artifacts_dir/ --out_csv test_train0822_SC3331genes/gatv2/predictions/batch_pred.csv --num_workers 10 --model_name GATv2
 
 # 模型 B（例如 GraphSAGE）
-python STRIDE/batch_infer.py \
+python -m stonco.core.batch_infer \
   --npz_glob '/path/to/val_npz_dir/*.npz' \
   --artifacts_dir /path/to/artifacts_sage \
   --out_csv /path/to/preds_sage.csv \
@@ -513,7 +549,7 @@ python STRIDE/batch_infer.py \
 
 步骤 2）用 evaluate_models 汇总评估并可选绘图：
 ```bash
-python STRIDE/evaluate_models.py \
+python -m stonco.utils.evaluate_models \
   --model GATv2=/path/to/preds_gatv2.csv \
   --model SAGE=/path/to/preds_sage.csv \
   --out_dir /path/to/compare \
@@ -528,7 +564,7 @@ python STRIDE/evaluate_models.py \
 
 步骤 3）（可选）对单个模型绘制“按切片准确率柱状图”：
 ```bash
-python STRIDE/plot_accuracy_bars.py \
+python -m stonco.utils.plot_accuracy_bars \
   --pred_csv /path/to/preds_gatv2.csv \
   --model_name GATv2 \
   --out_path /path/to/compare/gatv2_per_slide_acc.png \
@@ -543,13 +579,13 @@ python STRIDE/plot_accuracy_bars.py \
 
 - 使用训练 NPZ 中的某张（例如最后一张作为验证）：
 ```bash
-python STRIDE/visualize_prediction.py \
+python -m stonco.utils.visualize_prediction \
   --train_npz /path/to/...
 ```
 
 - 使用单切片 NPZ（若 npz 含 y 可直接计算准确率；若不含，可结合验证目录自动加载真实标签）：
 ```bash
-python STRIDE/visualize_prediction.py \
+python -m stonco.utils.visualize_prediction \
   --npz /path/to/slide.npz \
   --artifacts_dir /path/to/artifacts \
   --val_root /path/to/ST_validation_datasets \
@@ -559,7 +595,7 @@ python STRIDE/visualize_prediction.py \
 
 - 批量处理一组单切片 NPZ（为每张切片导出一个 SVG 到 out_dir）：
 ```bash
-python STRIDE/visualize_prediction.py \
+python -m stonco.utils.visualize_prediction \
   --npz_glob '/path/to/val_npz/*.npz' \
   --artifacts_dir /path/to/artifacts \
   --out_dir /path/to/visualizations \
@@ -582,15 +618,15 @@ python STRIDE/visualize_prediction.py \
 
 可用 generate_synthetic_data.py 生成示例数据，快速端到端验证：
 ```bash
-python STRIDE/generate_synthetic_data.py --output_dir Spotonco/synthetic_data --n_genes 2000 --seed 42
-python STRIDE/train.py --train_npz Spotonco/synthetic_data/train_data.npz --artifacts_dir Spotonco/artifacts --epochs 2 --early_patience 2 --batch_size_graphs 1
-python STRIDE/infer.py --npz Spotonco/synthetic_data/infer_slide_1.npz --artifacts_dir Spotonco/artifacts --out_csv Spotonco/synthetic_data/preds_infer_slide_1.csv
-python STRIDE/visualize_prediction.py --train_npz Spotonco/synthetic_data/train_data.npz --artifacts_dir Spotonco/artifacts --slide_idx -1 --out_svg Spotonco/synthetic_data/vis_val_slide.svg
+python examples/generate_synthetic_data.py --output_dir STOnco/synthetic_data --n_genes 2000 --seed 42
+python -m stonco.core.train --train_npz STOnco/synthetic_data/train_data.npz --artifacts_dir STOnco/artifacts --epochs 2 --early_patience 2 --batch_size_graphs 1
+python -m stonco.core.infer --npz STOnco/synthetic_data/infer_slide_1.npz --artifacts_dir STOnco/artifacts --out_csv STOnco/synthetic_data/preds_infer_slide_1.csv
+python -m stonco.utils.visualize_prediction --train_npz STOnco/synthetic_data/train_data.npz --artifacts_dir STOnco/artifacts --slide_idx -1 --out_svg STOnco/synthetic_data/vis_val_slide.svg
 ```
 
 ---
 
 若需了解模型内部与双域自适应实现，请参考：
-- <mcfile name="models.py" path="/root/Project/Spotonco/models.py"></mcfile>
-- <mcfile name="Dual-Domain Adversarial Learning.md" path="/root/Project/Spotonco/Dual-Domain Adversarial Learning.md"></mcfile>
-- 训练入口与参数：<mcfile name="train.py" path="/root/Project/Spotonco/train.py"></mcfile>
+- `stonco/core/models.py`
+- `docs/Dual-Domain Adversarial Learning.md`
+- 训练入口与参数：`stonco/core/train.py`

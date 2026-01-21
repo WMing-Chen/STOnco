@@ -22,40 +22,70 @@ import random
 
 # -------------------------- 新增：基于癌种的划分辅助函数 --------------------------
 def _load_cancer_labels():
-    """加载 data/cancer_sample_labels.csv，返回 {sample_id: cancer_type} 和 {cancer_type: [sample_id,...]}
+    """加载 data/cancer_sample_labels.csv，返回癌种与批次标签映射。
+    返回：id2type, type2ids, id2batch, batch2ids
     若CSV缺失，将返回空映射，并在后续基于前缀进行兜底推断并打印提示信息。
     """
-    csv_path = Path(__file__).parent / 'data' / 'cancer_sample_labels.csv'
+    csv_path = Path(__file__).resolve().parents[2] / 'data' / 'cancer_sample_labels.csv'
     if not csv_path.exists():
         print(f"[Warn] Cancer label CSV not found: {csv_path}. Will fallback to slide_id prefix or UNKNOWN.")
         return {}, {}
     df = pd.read_csv(csv_path)
     id2type = {str(r['sample_id']): str(r['cancer_type']) for _, r in df.iterrows()}
+    id2batch = {}
+    if 'Batch_id' in df.columns:
+        id2batch = {str(r['sample_id']): str(r['Batch_id']) for _, r in df.iterrows()}
+    else:
+        print(f"[Warn] Column 'Batch_id' not found in {csv_path}. Will fallback to slide_id for batch domain.")
     type2ids = {}
     for sid, ctype in id2type.items():
         type2ids.setdefault(ctype, []).append(sid)
-    return id2type, type2ids
+    batch2ids = {}
+    for sid, bid in id2batch.items():
+        batch2ids.setdefault(bid, []).append(sid)
+    return id2type, type2ids, id2batch, batch2ids
 
 def _build_type_to_present_ids(present_ids):
     """基于当前NPZ中的 slide_ids 构建 {cancer_type:[present_ids]} 和 {present_id:cancer_type}."""
-    id2type_all, _ = _load_cancer_labels()
+    id2type_all, _, _, _ = _load_cancer_labels()
     type2present = {}
     present_id2type = {}
+    fallback_cache = set()
     for sid in present_ids:
         s = str(sid)
-        ctype = id2type_all.get(s, None)
-        # 兜底：尝试从前缀字母提取癌种（如 BRCA2 -> BRCA）
-        if ctype is None:
-            prefix = ''.join([ch for ch in s if ch.isalpha()])
-            if prefix:
-                ctype = prefix
-                print(f"[Info] sample_id '{s}' not found in CSV, fallback to prefix '{prefix}'.")
-        if ctype is None:
-            ctype = 'UNKNOWN'
-            print(f"[Info] sample_id '{s}' not found in CSV and no alpha prefix; fallback to 'UNKNOWN'.")
+        ctype = _resolve_cancer_type(s, id2type_all, fallback_cache)
         present_id2type[s] = ctype
         type2present.setdefault(ctype, []).append(s)
     return present_id2type, type2present
+
+
+def _resolve_batch_id(sample_id: str, id2batch: dict, fallback_cache: set) -> str:
+    """解析 batch_id；若缺失则回退到 slide_id，并提示一次。"""
+    bid = id2batch.get(sample_id)
+    if bid is None or str(bid).strip() == '' or str(bid).lower() == 'nan':
+        if sample_id not in fallback_cache:
+            print(f"[Warn] Batch_id missing for sample_id '{sample_id}'. Fallback to slide_id as batch domain.")
+            fallback_cache.add(sample_id)
+        return sample_id
+    return str(bid)
+
+
+def _resolve_cancer_type(sample_id: str, id2type: dict, fallback_cache: set) -> str:
+    """解析 cancer_type；若缺失则回退到前缀或 UNKNOWN，并提示一次。"""
+    ctype = id2type.get(sample_id, None)
+    if ctype is None:
+        prefix = ''.join([ch for ch in sample_id if ch.isalpha()])
+        if prefix:
+            ctype = prefix
+            if sample_id not in fallback_cache:
+                print(f"[Info] sample_id '{sample_id}' not found in CSV, fallback to prefix '{prefix}'.")
+                fallback_cache.add(sample_id)
+        else:
+            ctype = 'UNKNOWN'
+            if sample_id not in fallback_cache:
+                print(f"[Info] sample_id '{sample_id}' not found in CSV and no alpha prefix; fallback to 'UNKNOWN'.")
+                fallback_cache.add(sample_id)
+    return ctype
 
 def _stratified_single_split(present_ids, rng):
     """为每个癌种随机选择1个样本作为验证集，其余为训练集。
@@ -156,9 +186,8 @@ def main():
     
     # 现有可选参数
     parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--early_patience', type=int, default=None)
+    parser.add_argument('--early_patience', type=int, default=None, help='早停耐心值，<=0 表示关闭早停')
     parser.add_argument('--batch_size_graphs', type=int, default=None)
-    parser.add_argument('--disable_domain_adv', action='store_true', help='关闭域自适应（DomainAdversarial）训练')
     parser.add_argument('--model', choices=['gatv2', 'sage', 'gcn'], default=None, help='选择GNN主干，默认gatv2')
     parser.add_argument('--heads', type=int, default=None, help='GATv2的多头数（仅对gatv2有效）')
     parser.add_argument('--concat_lap_pe', type=int, choices=[0,1], default=None, help='是否将lapPE拼接至节点特征（1/0）')
@@ -183,9 +212,9 @@ def main():
     parser.add_argument('--device', default=None, help='指定设备（cpu/cuda）,不指定则自动检测')
     
     # 新增：双域对抗控制与权重（新参数优先级最高）
-    parser.add_argument('--use_domain_adv_slide', type=int, choices=[0,1], default=None, help='启用/关闭切片域对抗（1/0）')
+    parser.add_argument('--use_domain_adv_slide', type=int, choices=[0,1], default=None, help='启用/关闭批次域对抗（1/0）')
     parser.add_argument('--use_domain_adv_cancer', type=int, choices=[0,1], default=None, help='启用/关闭癌种域对抗（1/0）')
-    parser.add_argument('--lambda_slide', type=float, default=None, help='切片域对抗损失权重')
+    parser.add_argument('--lambda_slide', type=float, default=None, help='批次域对抗损失权重')
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
     
     # 新增：癌种分层与K折/LOCO
@@ -194,12 +223,17 @@ def main():
     parser.add_argument('--split_seed', type=int, default=42, help='分层/交叉验证随机种子')
     parser.add_argument('--split_test_only', action='store_true', help='仅测试划分逻辑，不进行训练，打印每折的统计信息')
     parser.add_argument('--leave_one_cancer_out', action='store_true', help='启用留一癌种评估模式（对每个癌种单独训练：其为验证，其余为训练）')
+    parser.add_argument('--val_sample_dir', default=None, help='外部验证样本目录（单切片NPZ），将与内部验证集共同评估')
 
     # 新增：解释性输出（基因重要性）
     parser.add_argument('--explain_saliency', action='store_true', default=True, help='训练结束后基于最终模型计算并保存基因重要性（总体，不分癌种）（默认开启）')
     parser.add_argument('--no_explain', action='store_false', dest='explain_saliency', help='关闭解释性输出')
     parser.add_argument('--explain_method', choices=['ig', 'saliency'], default='ig', help='选择解释方法：集成梯度(ig)或显著性图(saliency)')
     parser.add_argument('--ig_steps', type=int, default=50, help='IG步数，默认50')
+
+    # 新增：保存Loss组件
+    parser.add_argument('--save_loss_components', type=int, choices=[0,1], default=1,
+                        help='保存Loss组件到CSV (0/1, 默认: 1)')
 
     args = parser.parse_args()
 
@@ -240,8 +274,6 @@ def main():
         cfg['early_patience'] = args.early_patience
     if args.batch_size_graphs is not None:
         cfg['batch_size_graphs'] = args.batch_size_graphs
-    if args.disable_domain_adv:
-        cfg['use_domain_adv'] = False
     if args.model is not None:
         cfg['model'] = args.model
     if args.heads is not None:
@@ -324,7 +356,7 @@ def main():
     return run_single_training(args, cfg, device)
 
 def prepare_graphs(args, cfg, save_preprocessor_dir=None):
-    """构建PyG图，返回 train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer
+    """构建PyG图，返回 train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer
     支持：当 --stratify_by_cancer 启用时，采用癌种分层划分（每癌种1张为验证）。
     """
     data = np.load(args.train_npz, allow_pickle=True)
@@ -335,8 +367,11 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     # 域标签准备
     present_ids = [str(sid) for sid in slide_ids]
     id2type, type2present = _build_type_to_present_ids(present_ids)
-    # slide域：每个slide一个域
-    slide_to_idx = {sid:i for i, sid in enumerate(sorted(present_ids))}
+    _, _, id2batch, _ = _load_cancer_labels()
+    # batch域：来自 cancer_sample_labels.csv 的 Batch_id
+    batch_fallback_cache = set()
+    batch_ids = [_resolve_batch_id(sid, id2batch, batch_fallback_cache) for sid in present_ids]
+    batch_to_idx = {bid: i for i, bid in enumerate(sorted(set(batch_ids)))}
     # cancer域：每个癌种一个域
     cancer_types_sorted = sorted(type2present.keys())
     cancer_to_idx = {ct:i for i, ct in enumerate(cancer_types_sorted)}
@@ -356,14 +391,15 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
         data_g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
         data_g.slide_id = str(s['slide_id'])
         # 注入域标签（图级）
-        data_g.slide_dom = torch.tensor(slide_to_idx[str(s['slide_id'])], dtype=torch.long)
+        batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
+        data_g.bat_dom = torch.tensor(batch_to_idx[batch_id], dtype=torch.long)
         ctype = id2type.get(str(s['slide_id']))
         data_g.cancer_dom = torch.tensor(cancer_to_idx[ctype], dtype=torch.long)
         pyg_graphs.append(data_g)
 
     in_dim = pyg_graphs[0].x.shape[1]
 
-    n_domains_slide = len(slide_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+    n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
     # 默认：启用分层，最后一个切片作为验证集；若未启用分层，则进行简单划分
@@ -378,18 +414,75 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
         train_graphs = pyg_graphs[:-1]
         val_graphs = pyg_graphs[-1:]
 
-    return train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer
+    return train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer
 
 
-def train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=0, report_cb=None):
+def _build_external_val_graphs(args, cfg, preprocessor_dir):
+    """构建外部验证集图列表（单切片NPZ目录）。"""
+    if not args.val_sample_dir:
+        return []
+    val_dir = os.path.abspath(args.val_sample_dir)
+    if not os.path.isdir(val_dir):
+        print(f"[Warn] val_sample_dir not found: {val_dir}")
+        return []
+    import glob
+    npz_files = sorted(glob.glob(os.path.join(val_dir, '*.npz')))
+    if not npz_files:
+        print(f"[Warn] No NPZ files found in val_sample_dir: {val_dir}")
+        return []
+
+    try:
+        pp = Preprocessor.load(preprocessor_dir)
+    except Exception as e:
+        print(f"[Warn] Failed to load preprocessor from {preprocessor_dir}: {e}")
+        return []
+
+    # 外部验证仅用于分类指标计算，不注入域标签
+
+    graphs = []
+    for npz_path in npz_files:
+        try:
+            d = np.load(npz_path, allow_pickle=True)
+        except Exception as e:
+            print(f"[Warn] Failed to load {npz_path}: {e}")
+            continue
+        if not {'X', 'xy', 'gene_names', 'y'}.issubset(set(d.files)):
+            print(f"[Warn] Missing required keys in {npz_path}. Require X, xy, gene_names, y.")
+            continue
+        X = d['X']
+        xy = d['xy']
+        y = d['y']
+        gene_names = list(d['gene_names'])
+        sample_id = str(d.get('sample_id', Path(npz_path).stem))
+
+        Xp = pp.transform(X, gene_names)
+        g = assemble_pyg(Xp, xy, y, cfg)
+        g.slide_id = sample_id
+
+        graphs.append(g)
+    return graphs
+
+
+def train_and_validate(
+    train_graphs,
+    val_graphs,
+    in_dim,
+    n_domains_batch,
+    n_domains_cancer,
+    cfg,
+    device,
+    num_workers=0,
+    report_cb=None,
+    external_val_graphs=None,
+):
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
     """
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_slide,
+        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
+        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
     model = model.to(device)
@@ -399,85 +492,298 @@ def train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_doma
 
     train_loader = PyGDataLoader(train_graphs, batch_size=cfg['batch_size_graphs'], shuffle=True, num_workers=num_workers)
     val_loader = PyGDataLoader(val_graphs, batch_size=1, shuffle=False, num_workers=max(0, min(num_workers, 2)))
+    extra_val_graphs = list(external_val_graphs) if external_val_graphs else []
 
-    best = {'auroc':-1, 'accuracy': -1, 'state':None, 'epoch':-1, 'macro_f1': float('nan'), 'auprc': float('nan')}
+    def _compute_losses(out, batch):
+        logits = out['logits']
+        mask = batch.y >= 0
+        if mask.sum() > 0:
+            loss_task = bce(logits[mask], batch.y[mask].float())
+        else:
+            loss_task = torch.tensor(0.0, device=device)
+        total = loss_task
+        loss_batch = torch.tensor(0.0, device=device)
+        loss_cancer = torch.tensor(0.0, device=device)
+        if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom'):
+            if n_domains_batch is None:
+                raise ValueError('n_domains_batch is None while batch domain logits are enabled.')
+            dom_min = int(batch.bat_dom.min().item())
+            dom_max = int(batch.bat_dom.max().item())
+            if dom_min < 0 or dom_max >= int(n_domains_batch):
+                raise ValueError(
+                    f"[DomainCheck] batch_dom out of range: min={dom_min}, max={dom_max}, "
+                    f"n_domains_batch={n_domains_batch}, slide_ids={getattr(batch, 'slide_id', 'NA')}"
+                )
+            loss_dom_batch = cel(out['dom_logits_slide'], batch.bat_dom)
+            loss_batch = cfg['lambda_slide'] * loss_dom_batch
+            total = total + loss_batch
+        if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom'):
+            if n_domains_cancer is None:
+                raise ValueError('n_domains_cancer is None while cancer domain logits are enabled.')
+            dom_min = int(batch.cancer_dom.min().item())
+            dom_max = int(batch.cancer_dom.max().item())
+            if dom_min < 0 or dom_max >= int(n_domains_cancer):
+                raise ValueError(
+                    f"[DomainCheck] cancer_dom out of range: min={dom_min}, max={dom_max}, "
+                    f"n_domains_cancer={n_domains_cancer}, slide_ids={getattr(batch, 'slide_id', 'NA')}"
+                )
+            loss_dom_cancer = cel(out['dom_logits_cancer'], batch.cancer_dom)
+            loss_cancer = cfg['lambda_cancer'] * loss_dom_cancer
+            total = total + loss_cancer
+        return total, loss_task, loss_batch, loss_cancer
+
+    best = {'auroc': -1, 'accuracy': -1, 'state': None, 'epoch': -1, 'macro_f1': float('nan'), 'auprc': float('nan')}
     patience = 0
-    hist_train_loss = []
-    hist_val_auroc = []
-    hist_val_auprc = []
+    early_patience = cfg.get('early_patience', None)
+    early_stop_enabled = early_patience is not None and early_patience > 0
+    if not early_stop_enabled:
+        print('[Info] Early stopping disabled')
 
-    for epoch in range(1, cfg['epochs']+1):
+    hist = {
+        'avg_total_loss': [],
+        'avg_task_loss': [],
+        'avg_batch_domain_loss': [],
+        'avg_cancer_domain_loss': [],
+        'var_risk': [],
+        'train_accuracy': [],
+        'val_accuracy': [],
+        'val_macro_f1': [],
+        'val_auroc': [],
+        'val_auprc': [],
+    }
+
+    for epoch in range(1, cfg['epochs'] + 1):
         model.train()
-        tot_loss = 0.0
+        tot_total = 0.0
+        tot_task = 0.0
+        tot_batch = 0.0
+        tot_cancer = 0.0
+        batch_losses = []
         num_batches = 0
+        train_correct = 0
+        train_total = 0
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            out = model(batch.x, batch.edge_index, batch=getattr(batch, 'batch', None), edge_weight=getattr(batch, 'edge_weight', None), domain_lambda=cfg['lambda_slide'], lambda_slide=cfg['lambda_slide'], lambda_cancer=cfg['lambda_cancer'])
-            logits = out['logits']
-            mask = batch.y >= 0
-            if mask.sum()>0:
-                loss_cls = bce(logits[mask], batch.y[mask].float())
-            else:
-                loss_cls = torch.tensor(0.0, device=device)
-            loss = loss_cls
-            # Slide域对抗
-            if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'slide_dom'):
-                dom_labels_slide = batch.slide_dom
-                loss_dom_slide = cel(out['dom_logits_slide'], dom_labels_slide)
-                loss = loss + cfg['lambda_slide'] * loss_dom_slide
-            # Cancer域对抗
-            if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom'):
-                dom_labels_cancer = batch.cancer_dom
-                loss_dom_cancer = cel(out['dom_logits_cancer'], dom_labels_cancer)
-                loss = loss + cfg['lambda_cancer'] * loss_dom_cancer
-            loss.backward(); opt.step()
-            tot_loss += float(loss.item()); num_batches += 1
-        avg_loss = tot_loss / max(1, num_batches)
-        hist_train_loss.append(avg_loss)
+            out = model(
+                batch.x,
+                batch.edge_index,
+                batch=getattr(batch, 'batch', None),
+                edge_weight=getattr(batch, 'edge_weight', None),
+                domain_lambda=cfg['lambda_slide'],
+                lambda_slide=cfg['lambda_slide'],
+                lambda_cancer=cfg['lambda_cancer'],
+            )
+            loss_total, loss_task, loss_batch, loss_cancer = _compute_losses(out, batch)
+            loss_total.backward()
+            opt.step()
 
-        # 验证
+            tot_total += float(loss_total.item())
+            tot_task += float(loss_task.item())
+            tot_batch += float(loss_batch.item())
+            tot_cancer += float(loss_cancer.item())
+            batch_losses.append(float(loss_total.item()))
+            num_batches += 1
+
+            with torch.no_grad():
+                probs = torch.sigmoid(out['logits'])
+                preds = (probs > 0.5).long()
+                mask = batch.y >= 0
+                if mask.sum() > 0:
+                    train_correct += int((preds[mask] == batch.y[mask]).sum().item())
+                    train_total += int(mask.sum().item())
+
+        avg_total = tot_total / max(1, num_batches)
+        avg_task = tot_task / max(1, num_batches)
+        avg_batch = tot_batch / max(1, num_batches)
+        avg_cancer = tot_cancer / max(1, num_batches)
+        var_risk = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
+        train_accuracy = float(train_correct / train_total) if train_total > 0 else float('nan')
+
+        hist['avg_total_loss'].append(avg_total)
+        hist['avg_task_loss'].append(avg_task)
+        hist['avg_batch_domain_loss'].append(avg_batch)
+        hist['avg_cancer_domain_loss'].append(avg_cancer)
+        hist['var_risk'].append(var_risk)
+        hist['train_accuracy'].append(train_accuracy)
+
+        # 验证（内部 + 外部）
         model.eval()
-        val_logits_list = []; val_y_list = []
+        val_logits_list = []
+        val_y_list = []
+        per_slide_acc = []
         with torch.no_grad():
             for vb in val_loader:
                 vb = vb.to(device)
-                out_v = model(vb.x, vb.edge_index, batch=getattr(vb, 'batch', None), edge_weight=getattr(vb, 'edge_weight', None), domain_lambda=cfg['lambda_slide'], lambda_slide=cfg['lambda_slide'], lambda_cancer=cfg['lambda_cancer'])
+                out_v = model(
+                    vb.x,
+                    vb.edge_index,
+                    batch=getattr(vb, 'batch', None),
+                    edge_weight=getattr(vb, 'edge_weight', None),
+                    domain_lambda=cfg['lambda_slide'],
+                    lambda_slide=cfg['lambda_slide'],
+                    lambda_cancer=cfg['lambda_cancer'],
+                )
                 logits_v = out_v['logits']
-                val_logits_list.append(logits_v.cpu()); val_y_list.append(vb.y.cpu())
-        val_logits = torch.cat(val_logits_list, dim=0); val_y = torch.cat(val_y_list, dim=0)
-        m = eval_logits(val_logits, val_y)
-        hist_val_auroc.append(m['auroc']); hist_val_auprc.append(m['auprc'])
+                val_logits_list.append(logits_v.cpu())
+                val_y_list.append(vb.y.cpu())
+                m_slide = eval_logits(logits_v, vb.y)
+                per_slide_acc.append(m_slide.get('accuracy', float('nan')))
 
+            for g in extra_val_graphs:
+                vg = g.to(device)
+                out_v = model(
+                    vg.x,
+                    vg.edge_index,
+                    batch=getattr(vg, 'batch', None),
+                    edge_weight=getattr(vg, 'edge_weight', None),
+                    domain_lambda=cfg['lambda_slide'],
+                    lambda_slide=cfg['lambda_slide'],
+                    lambda_cancer=cfg['lambda_cancer'],
+                )
+                logits_v = out_v['logits']
+                val_logits_list.append(logits_v.cpu())
+                val_y_list.append(vg.y.cpu())
+                m_slide = eval_logits(logits_v, vg.y)
+                per_slide_acc.append(m_slide.get('accuracy', float('nan')))
+
+        if val_logits_list and val_y_list:
+            val_logits = torch.cat(val_logits_list, dim=0)
+            val_y = torch.cat(val_y_list, dim=0)
+            m = eval_logits(val_logits, val_y)
+        else:
+            m = {'auroc': float('nan'), 'auprc': float('nan'), 'accuracy': float('nan'), 'macro_f1': float('nan')}
+
+        val_accuracy = float(np.nanmean(per_slide_acc)) if per_slide_acc else float('nan')
+        hist['val_accuracy'].append(val_accuracy)
+        hist['val_macro_f1'].append(m.get('macro_f1', float('nan')))
+        hist['val_auroc'].append(m.get('auroc', float('nan')))
+        hist['val_auprc'].append(m.get('auprc', float('nan')))
+
+        metrics = {
+            'accuracy': val_accuracy,
+            'macro_f1': m.get('macro_f1', float('nan')),
+            'auroc': m.get('auroc', float('nan')),
+            'auprc': m.get('auprc', float('nan')),
+        }
         if report_cb is not None:
             try:
-                report_cb(epoch, m)
+                report_cb(epoch, metrics)
             except Exception:
                 pass
 
-        if m['accuracy'] > best['accuracy']:
-            best = {'auroc': m['auroc'], 'accuracy': m.get('accuracy', float('nan')), 'macro_f1': m.get('macro_f1', float('nan')), 'auprc': m.get('auprc', float('nan')), 'state': copy.deepcopy(model.state_dict()), 'epoch': epoch}
+        if val_accuracy > best['accuracy']:
+            best = {
+                'auroc': metrics['auroc'],
+                'accuracy': metrics['accuracy'],
+                'macro_f1': metrics['macro_f1'],
+                'auprc': metrics['auprc'],
+                'state': copy.deepcopy(model.state_dict()),
+                'epoch': epoch,
+            }
             patience = 0
         else:
             patience += 1
-            if patience >= cfg['early_patience']:
+            if early_stop_enabled and patience >= early_patience:
                 break
-    return best, {'train_loss': hist_train_loss, 'val_auroc': hist_val_auroc, 'val_auprc': hist_val_auprc}, best['state']
+    return best, hist, best['state']
+
+
+def _save_loss_components_csv(hist, out_dir):
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0:
+        return None
+    df = pd.DataFrame({
+        'epoch': range(1, n_epochs + 1),
+        'avg_total_loss': hist.get('avg_total_loss', [float('nan')] * n_epochs),
+        'avg_task_loss': hist.get('avg_task_loss', [float('nan')] * n_epochs),
+        'Var_risk': hist.get('var_risk', [float('nan')] * n_epochs),
+        'avg_cancer_domain_loss': hist.get('avg_cancer_domain_loss', [float('nan')] * n_epochs),
+        'avg_batch_domain_loss': hist.get('avg_batch_domain_loss', [float('nan')] * n_epochs),
+        'train_accuracy': hist.get('train_accuracy', [float('nan')] * n_epochs),
+        'val_accuracy': hist.get('val_accuracy', [float('nan')] * n_epochs),
+        'val_macro_f1': hist.get('val_macro_f1', [float('nan')] * n_epochs),
+        'val_auroc': hist.get('val_auroc', [float('nan')] * n_epochs),
+        'val_auprc': hist.get('val_auprc', [float('nan')] * n_epochs),
+    })
+    csv_path = os.path.join(out_dir, 'loss_components.csv')
+    df.to_csv(csv_path, index=False, float_format='%.6f')
+    return csv_path
+
+
+def _plot_train_metrics(hist, out_dir):
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0:
+        return None, None
+    epochs = list(range(1, n_epochs + 1))
+
+    def _plot_line(ax, values, title):
+        ax.plot(epochs, values, marker='o', linewidth=1.8, markersize=4)
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.grid(True, linestyle='--', alpha=0.3)
+
+    # 1) 训练损失图（2x3）
+    fig1, axes1 = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
+    metrics_train = [
+        ('avg_total_loss', 'avg_total_loss'),
+        ('avg_task_loss', 'avg_task_loss'),
+        ('var_risk', 'Var_risk'),
+        ('avg_cancer_domain_loss', 'avg_cancer_domain_loss'),
+        ('avg_batch_domain_loss', 'avg_batch_domain_loss'),
+        ('train_accuracy', 'train_accuracy'),
+    ]
+    for ax, (key, title) in zip(axes1.flatten(), metrics_train):
+        values = hist.get(key, [float('nan')] * n_epochs)
+        _plot_line(ax, values, title)
+    fig1.tight_layout()
+    out_train_svg = os.path.join(out_dir, 'train_loss.svg')
+    fig1.savefig(out_train_svg, format='svg', dpi=150)
+    plt.close(fig1)
+
+    # 2) 验证指标图（2x2）
+    fig2, axes2 = plt.subplots(2, 2, figsize=(10, 7), sharex=True)
+    metrics_val = [
+        ('val_accuracy', 'val_accuracy'),
+        ('val_macro_f1', 'val_macro_f1'),
+        ('val_auroc', 'val_auroc'),
+        ('val_auprc', 'val_auprc'),
+    ]
+    for ax, (key, title) in zip(axes2.flatten(), metrics_val):
+        values = hist.get(key, [float('nan')] * n_epochs)
+        _plot_line(ax, values, title)
+    fig2.tight_layout()
+    out_val_svg = os.path.join(out_dir, 'train_val_metrics.svg')
+    fig2.savefig(out_val_svg, format='svg', dpi=150)
+    plt.close(fig2)
+    return out_train_svg, out_val_svg
 
 
 def run_single_training(args, cfg, device):
     """原始的单次训练逻辑（现支持双域对抗）"""
     
-    train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer = prepare_graphs(args, cfg, save_preprocessor_dir=args.artifacts_dir)
+    train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer = prepare_graphs(args, cfg, save_preprocessor_dir=args.artifacts_dir)
 
-    best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
+    external_val_graphs = _build_external_val_graphs(args, cfg, args.artifacts_dir)
+
+    best, hist, best_state = train_and_validate(
+        train_graphs,
+        val_graphs,
+        in_dim,
+        n_domains_batch,
+        n_domains_cancer,
+        cfg,
+        device,
+        num_workers=args.num_workers,
+        external_val_graphs=external_val_graphs,
+    )
 
     # 保存最优模型
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_slide,
+        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
+        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
     model.load_state_dict(best_state)
@@ -485,62 +791,21 @@ def run_single_training(args, cfg, device):
     save_json({'cfg': cfg, 'best_epoch': best['epoch']}, os.path.join(args.artifacts_dir, 'meta.json'))
     print('Saved artifacts to', args.artifacts_dir)
 
-    # 保存训练曲线
+    # 保存训练与验证曲线
     try:
         os.makedirs(args.artifacts_dir, exist_ok=True)
-        epochs = list(range(1, len(hist['train_loss'])+1))
+        out_train_svg, out_val_svg = _plot_train_metrics(hist, args.artifacts_dir)
+        if out_train_svg:
+            print('Saved training loss figure to', out_train_svg)
+        if out_val_svg:
+            print('Saved validation metrics figure to', out_val_svg)
 
-        # Best/Last计算
-        valid_aurocs = [(i, v) for i, v in enumerate(hist['val_auroc']) if not np.isnan(v)]
-        if valid_aurocs:
-            best_auroc_idx, best_auroc_val = max(valid_aurocs, key=lambda x: x[1])
-            best_epoch = best_auroc_idx + 1
-            last_auroc = hist['val_auroc'][-1] if hist['val_auroc'] else float('nan')
-        else:
-            best_epoch, best_auroc_val, last_auroc = None, float('nan'), float('nan')
-
-        if hist['val_auprc'] and not all(np.isnan(hist['val_auprc'])):
-            valid_auprcs = [(i, v) for i, v in enumerate(hist['val_auprc']) if not np.isnan(v)]
-            if valid_auprcs:
-                _, best_auprc_val = max(valid_auprcs, key=lambda x: x[1])
-                last_auprc = hist['val_auprc'][-1]
-            else:
-                best_auprc_val, last_auprc = float('nan'), float('nan')
-        else:
-            best_auprc_val, last_auprc = float('nan'), float('nan')
-
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
-        ax1.plot(epochs, hist['train_loss'], marker='o', color='#2E86DE', linewidth=2, markersize=4, label='Train Loss')
-        ax1.set_ylabel('Loss', fontsize=11)
-        ax1.set_title(f"Training Loss\nLast: {hist['train_loss'][-1]:.4f}" if hist['train_loss'] else 'Training Loss', fontsize=11)
-        ax1.grid(True, linestyle='--', alpha=0.3)
-        if best_epoch is not None:
-            ax1.axvline(x=best_epoch, color='red', linestyle=':', alpha=0.7, linewidth=1.5)
-        ax2.plot(epochs, hist['val_auroc'], marker='s', color='#27AE60', linewidth=2, markersize=4, label='Val AUROC')
-        ax2.set_ylabel('AUROC', fontsize=11)
-        title_auroc = f'Validation AUROC\nBest: {best_auroc_val:.4f} @ Epoch {best_epoch} | Last: {last_auroc:.4f}' if best_epoch else f'Validation AUROC\nLast: {last_auroc:.4f}'
-        ax2.set_title(title_auroc, fontsize=11)
-        ax2.set_ylim(0, 1.05)
-        ax2.grid(True, linestyle='--', alpha=0.3)
-        if best_epoch is not None:
-            ax2.axvline(x=best_epoch, color='red', linestyle=':', alpha=0.7, linewidth=1.5)
-        ax3.plot(epochs, hist['val_auprc'], marker='^', color='#E67E22', linewidth=2, markersize=4, label='Val AUPRC')
-        ax3.set_ylabel('AUPRC', fontsize=11)
-        title_auprc = f'Validation AUPRC\nBest: {best_auprc_val:.4f} | Last: {last_auprc:.4f}'
-        ax3.set_title(title_auprc, fontsize=11)
-        ax3.set_ylim(0, 1.05)
-        ax3.grid(True, linestyle='--', alpha=0.3)
-        if best_epoch is not None:
-            ax3.axvline(x=best_epoch, color='red', linestyle=':', alpha=0.7, linewidth=1.5)
-        fig.text(0.5, 0.02, 'Epoch', ha='center', fontsize=12)
-        fig.suptitle('Training Metrics Overview', fontsize=14, y=0.95)
-        out_svg = os.path.join(args.artifacts_dir, 'train_metrics.svg')
-        fig.tight_layout(); fig.subplots_adjust(bottom=0.15, top=0.82)
-        fig.savefig(out_svg, format='svg', dpi=150)
-        plt.close(fig)
-        print('Saved training metrics figure to', out_svg)
+        if getattr(args, 'save_loss_components', 0):
+            csv_path = _save_loss_components_csv(hist, args.artifacts_dir)
+            if csv_path:
+                print('Saved loss components to', csv_path)
     except Exception as e:
-        print('Warning: failed to save training metrics figure:', e)
+        print('Warning: failed to save training metrics figures:', e)
 
     # 新增：训练结束后计算并保存总体基因重要性（不分癌种）
     if getattr(args, 'explain_saliency', False):
@@ -642,7 +907,10 @@ def run_kfold_training(args, cfg, device):
 
     present_ids = [str(sid) for sid in slide_ids]
     id2type, type2present = _build_type_to_present_ids(present_ids)
-    slide_to_idx = {sid:i for i, sid in enumerate(sorted(present_ids))}
+    _, _, id2batch, _ = _load_cancer_labels()
+    batch_fallback_cache = set()
+    batch_ids = [_resolve_batch_id(sid, id2batch, batch_fallback_cache) for sid in present_ids]
+    batch_to_idx = {bid: i for i, bid in enumerate(sorted(set(batch_ids)))}
     cancer_types_sorted = sorted(type2present.keys())
     cancer_to_idx = {ct:i for i, ct in enumerate(cancer_types_sorted)}
 
@@ -658,14 +926,15 @@ def run_kfold_training(args, cfg, device):
         Xp = pp.transform(s['X'], gene_names)
         data_g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
         data_g.slide_id = str(s['slide_id'])
-        data_g.slide_dom = torch.tensor(slide_to_idx[str(s['slide_id'])], dtype=torch.long)
+        batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
+        data_g.bat_dom = torch.tensor(batch_to_idx[batch_id], dtype=torch.long)
         ctype = id2type.get(str(s['slide_id']))
         data_g.cancer_dom = torch.tensor(cancer_to_idx[ctype], dtype=torch.long)
         pyg_graphs.append(data_g)
 
     in_dim = pyg_graphs[0].x.shape[1]
 
-    n_domains_slide = len(slide_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+    n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
     # 生成K个fold（按癌种每类1张验证）
@@ -697,14 +966,34 @@ def run_kfold_training(args, cfg, device):
         train_graphs = [id2graph[sid] for sid in train_ids]
         val_graphs = [id2graph[sid] for sid in val_ids]
 
-        best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
+        external_val_graphs = _build_external_val_graphs(args, cfg, fold_dir)
+        best, hist, best_state = train_and_validate(
+            train_graphs,
+            val_graphs,
+            in_dim,
+            n_domains_batch,
+            n_domains_cancer,
+            cfg,
+            device,
+            num_workers=args.num_workers,
+            external_val_graphs=external_val_graphs,
+        )
+
+        # 新增：如果启用save_loss_components，保存Loss组件CSV
+        if getattr(args, 'save_loss_components', 0):
+            try:
+                csv_path = _save_loss_components_csv(hist, fold_dir)
+                if csv_path:
+                    print(f'[KFold] Saved loss components to {csv_path}')
+            except Exception as e:
+                print(f'[KFold] Warning: failed to save loss components CSV: {e}')
 
         # 保存最优模型及元信息
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_slide,
+            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
+            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
         model.load_state_dict(best_state)
@@ -770,6 +1059,7 @@ def run_loco_training(args, cfg, device):
     gene_names = list(data['gene_names'])
 
     id2type, type2present = _build_type_to_present_ids(slide_ids)
+    _, _, id2batch, _ = _load_cancer_labels()
     cancer_types = sorted(type2present.keys())
 
     parent_dir = os.path.abspath(os.path.join(args.artifacts_dir, os.pardir))
@@ -807,8 +1097,10 @@ def run_loco_training(args, cfg, device):
             pass
 
         # 构建图并注入域标签
-        # 域索引基于全部出现的slide/cancer，以保持head维度稳定
-        slide_to_idx = {sid:i for i, sid in enumerate(sorted(slide_ids))}
+        # 域索引基于全部出现的batch/cancer，以保持head维度稳定
+        batch_fallback_cache = set()
+        batch_ids = [_resolve_batch_id(sid, id2batch, batch_fallback_cache) for sid in slide_ids]
+        batch_to_idx = {bid: i for i, bid in enumerate(sorted(set(batch_ids)))}
         cancer_to_idx = {c:i for i, c in enumerate(cancer_types)}
 
         def build_graph_list(id_list):
@@ -819,7 +1111,8 @@ def run_loco_training(args, cfg, device):
                 Xp = pp.transform(s['X'], gene_names)
                 g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
                 g.slide_id = str(s['slide_id'])
-                g.slide_dom = torch.tensor(slide_to_idx[str(s['slide_id'])], dtype=torch.long)
+                batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
+                g.bat_dom = torch.tensor(batch_to_idx[batch_id], dtype=torch.long)
                 g.cancer_dom = torch.tensor(cancer_to_idx[id2type[str(s['slide_id'])]], dtype=torch.long)
                 graphs.append(g)
             return graphs
@@ -828,17 +1121,37 @@ def run_loco_training(args, cfg, device):
         val_graphs = build_graph_list(val_ids)
 
         in_dim = train_graphs[0].x.shape[1]
-        n_domains_slide = len(slide_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+        n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
         n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
-        best, hist, best_state = train_and_validate(train_graphs, val_graphs, in_dim, n_domains_slide, n_domains_cancer, cfg, device, num_workers=args.num_workers)
+        external_val_graphs = _build_external_val_graphs(args, cfg, loco_dir)
+        best, hist, best_state = train_and_validate(
+            train_graphs,
+            val_graphs,
+            in_dim,
+            n_domains_batch,
+            n_domains_cancer,
+            cfg,
+            device,
+            num_workers=args.num_workers,
+            external_val_graphs=external_val_graphs,
+        )
+
+        # 新增：如果启用save_loss_components，保存Loss组件CSV
+        if getattr(args, 'save_loss_components', 0):
+            try:
+                csv_path = _save_loss_components_csv(hist, loco_dir)
+                if csv_path:
+                    print(f'[LOCO] Saved loss components to {csv_path}')
+            except Exception as e:
+                print(f'[LOCO] Warning: failed to save loss components CSV: {e}')
 
         # 保存模型与meta
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_slide if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_slide,
+            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
+            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
         model.load_state_dict(best_state)

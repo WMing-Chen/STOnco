@@ -42,20 +42,37 @@ pip install -e .
 ### 1. Data Preparation
 
 ```bash
-python -m stonco.utils.prepare_data \
-    --input_dir /path/to/visium/data \
-    --output_dir ./processed_data \
-    --gene_list_path genes.txt
+python -m stonco.utils.prepare_data build-train-npz \
+    --train_dir /path/to/visium/data/ST_train_datasets \
+    --out_npz ./processed_data/train_data.npz \
+    --xy_cols row col \
+    --label_col true_label
+
+python -m stonco.utils.prepare_data build-val-npz \
+    --val_dir /path/to/visium/data/ST_validation_datasets \
+    --out_dir ./processed_data/val_npz \
+    --xy_cols row col \
+    --label_col true_label
 ```
 
 ### 2. Model Training
 
 ```bash
 python -m stonco.core.train \
-    --train_data ./processed_data/train_data.npz \
-    --val_dir ./processed_data/val_npz \
+    --train_npz ./processed_data/train_data.npz \
     --artifacts_dir ./artifacts \
-    --model_type gatv2
+    --model gatv2
+```
+
+Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics.
+Disable early stopping:
+
+```bash
+python -m stonco.core.train \
+    --train_npz ./processed_data/train_data.npz \
+    --artifacts_dir ./artifacts \
+    --model gatv2 \
+    --early_patience 0
 ```
 
 ### 3. Inference
@@ -63,23 +80,24 @@ python -m stonco.core.train \
 ```bash
 # Single sample inference
 python -m stonco.core.infer \
-    --model_path ./artifacts/model.pt \
-    --input_data sample.npz \
-    --output_path predictions.csv
+    --npz sample.npz \
+    --artifacts_dir ./artifacts \
+    --out_csv predictions.csv
 
 # Batch inference
 python -m stonco.core.batch_infer \
-    --model_path ./artifacts/model.pt \
-    --input_dir ./test_samples \
-    --output_dir ./predictions
+    --npz_glob "./test_samples/*.npz" \
+    --artifacts_dir ./artifacts \
+    --out_csv ./predictions/batch_predictions.csv
 ```
 
 ### 4. Visualization
 
 ```bash
 python -m stonco.utils.visualize_prediction \
-    --prediction_file predictions.csv \
-    --output_path visualization.svg
+    --npz sample.npz \
+    --artifacts_dir ./artifacts \
+    --out_svg visualization.svg
 ```
 
 ## Model Architecture
@@ -88,16 +106,16 @@ STOnco employs a unified `STOnco_Classifier` architecture with:
 
 - **GNN Backbone**: Configurable graph neural network (GATv2/GCN/GraphSAGE)
 - **Task Head**: Binary classification for tumor/non-tumor prediction
-- **Domain Heads**: Optional adversarial heads for cancer type and slide-level domain adaptation
+- **Domain Heads**: Optional adversarial heads for cancer type and batch-level domain adaptation
 
 ### Dual-Domain Adversarial Learning
 
 ```
-Total_Loss = Task_Loss + λ₁ × Cancer_Domain_Loss + λ₂ × Slide_Domain_Loss
+Total_Loss = Task_Loss + λ₁ × Cancer_Domain_Loss + λ₂ × Batch_Domain_Loss
 ```
 
 - **Cancer Domain Adversarial**: Reduces cancer-type-specific bias
-- **Slide Domain Adversarial**: Mitigates batch effects between slides
+- **Batch Domain Adversarial**: Mitigates batch effects between slides
 
 ## Project Structure
 
@@ -127,9 +145,9 @@ STOnco/
 
 ```bash
 python -m stonco.core.train_hpo \
-    --train_data train_data.npz \
-    --val_dir val_npz \
+    --train_npz train_data.npz \
     --artifacts_dir ./hpo_results \
+    --tune all \
     --n_trials 100
 ```
 
@@ -137,18 +155,31 @@ python -m stonco.core.train_hpo \
 
 ```bash
 python -m stonco.core.train \
-    --train_data train_data.npz \
-    --val_dir val_npz \
+    --train_npz train_data.npz \
     --artifacts_dir ./loco_results \
-    --eval_mode loco
+    --leave_one_cancer_out
+```
+
+### K-Fold Batch Inference
+
+```bash
+# Run batch inference across all kfold outputs (fold_1..fold_10)
+for i in {1..10}; do
+  python -m stonco.core.batch_infer \
+    --npz_glob './processed_data/val_npz/*.npz' \
+    --artifacts_dir "./kfold_val/fold_${i}/" \
+    --out_csv "./kfold_val/fold_${i}/batch_preds.csv" \
+    --num_threads 4 --num_workers 0
+done
 ```
 
 ### Model Evaluation
 
 ```bash
 python -m stonco.utils.evaluate_models \
-    --predictions_dir ./predictions \
-    --output_file evaluation_results.csv
+    --model GATv2=./predictions/batch_predictions.csv \
+    --out_dir ./evaluation \
+    --plot
 ```
 
 ## Input Data Format
