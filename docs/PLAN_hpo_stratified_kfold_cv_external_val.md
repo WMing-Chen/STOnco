@@ -1,4 +1,4 @@
-# HPO 改造方案：每个 Trial 使用「癌种分层 K 折（CV）平均」作为目标 + 支持外部验证集
+# HPO 改造方案：每个 Trial 使用「癌种分层随机 K 次 split 均值」作为目标 + 外部验证集参与 Optuna objective（可选）
 
 > 本文档是**设计/实施方案**（不是代码改动）。你确认关键决策点后，我再开始修改 `stonco/core/train_hpo.py` 等代码。
 
@@ -9,7 +9,7 @@
 - `train_hpo.py` 当前**不支持** `--val_sample_dir` 外部验证集（该能力在 `train.py` 里有）。  
 - `train.py` 的 `--kfold_cancer` 目前实现是 “K 个癌种分层的随机组合 split（Monte Carlo）”，并非严格意义的 “K 折互斥覆盖”。代码里也写了“若需严格无泄漏，可改为每折重拟合”。  
 
-本次改造目标：在 HPO 阶段把 “单次 split” 变成 “每个 trial 进行癌种分层 CV 并取均值”，并支持可选外部验证集输入（用于记录/筛选）。
+本次改造目标：在 HPO 阶段把 “单次 split” 变成 “每个 trial 进行癌种分层随机 K 次 split 并取均值”，并支持外部验证集输入（当提供时直接参与 Optuna objective；不提供则仅内部验证）。
 
 ---
 
@@ -17,8 +17,8 @@
 
 ### 1.1 目标
 
-1) **HPO 目标改为**：对每个 trial 的配置，在内部数据上做癌种分层 K 折（CV），取各折 `best_val_accuracy` 的均值作为 Optuna objective（maximize）。  
-2) **外部验证集输入**：支持从目录读取外部 NPZ（单切片）作为额外评估集，并在 HPO 期间记录（默认不用于优化目标，避免“用测试集调参”）。  
+1) **HPO 目标改为**：对每个 trial 的配置，在内部数据上做癌种分层随机 K 次 split，取每次 split 的 `best_accuracy` 均值作为 Optuna objective（maximize）。  
+2) **外部验证集输入**：支持从目录读取外部 NPZ（单切片）作为额外评估集；当设置 `--val_sample_dir` 时，外部验证集 accuracy 将**直接参与** Optuna objective（未设置则仅内部验证）。  
 3) **复现性**：fold 划分与 trial 内部种子可控、可复现；输出中能追踪每个 trial 的折内表现。  
 4) **与现有多阶段 HPO 保持兼容**：`--tune stage1|2|3|all` 行为不被破坏；仅当用户显式启用 CV 模式时才改变 objective。
 
@@ -33,15 +33,9 @@
 
 为了最大兼容现有用法，我建议如下：
 
-### 2.1 启用 CV 的方式（两种选一）
+### 2.1 启用随机 K 次 split 的方式（已确认：复用现有参数）
 
-方案 A（复用现有参数，最少改动）：
-- `--kfold_cancer K`：当 `--tune ...` 时，若 `K>1` 则启用 “trial 内 K 折平均” 作为 objective；不传则保持当前单次 split objective。
-
-方案 B（语义更清晰，避免歧义）：
-- 新增 `--hpo_cv_k K`：仅对 HPO 生效；与 `train.py` 的 `--kfold_cancer` 训练评估逻辑互不影响。
-
-> 需要你确认：你更倾向 A 还是 B？（见文末“需要确认”）
+- `--kfold_cancer K`：当 `--tune ...` 且 `K>0` 时，HPO objective 使用 “trial 内 K 次癌种分层随机 split 的均值”；不传（或不设置该参数）则保持当前单次分层 split objective。
 
 ### 2.2 外部验证集输入
 
@@ -52,55 +46,39 @@
 - 必需键：`X`, `xy`, `gene_names`, `y`  
 - 可选键：`sample_id`（否则使用文件名 stem）
 
-### 2.3 外部验证集是否参与 Optuna 目标（默认不参与）
+### 2.3 外部验证集是否参与 Optuna 目标（已确认：参与）
 
-默认建议：**外部验证只记录，不参与 objective**。  
-可选增强（如果你明确希望）：新增 `--hpo_objective`：
-- `internal_cv`（默认）
-- `internal_cv_plus_external`（比如：`0.8*internal + 0.2*external` 或直接平均）
+- 若设置了 `--val_sample_dir`：外部验证集的 accuracy **直接参与** Optuna objective。  
+- 若未设置 `--val_sample_dir`：objective 仅由内部验证（K 次随机 split 的均值）构成。
 
-> 需要你确认：外部验证集到底是“调参依据”还是“最终挑选/报告”？（见文末）
+仍有 1 个细节需要你确认：当外部验证存在时，内部/外部 accuracy 的合成方式（见第 8 节）。
 
 ---
 
-## 3. 折划分算法：建议用“癌种分层、互斥覆盖”的真 K 折
+## 3. 划分算法：K 次癌种分层随机 split（已确认）
 
-你现在提的是“癌种分层 K 折平均”，我建议实现为**严格 K 折**（每个样本最多出现在 1 个 fold 的 val 中，尽可能覆盖全体），而不是现有的“随机组合 split”。
+采用“Monte Carlo CV 风格”的随机 K 次 split：
+- 固定 `val_ratio`（沿用现有 `--val_ratio`），每次 split 按癌种分层抽取验证集（每癌种保底 1 张，n=1 则全进训练）
+- **允许重复**：当某些癌种切片较少时，允许不同 split 中出现相同 val 样本（符合“随机 kfold 即可”的需求）
 
-### 3.1 真 K 折（推荐）
-
-对每个癌种 type：
-- 收集该癌种的 slide_ids 列表并 shuffle（受 `--split_seed` 控制）
-- 将该列表按 round-robin 或 numpy array_split 切成 K 份
-- fold i 的 val_ids = 各癌种第 i 份的并集；train_ids = 其余
-
-优点：
-- 折间互斥、覆盖更完整，CV 均值更稳定、更像“泛化估计”
-
-需要处理的边界情况：
-- 如果某癌种样本数 `< K`，则该癌种在部分 fold 的 val 会为空，这是正常的；但会导致 fold 间癌种分布略不均。
-- 也可以选择强约束：`K <= min_count_per_cancer`，否则直接报错/自动降 K。
-
-### 3.2 继续沿用现有“随机组合 split”（备选）
-
-如果你认为“每折 val_ratio 固定（比如 0.2）更重要”，那我们可以沿用 `train.py::_k_random_combinations` 的逻辑（K 个不同的分层随机验证组合）来做 trial 内均值。
-
-> 需要你确认：你说的 “K 折” 是想要 **真 K 折互斥覆盖**，还是想要 **K 次分层随机 split**？（见文末）
+实现建议（优先满足“允许重复”这一点）：
+- 在 HPO 中直接重复调用 `stonco/core/train.py::_stratified_single_split(present_ids, rng, val_ratio)` 共 K 次，得到 K 组 `(train_ids, val_ids)`。
 
 ---
 
-## 4. 每个 Trial 的训练/评估流程（CV objective）
+## 4. 每个 Trial 的训练/评估流程（随机 K 次 split objective）
 
-假设启用了 CV（K>1），则 objective(trial) 变为：
+假设启用了随机 K 次 split（`--kfold_cancer K` 且 `K>0`），则 objective(trial) 变为：
 
 1) 根据 stage 构造 `trial_cfg`（沿用现有 `_get_stage_search_space` + 多阶段参数累积）。  
-2) 准备 folds：`[(train_ids_1, val_ids_1), ..., (train_ids_K, val_ids_K)]`（固定不随 trial 变化）。  
-3) 对每个 fold：
-   - **预处理器拟合仅用该 fold 的 train slides**（避免泄漏）
+2) 准备 splits：`[(train_ids_1, val_ids_1), ..., (train_ids_K, val_ids_K)]`（固定不随 trial 变化）。  
+3) 对每个 split：
+   - **预处理器拟合仅用该 split 的 train slides**（避免泄漏）
    - 用该预处理器 transform train/val slides，并构图（LapPE 如需）
-   - 调用 `train_and_validate(...)`，拿到该 fold 的 `best_val_accuracy`
-   - 记录该 fold 的其它指标（auroc/auprc/macro_f1，可选）
-4) trial 的 objective value = `mean(best_val_accuracy over folds)`（可选同时输出 std）。
+   - 若提供 `--val_sample_dir`：构建外部验证图 `external_val_graphs`（同样使用该 split 的预处理器 transform），并传给 `train_and_validate(...)`
+   - 调用 `train_and_validate(...)`，拿到该 split 的 `best_accuracy`（accuracy 的定义见第 5 节）
+   - 记录该 split 的其它指标（auroc/auprc/macro_f1，可选）
+4) trial 的 objective value = `mean(best_accuracy over K splits)`（可选同时输出 std）。
 
 ### 4.1 剪枝（pruning）建议
 
@@ -112,27 +90,19 @@
 
 ---
 
-## 5. 外部验证集：如何接入（建议默认“只记录不优化”）
+## 5. 外部验证集：如何接入（已确认：参与 objective）
 
-### 5.1 关键原则
+### 5.1 说明
 
-- 外部验证如果代表“真正的外部泛化测试”，原则上**不应参与 HPO 目标**，否则会变成“在测试集上调参”。  
-- 但外部验证非常适合作为：
-  - trial 记录项（user_attr）
-  - Top-K 复评/最终挑选依据（例如 internal_cv 接近时，用 external 更好者）
+你已确认：当设置 `--val_sample_dir` 时，外部验证集 accuracy 将直接参与 Optuna objective（未设置则不参与）。
 
-### 5.2 推荐实现（成本较低且更合理）
+### 5.2 推荐实现（与现有 `train.py` 评估方式对齐）
 
-实现两个层次：
+在每个 split 的训练中，把外部验证集构建为 `external_val_graphs` 传给 `train_and_validate(...)`，让其在每个 epoch 的验证阶段同时评估：
+- 内部 `val_graphs`（来自本 split 的 val_ids）
+- 外部 `external_val_graphs`（来自 `--val_sample_dir`）
 
-1) **HPO 阶段（每个 trial）**：
-   - 仅计算 internal CV mean accuracy 作为 objective
-   - 可选：在 trial 完成后，对该 trial 的“每折 best model”（或最后一次训练出的 best_state）跑外部验证并记录 external 指标  
-     - 这一步会明显增加成本；建议默认关闭或只对 Top-K 做
-
-2) **复评阶段（`--rescore_topk`）**：
-   - 对 Top-K trial：多种子 ×（可选）CV 或全量训练
-   - 在此阶段**额外计算 external 指标**，并输出一个“internal + external”的综合表格，帮助最终选择
+这样 `train_and_validate` 返回的 `best['accuracy']` 会自然包含外部验证的贡献（见 `train.py` 当前实现：内部 val + 外部 val 会一起进入验证循环）。
 
 ### 5.3 外部验证与“预处理器一致性”
 
@@ -167,27 +137,16 @@ CV 计算会把每个 trial 的训练次数放大 K 倍。建议的优化顺序�
 
 ---
 
-## 8. 需要你确认的决策点（确认后我再改代码）
+## 8. 需要你再确认 1 个细节（确认后我再改代码）
 
-请你逐条回复编号即可：
+你已确认：
+- 使用 **K 次癌种分层随机 split**（允许重复）
+- 复用 `--kfold_cancer K`
+- 外部验证集 `--val_sample_dir` **参与** Optuna objective（未设置则仅内部）
+- Optuna 目标仍为 `accuracy`
 
-1) 你要的 “K 折” 是哪种？
-   - B. **K 次癌种分层随机 split**（更接近当前 `--kfold_cancer` 的实现语义）
 
-2) 启用 CV 的 CLI 你更希望：
-   - A. 复用 `--kfold_cancer K`（HPO 里也用它）
-
-3) 外部验证集 `--val_sample_dir` 的用途：
-   - B. **直接参与 Optuna objective**（会有“用外部集调参”的风险）
-
-4) 若选择 “真 K 折”，当某些癌种样本数 `< K` 时你希望：
-   - A. 允许该癌种在部分 fold 的 val 为空（继续跑，并提示 warning）
-   - B. 直接报错要求你调小 K
-   - C. 自动把 K 下调到可行值（并打印最终 K）
-
-5) 你希望 Optuna 目标仍然是 `accuracy` 吗？
-   - A. 是（保持一致）
-   - B. 改成 `macro_f1` 或 `auroc`（需要你指定）
+- 当设置了 `--val_sample_dir` 时，objective 中内部/外部 accuracy 的“合成方式”我希望：**合并评估（推荐、改动最小）**：像 `train.py` 那样把外部样本也加入验证循环，最终 `accuracy` 在“内部 val + 外部 val”所有验证 slide 上统一计算（等价于按 slide 数量隐式加权）。
 
 ---
 
@@ -196,4 +155,3 @@ CV 计算会把每个 trial 的训练次数放大 K 倍。建议的优化顺序�
 - `stonco/core/train_hpo.py`：新增 CV objective、外部验证输入与结果记录逻辑
 - （可能）`stonco/core/train.py`：抽取/复用 split 与外部验证构图工具，避免复制代码
 - （可选新增）`stonco/utils/splits.py`：把“癌种分层 K 折”工具函数做成可复用模块
-
