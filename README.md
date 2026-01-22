@@ -64,7 +64,7 @@ python -m stonco.core.train \
     --model gatv2
 ```
 
-Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics.
+Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics. The `meta.json` now records `train_ids`, `val_ids`, and `metrics` for reproducibility. You can control validation splitting with `--val_ratio` (default 0.2) or disable stratification via `--no_stratify_by_cancer`.
 Disable early stopping:
 
 ```bash
@@ -89,6 +89,44 @@ python -m stonco.core.batch_infer \
     --npz_glob "./test_samples/*.npz" \
     --artifacts_dir ./artifacts \
     --out_csv ./predictions/batch_predictions.csv
+```
+
+Batch inference also supports predicting internal validation slides + external NPZs together:
+
+```bash
+python -m stonco.core.batch_infer \
+    --train_npz ./processed_data/train_data.npz \
+    --external_val_dir ./processed_data/val_npz \
+    --artifacts_dir ./artifacts \
+    --out_csv ./predictions/batch_predictions.csv
+```
+Batch inference writes spot-level predictions to `out_csv` and also emits a slide-level summary CSV (`batch_preds_summary.csv`) in the same directory.
+
+KFold batch inference (per fold):
+
+```bash
+for i in {1..10}; do
+  python -m stonco.core.batch_infer \
+    --npz_glob "./processed_data/val_npz/*.npz" \
+    --artifacts_dir "./kfold_val/fold_${i}/" \
+    --out_csv "./kfold_val/fold_${i}/batch_predictions.csv" \
+    --num_threads 4 \
+    --num_workers 0
+done
+```
+
+KFold batch inference with internal validation + external validation together:
+
+```bash
+for i in {1..10}; do
+  python -m stonco.core.batch_infer \
+    --train_npz ./processed_data/train_data.npz \
+    --external_val_dir ./processed_data/val_npz \
+    --artifacts_dir "./kfold_val/fold_${i}/" \
+    --out_csv "./kfold_val/fold_${i}/batch_predictions.csv" \
+    --num_threads 4 \
+    --num_workers 0
+done
 ```
 
 ### 4. Visualization
@@ -150,6 +188,7 @@ python -m stonco.core.train_hpo \
     --tune all \
     --n_trials 100
 ```
+`train_hpo.py` supports the same cancer-stratified split controls as `train.py`, including `--val_ratio` (default 0.2) and `--no_stratify_by_cancer`.
 
 ### Cross-Cancer Evaluation (LOCO)
 

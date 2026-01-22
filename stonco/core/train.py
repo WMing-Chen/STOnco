@@ -87,24 +87,40 @@ def _resolve_cancer_type(sample_id: str, id2type: dict, fallback_cache: set) -> 
                 fallback_cache.add(sample_id)
     return ctype
 
-def _stratified_single_split(present_ids, rng):
-    """为每个癌种随机选择1个样本作为验证集，其余为训练集。
+def _stratified_single_split(present_ids, rng, val_ratio=0.2):
+    """按比例划分验证集（保底每癌种1张，n=1则只进训练）。
     返回 (train_ids, val_ids)
     """
     present_id2type, type2present = _build_type_to_present_ids(present_ids)
     val_ids = []
-    for ctype, ids in type2present.items():
-        # 至少需要一个样本
-        pick = rng.choice(ids)
-        val_ids.append(pick)
+    for ctype in sorted(type2present.keys()):
+        ids = list(type2present[ctype])
+        n = len(ids)
+        if n <= 1:
+            continue
+        raw = int(round(n * float(val_ratio)))
+        n_val = max(1, min(n - 1, raw))
+        if n_val == 1:
+            val_ids.append(rng.choice(ids))
+        else:
+            val_ids.extend(rng.sample(ids, n_val))
     train_ids = [s for s in map(str, present_ids) if s not in set(val_ids)]
     return train_ids, val_ids, present_id2type
 
-def _k_random_combinations(present_ids, k, rng):
-    """生成k个不同的组合：每个组合都是从每个癌种中随机选取1个样本作为验证集。
+def _k_random_combinations(present_ids, k, rng, val_ratio=0.2):
+    """生成k个不同的组合：按比例为每个癌种随机选取若干样本作为验证集。
     返回 folds 列表，每个元素为 (train_ids, val_ids)
     """
     present_id2type, type2present = _build_type_to_present_ids(present_ids)
+    per_type_nval = {}
+    for ctype, ids in type2present.items():
+        n = len(ids)
+        if n <= 1:
+            per_type_nval[ctype] = 0
+            continue
+        raw = int(round(n * float(val_ratio)))
+        per_type_nval[ctype] = max(1, min(n - 1, raw))
+
     folds = []
     seen = set()
     max_attempts = k * 50
@@ -114,8 +130,14 @@ def _k_random_combinations(present_ids, k, rng):
         attempts += 1
         val_ids = []
         for ctype in types_sorted:
-            ids = type2present[ctype]
-            val_ids.append(rng.choice(ids))
+            ids = list(type2present[ctype])
+            n_val = per_type_nval.get(ctype, 0)
+            if n_val <= 0:
+                continue
+            if n_val == 1:
+                val_ids.append(rng.choice(ids))
+            else:
+                val_ids.extend(rng.sample(ids, n_val))
         key = tuple(sorted(val_ids))
         if key in seen:
             continue
@@ -218,8 +240,10 @@ def main():
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
     
     # 新增：癌种分层与K折/LOCO
-    parser.add_argument('--stratify_by_cancer', action='store_true', help='启用癌种分层划分：每个癌种随机1张作为验证，其余训练')
-    parser.add_argument('--kfold_cancer', type=int, default=None, help='整数输入，基于癌种的K折（随机选择K种不同组合，每种组合每癌种1张验证）。产物统一保存至artifacts_dir同级目录下，并在/kfold_val/kfold_summary.csv 汇总指标；这里的artifacts_dir 仅决定保存根目录。')
+    parser.add_argument('--stratify_by_cancer', action='store_true', default=True, help='启用癌种分层划分：按比例分配验证集且每癌种保底1张（n=1除外）')
+    parser.add_argument('--no_stratify_by_cancer', action='store_false', dest='stratify_by_cancer', help='关闭癌种分层，使用简单划分（最后1张为验证）')
+    parser.add_argument('--val_ratio', type=float, default=0.2, help='验证集比例（默认0.2，按癌种分配且保底1张）')
+    parser.add_argument('--kfold_cancer', type=int, default=None, help='整数输入，基于癌种的K折（按比例划分验证集并随机组合）。产物统一保存至artifacts_dir同级目录下，并在/kfold_val/kfold_summary.csv 汇总指标；这里的artifacts_dir 仅决定保存根目录。')
     parser.add_argument('--split_seed', type=int, default=42, help='分层/交叉验证随机种子')
     parser.add_argument('--split_test_only', action='store_true', help='仅测试划分逻辑，不进行训练，打印每折的统计信息')
     parser.add_argument('--leave_one_cancer_out', action='store_true', help='启用留一癌种评估模式（对每个癌种单独训练：其为验证，其余为训练）')
@@ -234,6 +258,9 @@ def main():
     # 新增：保存Loss组件
     parser.add_argument('--save_loss_components', type=int, choices=[0,1], default=1,
                         help='保存Loss组件到CSV (0/1, 默认: 1)')
+    # 新增：训练曲线保存开关
+    parser.add_argument('--save_train_curves', type=int, choices=[0,1], default=1,
+                        help='保存训练曲线SVG (0/1, 默认: 1)')
 
     args = parser.parse_args()
 
@@ -402,10 +429,11 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
-    # 默认：启用分层，最后一个切片作为验证集；若未启用分层，则进行简单划分
+    # 默认：启用分层，按比例划分验证集；若未启用分层，则进行简单划分
     if getattr(args, 'stratify_by_cancer', True):
         rng = random.Random(args.split_seed)
-        train_ids, val_ids, _ = _stratified_single_split(present_ids, rng)
+        val_ratio = getattr(args, 'val_ratio', 0.2)
+        train_ids, val_ids, _ = _stratified_single_split(present_ids, rng, val_ratio=val_ratio)
         id2graph = {str(g.slide_id): g for g in pyg_graphs}
         train_graphs = [id2graph[sid] for sid in train_ids]
         val_graphs = [id2graph[sid] for sid in val_ids]
@@ -413,6 +441,11 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
         # 简单划分：最后一个切片作为验证集（保持向后兼容）
         train_graphs = pyg_graphs[:-1]
         val_graphs = pyg_graphs[-1:]
+        train_ids = [str(g.slide_id) for g in train_graphs]
+        val_ids = [str(val_graphs[0].slide_id)] if val_graphs else []
+
+    setattr(args, '_train_ids', list(train_ids))
+    setattr(args, '_val_ids', list(val_ids))
 
     return train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer
 
@@ -474,6 +507,8 @@ def train_and_validate(
     num_workers=0,
     report_cb=None,
     external_val_graphs=None,
+    progress_desc=None,
+    progress_leave=False,
 ):
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
@@ -552,7 +587,10 @@ def train_and_validate(
         'val_auprc': [],
     }
 
-    for epoch in range(1, cfg['epochs'] + 1):
+    epoch_iter = range(1, cfg['epochs'] + 1)
+    if progress_desc:
+        epoch_iter = tqdm(epoch_iter, desc=progress_desc, leave=progress_leave)
+    for epoch in epoch_iter:
         model.train()
         tot_total = 0.0
         tot_task = 0.0
@@ -672,6 +710,15 @@ def train_and_validate(
             except Exception:
                 pass
 
+        if progress_desc:
+            try:
+                epoch_iter.set_postfix(
+                    train_loss=f'{avg_total:.3f}',
+                    val_acc=f'{val_accuracy:.3f}'
+                )
+            except Exception:
+                pass
+
         if val_accuracy > best['accuracy']:
             best = {
                 'auroc': metrics['auroc'],
@@ -716,9 +763,19 @@ def _plot_train_metrics(hist, out_dir):
     if n_epochs == 0:
         return None, None
     epochs = list(range(1, n_epochs + 1))
+    step = 1 if n_epochs <= 100 else 10
+    sample_idx = list(range(0, n_epochs, step))
+    if sample_idx and sample_idx[-1] != n_epochs - 1:
+        sample_idx.append(n_epochs - 1)
+    sample_epochs = [epochs[i] for i in sample_idx] if sample_idx else epochs
+
+    def _sample_values(values):
+        if not values:
+            return values
+        return [values[i] for i in sample_idx] if sample_idx else values
 
     def _plot_line(ax, values, title):
-        ax.plot(epochs, values, marker='o', linewidth=1.8, markersize=4)
+        ax.plot(sample_epochs, _sample_values(values), marker='o', linewidth=1.8, markersize=4)
         ax.set_title(title)
         ax.set_xlabel('Epoch')
         ax.grid(True, linestyle='--', alpha=0.3)
@@ -736,6 +793,8 @@ def _plot_train_metrics(hist, out_dir):
     for ax, (key, title) in zip(axes1.flatten(), metrics_train):
         values = hist.get(key, [float('nan')] * n_epochs)
         _plot_line(ax, values, title)
+    for ax in axes1[0]:
+        ax.tick_params(labelbottom=True)
     fig1.tight_layout()
     out_train_svg = os.path.join(out_dir, 'train_loss.svg')
     fig1.savefig(out_train_svg, format='svg', dpi=150)
@@ -752,6 +811,8 @@ def _plot_train_metrics(hist, out_dir):
     for ax, (key, title) in zip(axes2.flatten(), metrics_val):
         values = hist.get(key, [float('nan')] * n_epochs)
         _plot_line(ax, values, title)
+    for ax in axes2[0]:
+        ax.tick_params(labelbottom=True)
     fig2.tight_layout()
     out_val_svg = os.path.join(out_dir, 'train_val_metrics.svg')
     fig2.savefig(out_val_svg, format='svg', dpi=150)
@@ -776,6 +837,8 @@ def run_single_training(args, cfg, device):
         device,
         num_workers=args.num_workers,
         external_val_graphs=external_val_graphs,
+        progress_desc='Train',
+        progress_leave=True,
     )
 
     # 保存最优模型
@@ -788,17 +851,32 @@ def run_single_training(args, cfg, device):
     )
     model.load_state_dict(best_state)
     save_model(model, args.artifacts_dir)
-    save_json({'cfg': cfg, 'best_epoch': best['epoch']}, os.path.join(args.artifacts_dir, 'meta.json'))
+    train_ids = list(getattr(args, '_train_ids', []))
+    val_ids = list(getattr(args, '_val_ids', []))
+    meta = {
+        'cfg': cfg,
+        'best_epoch': best['epoch'],
+        'val_ids': val_ids,
+        'train_ids': train_ids,
+        'metrics': {
+            'auroc': best.get('auroc', float('nan')),
+            'auprc': best.get('auprc', float('nan')),
+            'accuracy': best.get('accuracy', float('nan')),
+            'macro_f1': best.get('macro_f1', float('nan')),
+        }
+    }
+    save_json(meta, os.path.join(args.artifacts_dir, 'meta.json'))
     print('Saved artifacts to', args.artifacts_dir)
 
     # 保存训练与验证曲线
     try:
         os.makedirs(args.artifacts_dir, exist_ok=True)
-        out_train_svg, out_val_svg = _plot_train_metrics(hist, args.artifacts_dir)
-        if out_train_svg:
-            print('Saved training loss figure to', out_train_svg)
-        if out_val_svg:
-            print('Saved validation metrics figure to', out_val_svg)
+        if getattr(args, 'save_train_curves', 1):
+            out_train_svg, out_val_svg = _plot_train_metrics(hist, args.artifacts_dir)
+            if out_train_svg:
+                print('Saved training loss figure to', out_train_svg)
+            if out_val_svg:
+                print('Saved validation metrics figure to', out_val_svg)
 
         if getattr(args, 'save_loss_components', 0):
             csv_path = _save_loss_components_csv(hist, args.artifacts_dir)
@@ -937,9 +1015,9 @@ def run_kfold_training(args, cfg, device):
     n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
-    # 生成K个fold（按癌种每类1张验证）
+    # 生成K个fold（按比例 + 保底每癌种1张）
     rng = random.Random(args.split_seed)
-    folds, present_id2type = _k_random_combinations(present_ids, int(args.kfold_cancer), rng)
+    folds, present_id2type = _k_random_combinations(present_ids, int(args.kfold_cancer), rng, val_ratio=args.val_ratio)
 
     id2graph = {str(g.slide_id): g for g in pyg_graphs}
 
@@ -951,7 +1029,8 @@ def run_kfold_training(args, cfg, device):
     os.makedirs(base_kfold_dir, exist_ok=True)
     print(f"[KFold] Base directory: {base_kfold_dir}")
 
-    for i, (train_ids, val_ids) in enumerate(folds, start=1):
+    total_folds = len(folds)
+    for i, (train_ids, val_ids) in enumerate(tqdm(folds, desc='KFold', total=total_folds), start=1):
         fold_dir = os.path.join(base_kfold_dir, f"fold_{i}")
         os.makedirs(fold_dir, exist_ok=True)
         print(f"[KFold] Created fold directory: {fold_dir}")
@@ -977,7 +1056,19 @@ def run_kfold_training(args, cfg, device):
             device,
             num_workers=args.num_workers,
             external_val_graphs=external_val_graphs,
+            progress_desc=f'Fold {i}/{total_folds}',
+            progress_leave=False,
         )
+
+        if getattr(args, 'save_train_curves', 1):
+            try:
+                out_train_svg, out_val_svg = _plot_train_metrics(hist, fold_dir)
+                if out_train_svg:
+                    print(f'[KFold] Saved training loss figure to {out_train_svg}')
+                if out_val_svg:
+                    print(f'[KFold] Saved validation metrics figure to {out_val_svg}')
+            except Exception as e:
+                print(f'[KFold] Warning: failed to save training curves: {e}')
 
         # 新增：如果启用save_loss_components，保存Loss组件CSV
         if getattr(args, 'save_loss_components', 0):
@@ -1073,7 +1164,7 @@ def run_loco_training(args, cfg, device):
     # 将原始slides打包便于按索引选择
     slides_all = [{'X': X, 'y': y, 'xy': xy, 'slide_id': sid} for X, y, xy, sid in zip(Xs, ys, xys, slide_ids)]
 
-    for ct in cancer_types:
+    for ct in tqdm(cancer_types, desc='LOCO', total=len(cancer_types)):
         val_ids = sorted(type2present[ct])
         train_ids = sorted([sid for sid in slide_ids if sid not in set(val_ids)])
         if not train_ids or not val_ids:
@@ -1135,7 +1226,19 @@ def run_loco_training(args, cfg, device):
             device,
             num_workers=args.num_workers,
             external_val_graphs=external_val_graphs,
+            progress_desc=f'LOCO {ct}',
+            progress_leave=False,
         )
+
+        if getattr(args, 'save_train_curves', 1):
+            try:
+                out_train_svg, out_val_svg = _plot_train_metrics(hist, loco_dir)
+                if out_train_svg:
+                    print(f'[LOCO] Saved training loss figure to {out_train_svg}')
+                if out_val_svg:
+                    print(f'[LOCO] Saved validation metrics figure to {out_val_svg}')
+            except Exception as e:
+                print(f'[LOCO] Warning: failed to save training curves: {e}')
 
         # 新增：如果启用save_loss_components，保存Loss组件CSV
         if getattr(args, 'save_loss_components', 0):
@@ -1281,9 +1384,10 @@ def _run_split_test(args, cfg):
         return cnt
 
     if args.stratify_by_cancer and not args.kfold_cancer:
-        train_ids, val_ids, _ = _stratified_single_split(slide_ids, rng)
+        train_ids, val_ids, _ = _stratified_single_split(slide_ids, rng, val_ratio=args.val_ratio)
         print('[SplitTest] Stratified single split:')
         print('  Total slides:', len(slide_ids))
+        print('  Val ratio  :', args.val_ratio)
         print('  Train count:', len(train_ids))
         print('  Val count  :', len(val_ids))
         tr_cnt = summarize(train_ids)
@@ -1292,7 +1396,7 @@ def _run_split_test(args, cfg):
         print('  Val per cancer  :', va_cnt)
         print('  Val unique slides:', sorted(val_ids))
     elif args.kfold_cancer and args.kfold_cancer > 0:
-        folds, _ = _k_random_combinations(slide_ids, args.kfold_cancer, rng)
+        folds, _ = _k_random_combinations(slide_ids, args.kfold_cancer, rng, val_ratio=args.val_ratio)
         print(f'[SplitTest] K-fold by cancer with K={len(folds)} (random distinct combinations):')
         for i, (tr, va) in enumerate(folds, 1):
             tr_cnt = summarize(tr); va_cnt = summarize(va)

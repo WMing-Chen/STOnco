@@ -573,8 +573,10 @@ def main():
                        help='复评使用的随机种子列表（逗号分隔）')
 
     # 新增：癌种分层与K折
-    parser.add_argument('--stratify_by_cancer', action='store_true', help='启用癌种分层划分：每个癌种随机1张作为验证，其余训练')
-    parser.add_argument('--kfold_cancer', type=int, default=None, help='基于癌种的K折（随机选择K种不同组合，每种组合每癌种1张验证）')
+    parser.add_argument('--stratify_by_cancer', action='store_true', default=True, help='启用癌种分层划分：按比例分配验证集且每癌种保底1张（n=1除外）')
+    parser.add_argument('--no_stratify_by_cancer', action='store_false', dest='stratify_by_cancer', help='关闭癌种分层，使用简单划分（最后1张为验证）')
+    parser.add_argument('--val_ratio', type=float, default=0.2, help='验证集比例（默认0.2，按癌种分配且保底1张）')
+    parser.add_argument('--kfold_cancer', type=int, default=None, help='基于癌种的K折（按比例划分验证集并随机组合）')
     parser.add_argument('--split_seed', type=int, default=42, help='分层/交叉验证随机种子')
     parser.add_argument('--split_test_only', action='store_true', help='仅测试划分逻辑，不进行训练，打印每折的统计信息')
 
@@ -688,4 +690,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

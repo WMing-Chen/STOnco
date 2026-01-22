@@ -322,19 +322,23 @@ python -m stonco.core.train \
   - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
   - 损失权重：--lambda_slide（batch 域），--lambda_cancer（未指定时回退到 domain_lambda=0.3）
 - 划分/验证：
-  - --stratify_by_cancer 按癌种分层（每癌种随机 1 张验证）
-  - --kfold_cancer K 基于癌种的 K 组组合评估，产物位于 artifacts_dir 的同级目录 kfold_val/fold_{i}/，并写出 kfold_val/kfold_summary.csv
+  - --stratify_by_cancer 按癌种分层（默认启用，按比例划分且每癌种保底 1 张，n=1 仅训练）
+  - --no_stratify_by_cancer 关闭分层，使用最后 1 张作为验证
+  - --val_ratio 验证集比例（默认 0.2）
+  - --kfold_cancer K 基于癌种的 K 组组合评估（按比例分配验证集并随机组合），产物位于 artifacts_dir 的同级目录 kfold_val/fold_{i}/，并写出 kfold_val/kfold_summary.csv
   - --leave_one_cancer_out LOCO 留一癌种评估（每个癌种单独训练与验证）；产物位于 artifacts_dir 的父目录下 loco_eval/{CancerType}/
   - --split_seed 随机种子；--split_test_only 仅打印划分统计不训练
 - 其他：
   - --config_json 从 JSON 加载一组超参（支持扁平或 {"cfg": {...}} 格式）
   - --val_sample_dir 外部验证 NPZ 目录（单切片），验证指标与内部验证合并计算
   - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
+  - --save_train_curves 0/1（默认 1）：保存 train_loss.svg 与 train_val_metrics.svg
   - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于最佳模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
 - 模型：model.pt；元信息：meta.json（含 cfg 与 best_epoch）
+- meta.json 额外包含 train_ids、val_ids、metrics（auroc/auprc/accuracy/macro_f1）
 - 可视化：train_loss.svg（2×3：avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy），train_val_metrics.svg（2×2：val_accuracy/val_macro_f1/val_auroc/val_auprc）
 - Loss 组件：loss_components.csv（avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy/val_*）
 
@@ -420,6 +424,19 @@ for i in {1..10}; do
 done
 ```
 
+KFold 推理（内部验证集 + 外部验证集一起预测）：
+```bash
+# 一次跑所有fold（示例：fold_1..fold_10）
+for i in {1..10}; do
+  python -m stonco.core.batch_infer \
+    --train_npz /path/to/train_data.npz \
+    --external_val_dir /path/to/val_npz \
+    --artifacts_dir "/path/to/kfold_val/fold_${i}/" \
+    --out_csv "/path/to/kfold_val/fold_${i}/batch_preds.csv" \
+    --num_threads 4 --num_workers 0
+done
+```
+
 - LOCO 留一癌种评估（逐癌种训练/验证）：
 
 ```bash
@@ -447,6 +464,7 @@ HPO 已独立到 `stonco/core/train_hpo.py`，提供统一三阶段流水线与�
 - --rescore_stages 需要复评的阶段列表（逗号分隔）
 - --seeds 多种子列表（逗号分隔）
 - 其余训练相关参数（如 --epochs、--early_patience、--model、--lap_pe_dim 等）与 train.py 保持一致
+  - 包含划分参数：`--val_ratio`（默认 0.2）与 `--no_stratify_by_cancer`
 
 示例：
 ```bash
@@ -503,6 +521,14 @@ python -m stonco.core.batch_infer \
   --out_csv /path/to/batch_preds.csv \
   --num_threads 4 --num_workers 0
 ```
+- 也支持“内部验证集 + 外部验证集”一起预测：
+```bash
+python -m stonco.core.batch_infer \
+  --train_npz /path/to/train_data.npz \
+  --external_val_dir /path/to/val_npz_dir \
+  --artifacts_dir /path/to/artifacts \
+  --out_csv /path/to/batch_preds.csv
+```
 - 读取 `artifacts_dir` 下的预处理器与 `meta.json` 的 cfg，对匹配到的每个 NPZ 执行“读取→预处理→图构建→推理”。
 - 性能参数：
   - `--num_threads` 控制 CPU 线程；`--num_workers` 控制 DataLoader 进程数（>0 时在子进程并行读取/预处理/构图）。
@@ -515,6 +541,7 @@ python -m stonco.core.batch_infer \
   - `pred_label`（按阈值得到的二值预测）
   - `y_true`（若 NPZ 含标签则输出，否则为 None）
   - `threshold`（写入用于推断的阈值，便于复现）
+- 样本级汇总：会在 `out_csv` 同目录生成 `batch_preds_summary.csv`，列为 `sample_id, source, n_spots, threshold, accuracy, auroc, auprc, macro_f1`（若无 `y_true` 则为 NaN）。
 - 解释性输出（默认开启，可用 `--no_explain` 关闭）：
   - `--explain_saliency` 默认开启；`--no_explain` 关闭
   - `--explain_method {ig,saliency}`，`--ig_steps`（默认 50）
