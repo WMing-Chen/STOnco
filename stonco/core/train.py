@@ -763,6 +763,7 @@ def _plot_train_metrics(hist, out_dir):
     if n_epochs == 0:
         return None, None
     epochs = list(range(1, n_epochs + 1))
+    line_color = '#08283D'
     do_smooth = n_epochs > 100
     smooth_window = 10
     raw_alpha = 0.35
@@ -775,7 +776,7 @@ def _plot_train_metrics(hist, out_dir):
             ax.plot(
                 epochs,
                 series.values,
-                color='black',
+                color=line_color,
                 linewidth=raw_lw,
                 alpha=raw_alpha,
             )
@@ -783,14 +784,14 @@ def _plot_train_metrics(hist, out_dir):
             ax.plot(
                 epochs,
                 smooth.values,
-                color='black',
+                color=line_color,
                 linewidth=smooth_lw,
             )
         else:
             ax.plot(
                 epochs,
                 series.values,
-                color='black',
+                color=line_color,
                 linewidth=smooth_lw,
             )
 
