@@ -763,22 +763,41 @@ def _plot_train_metrics(hist, out_dir):
     if n_epochs == 0:
         return None, None
     epochs = list(range(1, n_epochs + 1))
-    step = 1 if n_epochs <= 100 else 10
-    sample_idx = list(range(0, n_epochs, step))
-    if sample_idx and sample_idx[-1] != n_epochs - 1:
-        sample_idx.append(n_epochs - 1)
-    sample_epochs = [epochs[i] for i in sample_idx] if sample_idx else epochs
+    do_smooth = n_epochs > 100
+    smooth_window = 10
+    raw_alpha = 0.35
+    raw_lw = 0.6
+    smooth_lw = 1.4
 
-    def _sample_values(values):
-        if not values:
-            return values
-        return [values[i] for i in sample_idx] if sample_idx else values
+    def _plot_neurips(ax, values, title):
+        series = pd.Series(values, dtype='float64')
+        if do_smooth:
+            ax.plot(
+                epochs,
+                series.values,
+                color='black',
+                linewidth=raw_lw,
+                alpha=raw_alpha,
+            )
+            smooth = series.rolling(window=smooth_window, min_periods=1).mean()
+            ax.plot(
+                epochs,
+                smooth.values,
+                color='black',
+                linewidth=smooth_lw,
+            )
+        else:
+            ax.plot(
+                epochs,
+                series.values,
+                color='black',
+                linewidth=smooth_lw,
+            )
 
-    def _plot_line(ax, values, title):
-        ax.plot(sample_epochs, _sample_values(values), marker='o', linewidth=1.8, markersize=4)
         ax.set_title(title)
         ax.set_xlabel('Epoch')
-        ax.grid(True, linestyle='--', alpha=0.3)
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
 
     # 1) 训练损失图（2x3）
     fig1, axes1 = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
@@ -792,7 +811,7 @@ def _plot_train_metrics(hist, out_dir):
     ]
     for ax, (key, title) in zip(axes1.flatten(), metrics_train):
         values = hist.get(key, [float('nan')] * n_epochs)
-        _plot_line(ax, values, title)
+        _plot_neurips(ax, values, title)
     for ax in axes1[0]:
         ax.tick_params(labelbottom=True)
     fig1.tight_layout()
@@ -810,7 +829,7 @@ def _plot_train_metrics(hist, out_dir):
     ]
     for ax, (key, title) in zip(axes2.flatten(), metrics_val):
         values = hist.get(key, [float('nan')] * n_epochs)
-        _plot_line(ax, values, title)
+        _plot_neurips(ax, values, title)
     for ax in axes2[0]:
         ax.tick_params(labelbottom=True)
     fig2.tight_layout()
