@@ -579,6 +579,8 @@ def train_and_validate(
         'avg_task_loss': [],
         'avg_batch_domain_loss': [],
         'avg_cancer_domain_loss': [],
+        'train_batch_domain_acc': [],
+        'train_cancer_domain_acc': [],
         'var_risk': [],
         'train_accuracy': [],
         'val_accuracy': [],
@@ -600,6 +602,10 @@ def train_and_validate(
         num_batches = 0
         train_correct = 0
         train_total = 0
+        dom_slide_correct = 0
+        dom_slide_total = 0
+        dom_cancer_correct = 0
+        dom_cancer_total = 0
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
@@ -612,6 +618,20 @@ def train_and_validate(
                 lambda_slide=cfg['lambda_slide'],
                 lambda_cancer=cfg['lambda_cancer'],
             )
+
+            # 域头训练准确率（图级，按图计数；不参与反传）
+            with torch.no_grad():
+                if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom'):
+                    pred = out['dom_logits_slide'].argmax(dim=1)
+                    tgt = batch.bat_dom
+                    dom_slide_correct += int((pred == tgt).sum().item())
+                    dom_slide_total += int(tgt.numel())
+                if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom'):
+                    pred = out['dom_logits_cancer'].argmax(dim=1)
+                    tgt = batch.cancer_dom
+                    dom_cancer_correct += int((pred == tgt).sum().item())
+                    dom_cancer_total += int(tgt.numel())
+
             loss_total, loss_task, loss_batch, loss_cancer = _compute_losses(out, batch)
             loss_total.backward()
             opt.step()
@@ -635,6 +655,8 @@ def train_and_validate(
         avg_task = tot_task / max(1, num_batches)
         avg_batch = tot_batch / max(1, num_batches)
         avg_cancer = tot_cancer / max(1, num_batches)
+        train_batch_domain_acc = float(dom_slide_correct / dom_slide_total) if dom_slide_total > 0 else float('nan')
+        train_cancer_domain_acc = float(dom_cancer_correct / dom_cancer_total) if dom_cancer_total > 0 else float('nan')
         var_risk = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
         train_accuracy = float(train_correct / train_total) if train_total > 0 else float('nan')
 
@@ -642,6 +664,8 @@ def train_and_validate(
         hist['avg_task_loss'].append(avg_task)
         hist['avg_batch_domain_loss'].append(avg_batch)
         hist['avg_cancer_domain_loss'].append(avg_cancer)
+        hist['train_batch_domain_acc'].append(train_batch_domain_acc)
+        hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
         hist['var_risk'].append(var_risk)
         hist['train_accuracy'].append(train_accuracy)
 
@@ -747,6 +771,8 @@ def _save_loss_components_csv(hist, out_dir):
         'Var_risk': hist.get('var_risk', [float('nan')] * n_epochs),
         'avg_cancer_domain_loss': hist.get('avg_cancer_domain_loss', [float('nan')] * n_epochs),
         'avg_batch_domain_loss': hist.get('avg_batch_domain_loss', [float('nan')] * n_epochs),
+        'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
+        'train_cancer_domain_acc': hist.get('train_cancer_domain_acc', [float('nan')] * n_epochs),
         'train_accuracy': hist.get('train_accuracy', [float('nan')] * n_epochs),
         'val_accuracy': hist.get('val_accuracy', [float('nan')] * n_epochs),
         'val_macro_f1': hist.get('val_macro_f1', [float('nan')] * n_epochs),
@@ -763,7 +789,7 @@ def _plot_train_metrics(hist, out_dir):
     if n_epochs == 0:
         return None, None
     epochs = list(range(1, n_epochs + 1))
-    line_color = '#08283D'
+    line_color = '#1f3a5f'
     do_smooth = n_epochs > 100
     smooth_window = 10
     raw_alpha = 0.35
@@ -840,6 +866,147 @@ def _plot_train_metrics(hist, out_dir):
     return out_train_svg, out_val_svg
 
 
+def _plot_domain_diagnostics(
+    hist,
+    out_dir,
+    n_domains_batch=None,
+    n_domains_cancer=None,
+    lambda_slide=0.0,
+    lambda_cancer=0.0,
+    smooth_window=10,
+    title='Domain Adversarial Diagnostics (CE & Accuracy)',
+):
+    """2x2 诊断图：
+    - Batch domain: unweighted CE vs log(K), Accuracy vs 1/K
+    - Cancer domain: unweighted CE vs log(K), Accuracy vs 1/K
+
+    注意：avg_*_domain_loss 记录的是 lambda_* * CE。
+    本图中 CE 会按 CE = (avg_domain_loss / lambda_*) 还原；当 lambda_*=0 或域头未启用时会显示 NaN。
+    """
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0:
+        return None
+    epochs = list(range(1, n_epochs + 1))
+
+    do_smooth = n_epochs > 100
+    line_color = '#1f3a5f'
+
+    def _series(key):
+        vals = hist.get(key, [])
+        if len(vals) < n_epochs:
+            vals = list(vals) + [float('nan')] * (n_epochs - len(vals))
+        return pd.Series(vals, dtype='float64')
+
+    batch_loss = _series('avg_batch_domain_loss')
+    cancer_loss = _series('avg_cancer_domain_loss')
+    batch_acc = _series('train_batch_domain_acc')
+    cancer_acc = _series('train_cancer_domain_acc')
+
+    if lambda_slide and float(lambda_slide) != 0.0:
+        batch_ce = batch_loss / float(lambda_slide)
+    else:
+        batch_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
+    if lambda_cancer and float(lambda_cancer) != 0.0:
+        cancer_ce = cancer_loss / float(lambda_cancer)
+    else:
+        cancer_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
+
+    # 若域头未启用（acc 为 NaN），则 CE 也显示 NaN，避免误读为 0
+    batch_ce = batch_ce.where(~batch_acc.isna(), float('nan'))
+    cancer_ce = cancer_ce.where(~cancer_acc.isna(), float('nan'))
+
+    def _smooth(series):
+        if not do_smooth:
+            return series
+        w = int(smooth_window) if smooth_window else 10
+        w = max(1, w)
+        return series.rolling(window=w, min_periods=1).mean()
+
+    batch_ce_s = _smooth(batch_ce)
+    cancer_ce_s = _smooth(cancer_ce)
+    batch_acc_s = _smooth(batch_acc)
+    cancer_acc_s = _smooth(cancer_acc)
+
+    fig = plt.figure(figsize=(10, 8))
+    fig.patch.set_facecolor('white')
+
+    # (1) Batch CE
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.set_facecolor('white')
+    if do_smooth:
+        ax1.plot(epochs, batch_ce.values, alpha=0.35, linewidth=1, color=line_color, label='CE (raw)')
+        ax1.plot(epochs, batch_ce_s.values, linewidth=2, color=line_color, label=f'CE (smooth, w={smooth_window})')
+    else:
+        ax1.plot(epochs, batch_ce.values, linewidth=2, color=line_color, label='CE')
+    if n_domains_batch is not None and int(n_domains_batch) > 0:
+        ax1.axhline(float(np.log(int(n_domains_batch))), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance (random guess, log({int(n_domains_batch)}))')
+    ax1.set_title('Batch Domain CE')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Cross-Entropy (unweighted)')
+    ax1.spines['top'].set_visible(True)
+    ax1.spines['right'].set_visible(True)
+    ax1.legend(fontsize=9)
+
+    # (2) Batch Acc
+    ax2 = plt.subplot(2, 2, 2)
+    ax2.set_facecolor('white')
+    if do_smooth:
+        ax2.plot(epochs, batch_acc.values, alpha=0.35, linewidth=1, color=line_color, label='Accuracy (raw)')
+        ax2.plot(epochs, batch_acc_s.values, linewidth=2, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
+    else:
+        ax2.plot(epochs, batch_acc.values, linewidth=2, color=line_color, label='Accuracy')
+    if n_domains_batch is not None and int(n_domains_batch) > 0:
+        ax2.axhline(1.0 / float(int(n_domains_batch)), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance accuracy (random, 1/{int(n_domains_batch)})')
+    ax2.set_title('Batch Domain Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.spines['top'].set_visible(True)
+    ax2.spines['right'].set_visible(True)
+    ax2.legend(fontsize=9)
+
+    # (3) Cancer CE
+    ax3 = plt.subplot(2, 2, 3)
+    ax3.set_facecolor('white')
+    if do_smooth:
+        ax3.plot(epochs, cancer_ce.values, alpha=0.35, linewidth=1, color=line_color, label='CE (raw)')
+        ax3.plot(epochs, cancer_ce_s.values, linewidth=2, color=line_color, label=f'CE (smooth, w={smooth_window})')
+    else:
+        ax3.plot(epochs, cancer_ce.values, linewidth=2, color=line_color, label='CE')
+    if n_domains_cancer is not None and int(n_domains_cancer) > 0:
+        ax3.axhline(float(np.log(int(n_domains_cancer))), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance (random guess, log({int(n_domains_cancer)}))')
+    ax3.set_title('Cancer Domain CE')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Cross-Entropy (unweighted)')
+    ax3.spines['top'].set_visible(True)
+    ax3.spines['right'].set_visible(True)
+    ax3.legend(fontsize=9)
+
+    # (4) Cancer Acc
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.set_facecolor('white')
+    if do_smooth:
+        ax4.plot(epochs, cancer_acc.values, alpha=0.35, linewidth=1, color=line_color, label='Accuracy (raw)')
+        ax4.plot(epochs, cancer_acc_s.values, linewidth=2, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
+    else:
+        ax4.plot(epochs, cancer_acc.values, linewidth=2, color=line_color, label='Accuracy')
+    if n_domains_cancer is not None and int(n_domains_cancer) > 0:
+        ax4.axhline(1.0 / float(int(n_domains_cancer)), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance accuracy (random, 1/{int(n_domains_cancer)})')
+    ax4.set_title('Cancer Domain Accuracy')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Accuracy')
+    ax4.spines['top'].set_visible(True)
+    ax4.spines['right'].set_visible(True)
+    ax4.legend(fontsize=9)
+
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+
+    out_svg = os.path.join(out_dir, 'train_domain_diagnostics.svg')
+    fig.savefig(out_svg, format='svg', dpi=150)
+    plt.close(fig)
+    return out_svg
+
+
 def run_single_training(args, cfg, device):
     """原始的单次训练逻辑（现支持双域对抗）"""
     
@@ -897,6 +1064,16 @@ def run_single_training(args, cfg, device):
                 print('Saved training loss figure to', out_train_svg)
             if out_val_svg:
                 print('Saved validation metrics figure to', out_val_svg)
+            out_dom_svg = _plot_domain_diagnostics(
+                hist,
+                args.artifacts_dir,
+                n_domains_batch=n_domains_batch,
+                n_domains_cancer=n_domains_cancer,
+                lambda_slide=cfg.get('lambda_slide', 0.0),
+                lambda_cancer=cfg.get('lambda_cancer', 0.0),
+            )
+            if out_dom_svg:
+                print('Saved domain diagnostics figure to', out_dom_svg)
 
         if getattr(args, 'save_loss_components', 0):
             csv_path = _save_loss_components_csv(hist, args.artifacts_dir)
@@ -1087,6 +1264,16 @@ def run_kfold_training(args, cfg, device):
                     print(f'[KFold] Saved training loss figure to {out_train_svg}')
                 if out_val_svg:
                     print(f'[KFold] Saved validation metrics figure to {out_val_svg}')
+                out_dom_svg = _plot_domain_diagnostics(
+                    hist,
+                    fold_dir,
+                    n_domains_batch=n_domains_batch,
+                    n_domains_cancer=n_domains_cancer,
+                    lambda_slide=cfg.get('lambda_slide', 0.0),
+                    lambda_cancer=cfg.get('lambda_cancer', 0.0),
+                )
+                if out_dom_svg:
+                    print(f'[KFold] Saved domain diagnostics figure to {out_dom_svg}')
             except Exception as e:
                 print(f'[KFold] Warning: failed to save training curves: {e}')
 
@@ -1257,6 +1444,16 @@ def run_loco_training(args, cfg, device):
                     print(f'[LOCO] Saved training loss figure to {out_train_svg}')
                 if out_val_svg:
                     print(f'[LOCO] Saved validation metrics figure to {out_val_svg}')
+                out_dom_svg = _plot_domain_diagnostics(
+                    hist,
+                    loco_dir,
+                    n_domains_batch=n_domains_batch,
+                    n_domains_cancer=n_domains_cancer,
+                    lambda_slide=cfg.get('lambda_slide', 0.0),
+                    lambda_cancer=cfg.get('lambda_cancer', 0.0),
+                )
+                if out_dom_svg:
+                    print(f'[LOCO] Saved domain diagnostics figure to {out_dom_svg}')
             except Exception as e:
                 print(f'[LOCO] Warning: failed to save training curves: {e}')
 
