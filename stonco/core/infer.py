@@ -45,7 +45,6 @@ class InferenceEngine:
                 dropout=self.cfg['dropout'],
                 model=self.cfg['model'],
                 heads=self.cfg.get('heads', 4),
-                use_domain_adv=False,
             )
             _ = m.load_state_dict(load_model_state_dict(self.artifacts_dir, map_location=self.device), strict=False)
             self.model = m.to(self.device)

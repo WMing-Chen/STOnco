@@ -1,9 +1,8 @@
-import argparse, os, numpy as np, torch
+import argparse, os, numpy as np, torch, math
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder
-from .models import STOnco_Classifier, grad_reverse
+from .models import STOnco_Classifier
 from stonco.utils.utils import save_model, save_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
-from torch_geometric.nn import global_mean_pool
 import torch.nn.functional as F
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score
@@ -238,6 +237,10 @@ def main():
     parser.add_argument('--use_domain_adv_cancer', type=int, choices=[0,1], default=None, help='启用/关闭癌种域对抗（1/0）')
     parser.add_argument('--lambda_slide', type=float, default=None, help='批次域对抗损失权重')
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
+    # 新增：GRL beta schedule（固定 DANN-style；仅暴露 target 与 gamma）
+    parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='批次域 GRL 目标强度（DANN schedule），默认1.0')
+    parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度（DANN schedule），默认0.5')
+    parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10')
     
     # 新增：癌种分层与K折/LOCO
     parser.add_argument('--stratify_by_cancer', action='store_true', default=True, help='启用癌种分层划分：按比例分配验证集且每癌种保底1张（n=1除外）')
@@ -264,16 +267,21 @@ def main():
 
     args = parser.parse_args()
 
-    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'use_domain_adv':True, 'domain_lambda':0.3, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
            # 控制项
            'use_pca': False,
            'concat_lap_pe': True,
            'lap_pe_use_gaussian': False,
-           # 新增：双域默认配置（新字段）。为体现优先级，新字段默认设为None或False，稍后进行兼容性映射
-           'use_domain_adv_slide': None,   # 若None，将回退到旧字段 use_domain_adv
+           # 新增：双域默认配置（新字段）
+           'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
            'use_domain_adv_cancer': True, # 默认开启
-           'lambda_slide': None,           # 若None，将回退到 domain_lambda
-           'lambda_cancer': None,           # 若None，将回退到 domain_lambda
+           # alpha（域 loss 权重）
+           'lambda_slide': 1.0,
+           'lambda_cancer': 1.0,
+           # beta（GRL 对抗强度，DANN-style schedule）
+           'grl_beta_slide_target': 1.0,
+           'grl_beta_cancer_target': 0.5,
+           'grl_beta_gamma': 10.0,
            # 新增：HVG控制
            'n_hvg': 'all'
            }
@@ -336,18 +344,28 @@ def main():
         cfg['lambda_slide'] = float(args.lambda_slide)
     if args.lambda_cancer is not None:
         cfg['lambda_cancer'] = float(args.lambda_cancer)
+    if getattr(args, 'grl_beta_slide_target', None) is not None:
+        cfg['grl_beta_slide_target'] = float(args.grl_beta_slide_target)
+    if getattr(args, 'grl_beta_cancer_target', None) is not None:
+        cfg['grl_beta_cancer_target'] = float(args.grl_beta_cancer_target)
+    if getattr(args, 'grl_beta_gamma', None) is not None:
+        cfg['grl_beta_gamma'] = float(args.grl_beta_gamma)
 
-    # 兼容性映射与默认值填充（优先级：新CLI > 旧CLI/旧cfg字段 > 新cfg字段 > 默认）
-    # use_domain_adv_slide: 若未显式指定，回退到旧字段 use_domain_adv
+    # 默认值填充（新字段）
     if cfg.get('use_domain_adv_slide', None) is None:
-        cfg['use_domain_adv_slide'] = bool(cfg.get('use_domain_adv', False))
-    # use_domain_adv_cancer: 若未显式指定，保持其在cfg中的值，默认True
+        cfg['use_domain_adv_slide'] = True
+    cfg['use_domain_adv_slide'] = bool(cfg['use_domain_adv_slide'])
     cfg['use_domain_adv_cancer'] = bool(cfg.get('use_domain_adv_cancer', True))
-    # lambda_*: 若未显式指定，回退到旧字段 domain_lambda（若不存在则0.3）
     if cfg.get('lambda_slide', None) is None:
-        cfg['lambda_slide'] = float(cfg.get('domain_lambda', 0.3))
+        cfg['lambda_slide'] = 1.0
     if cfg.get('lambda_cancer', None) is None:
-        cfg['lambda_cancer'] = float(cfg.get('domain_lambda', 0.3))
+        cfg['lambda_cancer'] = 1.0
+    if cfg.get('grl_beta_slide_target', None) is None:
+        cfg['grl_beta_slide_target'] = 1.0
+    if cfg.get('grl_beta_cancer_target', None) is None:
+        cfg['grl_beta_cancer_target'] = 0.5
+    if cfg.get('grl_beta_gamma', None) is None:
+        cfg['grl_beta_gamma'] = 10.0
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
     if args.device is not None:
@@ -426,7 +444,7 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
 
     in_dim = pyg_graphs[0].x.shape[1]
 
-    n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+    n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
     # 默认：启用分层，按比例划分验证集；若未启用分层，则进行简单划分
@@ -513,21 +531,60 @@ def train_and_validate(
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
     """
+    def _dann_beta(p, beta_target, gamma):
+        p = float(p)
+        beta_target = float(beta_target)
+        gamma = float(gamma)
+        return beta_target * (2.0 / (1.0 + math.exp(-gamma * p)) - 1.0)
+
+    def _make_graph_frequency_weights(graph_labels, k, device):
+        k = int(k)
+        if k <= 0:
+            return None
+        if graph_labels is None:
+            return None
+        labels = torch.as_tensor(graph_labels, dtype=torch.long)
+        if labels.numel() == 0:
+            return torch.ones(k, dtype=torch.float32, device=device)
+        counts = torch.bincount(labels, minlength=k).to(torch.float32)
+        n_graph = float(labels.numel())
+        w = torch.sqrt(torch.tensor(n_graph, dtype=torch.float32) / (float(k) * counts.clamp_min(1.0)))
+        w = w.clamp(0.5, 5.0)
+        w = w / w.mean().clamp_min(1e-6)
+        return w.to(device)
+
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
+        domain_hidden=64,
+        use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
-    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0]).to(device))
-    cel = nn.CrossEntropyLoss()
+    bce = nn.BCEWithLogitsLoss()
 
     train_loader = PyGDataLoader(train_graphs, batch_size=cfg['batch_size_graphs'], shuffle=True, num_workers=num_workers)
     val_loader = PyGDataLoader(val_graphs, batch_size=1, shuffle=False, num_workers=max(0, min(num_workers, 2)))
     extra_val_graphs = list(external_val_graphs) if external_val_graphs else []
+
+    # domain class weights (graph-frequency, sqrt inverse freq; clamp + mean-normalize)
+    dom_w_batch = None
+    dom_w_cancer = None
+    if cfg.get('use_domain_adv_slide', False) and n_domains_batch is not None:
+        dom_w_batch = _make_graph_frequency_weights(
+            [int(g.bat_dom.item()) for g in train_graphs if hasattr(g, 'bat_dom')],
+            int(n_domains_batch),
+            device,
+        )
+    if cfg.get('use_domain_adv_cancer', False) and n_domains_cancer is not None:
+        dom_w_cancer = _make_graph_frequency_weights(
+            [int(g.cancer_dom.item()) for g in train_graphs if hasattr(g, 'cancer_dom')],
+            int(n_domains_cancer),
+            device,
+        )
+    cel_batch = nn.CrossEntropyLoss(weight=dom_w_batch) if dom_w_batch is not None else nn.CrossEntropyLoss()
+    cel_cancer = nn.CrossEntropyLoss(weight=dom_w_cancer) if dom_w_cancer is not None else nn.CrossEntropyLoss()
 
     def _compute_losses(out, batch):
         logits = out['logits']
@@ -539,33 +596,40 @@ def train_and_validate(
         total = loss_task
         loss_batch = torch.tensor(0.0, device=device)
         loss_cancer = torch.tensor(0.0, device=device)
-        if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom'):
+        ce_batch = torch.tensor(float('nan'), device=device)
+        ce_cancer = torch.tensor(float('nan'), device=device)
+
+        if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom') and hasattr(batch, 'batch'):
             if n_domains_batch is None:
                 raise ValueError('n_domains_batch is None while batch domain logits are enabled.')
-            dom_min = int(batch.bat_dom.min().item())
-            dom_max = int(batch.bat_dom.max().item())
+            dom_nodes = batch.bat_dom[batch.batch]
+            dom_min = int(dom_nodes.min().item())
+            dom_max = int(dom_nodes.max().item())
             if dom_min < 0 or dom_max >= int(n_domains_batch):
                 raise ValueError(
                     f"[DomainCheck] batch_dom out of range: min={dom_min}, max={dom_max}, "
                     f"n_domains_batch={n_domains_batch}, slide_ids={getattr(batch, 'slide_id', 'NA')}"
                 )
-            loss_dom_batch = cel(out['dom_logits_slide'], batch.bat_dom)
-            loss_batch = cfg['lambda_slide'] * loss_dom_batch
+            ce_batch = F.cross_entropy(out['dom_logits_slide'], dom_nodes)
+            loss_dom_batch = cel_batch(out['dom_logits_slide'], dom_nodes)
+            loss_batch = float(cfg.get('lambda_slide', 1.0)) * loss_dom_batch
             total = total + loss_batch
-        if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom'):
+        if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom') and hasattr(batch, 'batch'):
             if n_domains_cancer is None:
                 raise ValueError('n_domains_cancer is None while cancer domain logits are enabled.')
-            dom_min = int(batch.cancer_dom.min().item())
-            dom_max = int(batch.cancer_dom.max().item())
+            dom_nodes = batch.cancer_dom[batch.batch]
+            dom_min = int(dom_nodes.min().item())
+            dom_max = int(dom_nodes.max().item())
             if dom_min < 0 or dom_max >= int(n_domains_cancer):
                 raise ValueError(
                     f"[DomainCheck] cancer_dom out of range: min={dom_min}, max={dom_max}, "
                     f"n_domains_cancer={n_domains_cancer}, slide_ids={getattr(batch, 'slide_id', 'NA')}"
                 )
-            loss_dom_cancer = cel(out['dom_logits_cancer'], batch.cancer_dom)
-            loss_cancer = cfg['lambda_cancer'] * loss_dom_cancer
+            ce_cancer = F.cross_entropy(out['dom_logits_cancer'], dom_nodes)
+            loss_dom_cancer = cel_cancer(out['dom_logits_cancer'], dom_nodes)
+            loss_cancer = float(cfg.get('lambda_cancer', 1.0)) * loss_dom_cancer
             total = total + loss_cancer
-        return total, loss_task, loss_batch, loss_cancer
+        return total, loss_task, loss_batch, loss_cancer, ce_batch, ce_cancer
 
     best = {'auroc': -1, 'accuracy': -1, 'state': None, 'epoch': -1, 'macro_f1': float('nan'), 'auprc': float('nan')}
     patience = 0
@@ -579,6 +643,8 @@ def train_and_validate(
         'avg_task_loss': [],
         'avg_batch_domain_loss': [],
         'avg_cancer_domain_loss': [],
+        'avg_batch_domain_ce': [],
+        'avg_cancer_domain_ce': [],
         'train_batch_domain_acc': [],
         'train_cancer_domain_acc': [],
         'var_risk': [],
@@ -592,12 +658,16 @@ def train_and_validate(
     epoch_iter = range(1, cfg['epochs'] + 1)
     if progress_desc:
         epoch_iter = tqdm(epoch_iter, desc=progress_desc, leave=progress_leave)
+    total_steps = int(cfg['epochs']) * max(1, len(train_loader))
+    global_step = 0
     for epoch in epoch_iter:
         model.train()
         tot_total = 0.0
         tot_task = 0.0
         tot_batch = 0.0
         tot_cancer = 0.0
+        tot_batch_ce = 0.0
+        tot_cancer_ce = 0.0
         batch_losses = []
         num_batches = 0
         train_correct = 0
@@ -609,30 +679,34 @@ def train_and_validate(
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
+            p = float(global_step) / float(total_steps) if total_steps > 0 else 0.0
+            beta_gamma = float(cfg.get('grl_beta_gamma', 10.0))
+            grl_beta_slide = _dann_beta(p, float(cfg.get('grl_beta_slide_target', 1.0)), beta_gamma)
+            grl_beta_cancer = _dann_beta(p, float(cfg.get('grl_beta_cancer_target', 0.5)), beta_gamma)
             out = model(
                 batch.x,
                 batch.edge_index,
                 batch=getattr(batch, 'batch', None),
                 edge_weight=getattr(batch, 'edge_weight', None),
-                domain_lambda=cfg['lambda_slide'],
-                lambda_slide=cfg['lambda_slide'],
-                lambda_cancer=cfg['lambda_cancer'],
+                grl_beta_slide=grl_beta_slide,
+                grl_beta_cancer=grl_beta_cancer,
             )
+            global_step += 1
 
-            # 域头训练准确率（图级，按图计数；不参与反传）
+            # 域头训练准确率（spot-level；不参与反传）
             with torch.no_grad():
-                if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom'):
+                if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom') and hasattr(batch, 'batch'):
                     pred = out['dom_logits_slide'].argmax(dim=1)
-                    tgt = batch.bat_dom
+                    tgt = batch.bat_dom[batch.batch]
                     dom_slide_correct += int((pred == tgt).sum().item())
                     dom_slide_total += int(tgt.numel())
-                if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom'):
+                if out.get('dom_logits_cancer', None) is not None and hasattr(batch, 'cancer_dom') and hasattr(batch, 'batch'):
                     pred = out['dom_logits_cancer'].argmax(dim=1)
-                    tgt = batch.cancer_dom
+                    tgt = batch.cancer_dom[batch.batch]
                     dom_cancer_correct += int((pred == tgt).sum().item())
                     dom_cancer_total += int(tgt.numel())
 
-            loss_total, loss_task, loss_batch, loss_cancer = _compute_losses(out, batch)
+            loss_total, loss_task, loss_batch, loss_cancer, ce_batch, ce_cancer = _compute_losses(out, batch)
             loss_total.backward()
             opt.step()
 
@@ -640,6 +714,10 @@ def train_and_validate(
             tot_task += float(loss_task.item())
             tot_batch += float(loss_batch.item())
             tot_cancer += float(loss_cancer.item())
+            if torch.isfinite(ce_batch):
+                tot_batch_ce += float(ce_batch.item())
+            if torch.isfinite(ce_cancer):
+                tot_cancer_ce += float(ce_cancer.item())
             batch_losses.append(float(loss_total.item()))
             num_batches += 1
 
@@ -655,6 +733,8 @@ def train_and_validate(
         avg_task = tot_task / max(1, num_batches)
         avg_batch = tot_batch / max(1, num_batches)
         avg_cancer = tot_cancer / max(1, num_batches)
+        avg_batch_ce = (tot_batch_ce / max(1, num_batches)) if cfg.get('use_domain_adv_slide', False) else float('nan')
+        avg_cancer_ce = (tot_cancer_ce / max(1, num_batches)) if cfg.get('use_domain_adv_cancer', False) else float('nan')
         train_batch_domain_acc = float(dom_slide_correct / dom_slide_total) if dom_slide_total > 0 else float('nan')
         train_cancer_domain_acc = float(dom_cancer_correct / dom_cancer_total) if dom_cancer_total > 0 else float('nan')
         var_risk = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
@@ -664,6 +744,8 @@ def train_and_validate(
         hist['avg_task_loss'].append(avg_task)
         hist['avg_batch_domain_loss'].append(avg_batch)
         hist['avg_cancer_domain_loss'].append(avg_cancer)
+        hist['avg_batch_domain_ce'].append(avg_batch_ce)
+        hist['avg_cancer_domain_ce'].append(avg_cancer_ce)
         hist['train_batch_domain_acc'].append(train_batch_domain_acc)
         hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
         hist['var_risk'].append(var_risk)
@@ -682,9 +764,6 @@ def train_and_validate(
                     vb.edge_index,
                     batch=getattr(vb, 'batch', None),
                     edge_weight=getattr(vb, 'edge_weight', None),
-                    domain_lambda=cfg['lambda_slide'],
-                    lambda_slide=cfg['lambda_slide'],
-                    lambda_cancer=cfg['lambda_cancer'],
                 )
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
@@ -699,9 +778,6 @@ def train_and_validate(
                     vg.edge_index,
                     batch=getattr(vg, 'batch', None),
                     edge_weight=getattr(vg, 'edge_weight', None),
-                    domain_lambda=cfg['lambda_slide'],
-                    lambda_slide=cfg['lambda_slide'],
-                    lambda_cancer=cfg['lambda_cancer'],
                 )
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
@@ -769,6 +845,8 @@ def _save_loss_components_csv(hist, out_dir):
         'avg_total_loss': hist.get('avg_total_loss', [float('nan')] * n_epochs),
         'avg_task_loss': hist.get('avg_task_loss', [float('nan')] * n_epochs),
         'Var_risk': hist.get('var_risk', [float('nan')] * n_epochs),
+        'avg_cancer_domain_ce': hist.get('avg_cancer_domain_ce', [float('nan')] * n_epochs),
+        'avg_batch_domain_ce': hist.get('avg_batch_domain_ce', [float('nan')] * n_epochs),
         'avg_cancer_domain_loss': hist.get('avg_cancer_domain_loss', [float('nan')] * n_epochs),
         'avg_batch_domain_loss': hist.get('avg_batch_domain_loss', [float('nan')] * n_epochs),
         'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
@@ -880,8 +958,9 @@ def _plot_domain_diagnostics(
     - Batch domain: unweighted CE vs log(K), Accuracy vs 1/K
     - Cancer domain: unweighted CE vs log(K), Accuracy vs 1/K
 
-    注意：avg_*_domain_loss 记录的是 lambda_* * CE。
-    本图中 CE 会按 CE = (avg_domain_loss / lambda_*) 还原；当 lambda_*=0 或域头未启用时会显示 NaN。
+    注意：
+    - 优先使用 hist['avg_*_domain_ce']（unweighted CE）。
+    - 若缺失，则回退用 hist['avg_*_domain_loss'] / lambda_* 近似还原（当 lambda_*=0 或域头未启用时会显示 NaN）。
     """
     n_epochs = len(hist.get('avg_total_loss', []))
     if n_epochs == 0:
@@ -899,17 +978,25 @@ def _plot_domain_diagnostics(
 
     batch_loss = _series('avg_batch_domain_loss')
     cancer_loss = _series('avg_cancer_domain_loss')
+    batch_ce_raw = _series('avg_batch_domain_ce')
+    cancer_ce_raw = _series('avg_cancer_domain_ce')
     batch_acc = _series('train_batch_domain_acc')
     cancer_acc = _series('train_cancer_domain_acc')
 
-    if lambda_slide and float(lambda_slide) != 0.0:
-        batch_ce = batch_loss / float(lambda_slide)
+    if batch_ce_raw.notna().any():
+        batch_ce = batch_ce_raw
     else:
-        batch_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
-    if lambda_cancer and float(lambda_cancer) != 0.0:
-        cancer_ce = cancer_loss / float(lambda_cancer)
+        if lambda_slide and float(lambda_slide) != 0.0:
+            batch_ce = batch_loss / float(lambda_slide)
+        else:
+            batch_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
+    if cancer_ce_raw.notna().any():
+        cancer_ce = cancer_ce_raw
     else:
-        cancer_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
+        if lambda_cancer and float(lambda_cancer) != 0.0:
+            cancer_ce = cancer_loss / float(lambda_cancer)
+        else:
+            cancer_ce = pd.Series([float('nan')] * n_epochs, dtype='float64')
 
     # 若域头未启用（acc 为 NaN），则 CE 也显示 NaN，避免误读为 0
     batch_ce = batch_ce.where(~batch_acc.isna(), float('nan'))
@@ -1032,8 +1119,8 @@ def run_single_training(args, cfg, device):
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-        use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
+        domain_hidden=64,
+        use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
     model.load_state_dict(best_state)
@@ -1209,7 +1296,7 @@ def run_kfold_training(args, cfg, device):
 
     in_dim = pyg_graphs[0].x.shape[1]
 
-    n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+    n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
     n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
     # 生成K个fold（按比例 + 保底每癌种1张）
@@ -1290,8 +1377,8 @@ def run_kfold_training(args, cfg, device):
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
+            domain_hidden=64,
+            use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
         model.load_state_dict(best_state)
@@ -1419,7 +1506,7 @@ def run_loco_training(args, cfg, device):
         val_graphs = build_graph_list(val_ids)
 
         in_dim = train_graphs[0].x.shape[1]
-        n_domains_batch = len(batch_to_idx) if (cfg.get('use_domain_adv_slide') if cfg.get('use_domain_adv_slide') is not None else cfg['use_domain_adv']) else None
+        n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
         n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
 
         external_val_graphs = _build_external_val_graphs(args, cfg, loco_dir)
@@ -1470,8 +1557,8 @@ def run_loco_training(args, cfg, device):
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            use_domain_adv=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains=(n_domains_batch if (cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']) else None), domain_hidden=64,
-            use_domain_adv_slide=(cfg['use_domain_adv_slide'] if cfg['use_domain_adv_slide'] is not None else cfg['use_domain_adv']), n_domains_slide=n_domains_batch,
+            domain_hidden=64,
+            use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
         model.load_state_dict(best_state)
@@ -1497,8 +1584,12 @@ def run_loco_training(args, cfg, device):
             with torch.no_grad():
                 for g in val_graphs:
                     vg = g.to(device)
-                    out_v = model(vg.x, vg.edge_index, batch=getattr(vg, 'batch', None), edge_weight=getattr(vg, 'edge_weight', None),
-                                   domain_lambda=cfg['lambda_slide'], lambda_slide=cfg['lambda_slide'], lambda_cancer=cfg['lambda_cancer'])
+                    out_v = model(
+                        vg.x,
+                        vg.edge_index,
+                        batch=getattr(vg, 'batch', None),
+                        edge_weight=getattr(vg, 'edge_weight', None),
+                    )
                     logits_v = out_v['logits']
                     m_slide = eval_logits(logits_v, vg.y)
                     y_np = vg.y.detach().cpu().numpy()

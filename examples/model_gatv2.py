@@ -89,7 +89,6 @@ class SpotoncoGATv2Classifier(nn.Module):
         'h': 节点特征,
         'dom_logits_slide': 切片域logits或None,
         'dom_logits_cancer': 癌种域logits或None,
-        'dom_logits': 兼容旧键，等同于 dom_logits_slide
       }
     """
 
@@ -148,7 +147,6 @@ class SpotoncoGATv2Classifier(nn.Module):
             'h': h,
             'dom_logits_slide': dom_logits_slide,
             'dom_logits_cancer': dom_logits_cancer,
-            'dom_logits': dom_logits_slide,  # 兼容旧键
         }
 
 

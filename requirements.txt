@@ -22,6 +22,9 @@ optuna>=2.10.0
 # Progress bars and utilities
 tqdm>=4.62.0
 
+# Dimensionality reduction (UMAP)
+umap-learn>=0.5.0
+
 # Optional: CUDA support (uncomment if using GPU)
 # torch-cluster>=1.5.0
 # torch-spline-conv>=1.2.0

@@ -12,11 +12,13 @@ STOnco is a PyTorch Geometric-based framework for tumor/non-tumor binary classif
 ## Key Features
 
 - **Dual-Domain Adversarial Learning**: Reduces dependency on cancer-specific signals and batch effects
+- **Spot-Level Domain Heads + GRL Scheduling**: Domain adversarial learning at the spot level with decoupled loss weight and GRL strength
 - **Multiple GNN Architectures**: Support for GATv2, GCN, and GraphSAGE models
 - **Complete Pipeline**: From data preparation to training, inference, and visualization
 - **Hyperparameter Optimization**: Built-in HPO with multi-stage pipeline
 - **Batch Processing**: Efficient inference on multiple samples
 - **Rich Visualization**: Comprehensive plotting and analysis tools
+- **Latent Export + UMAP/t-SNE**: Export 64-d spot embeddings and visualize with UMAP and t-SNE
 
 ## Installation
 
@@ -138,22 +140,48 @@ python -m stonco.utils.visualize_prediction \
     --out_svg visualization.svg
 ```
 
+### 5. Export Spot Embeddings (z64) + UMAP/t-SNE
+
+Export 64-d spot embeddings from the trained model:
+
+```bash
+python -m stonco.utils.export_spot_embeddings \
+    --artifacts_dir ./artifacts \
+    --npz_glob "./processed_data/val_npz/*.npz" \
+    --out_csv ./artifacts/spot_embeddings_val_npz.csv
+```
+
+Visualize the exported embeddings with UMAP + t-SNE (requires `umap-learn`, included in `requirements.txt`):
+
+```bash
+python -m stonco.utils.visualize_umap_tsne \
+    --embeddings_csv ./artifacts/spot_embeddings_val_npz.csv \
+    --out_dir ./artifacts/embedding_plots \
+    --max_points 50000 \
+    --seed 42
+```
+
 ## Model Architecture
 
 STOnco employs a unified `STOnco_Classifier` architecture with:
 
 - **GNN Backbone**: Configurable graph neural network (GATv2/GCN/GraphSAGE)
-- **Task Head**: Binary classification for tumor/non-tumor prediction
-- **Domain Heads**: Optional adversarial heads for cancer type and batch-level domain adaptation
+- **Task Head**: Spot-level tumor/non-tumor prediction with a fixed MLP head `[256, 128, 64, 1]`
+- **Domain Heads**: Optional adversarial heads (spot-level) for cancer type and batch domain adaptation
 
 ### Dual-Domain Adversarial Learning
 
 ```
-Total_Loss = Task_Loss + λ₁ × Cancer_Domain_Loss + λ₂ × Batch_Domain_Loss
+Total_Loss = Task_Loss + λ_slide × Batch_Domain_Loss + λ_cancer × Cancer_Domain_Loss
 ```
 
-- **Cancer Domain Adversarial**: Reduces cancer-type-specific bias
-- **Batch Domain Adversarial**: Mitigates batch effects between slides
+In `train.py`:
+
+- `--lambda_slide` / `--lambda_cancer` are **loss weights (alpha)**.
+- GRL strength uses a DANN-style schedule (fixed) with:
+  - `--grl_beta_slide_target`, `--grl_beta_cancer_target` (target beta; default `1.0/0.5`)
+  - `--grl_beta_gamma` (schedule steepness; default `10`)
+- Domain labels are read from `data/cancer_sample_labels.csv`: `cancer_type` and `Batch_id` (`Batch_id` falls back to `slide_id` if missing). Domain class counts are inferred per run/fold.
 
 ## Project Structure
 
@@ -170,9 +198,11 @@ STOnco/
 │       ├── prepare_data.py   # Data preprocessing
 │       ├── evaluate_models.py # Model evaluation
 │       ├── visualize_prediction.py # Visualization
+│       ├── export_spot_embeddings.py # Export z64 embeddings
+│       ├── visualize_umap_tsne.py # UMAP + t-SNE visualization
 │       └── ...
 ├── examples/                 # Example scripts and tutorials
-├── synthetic_test/           # Synthetic data for testing
+├── synthetic_data/           # (Generated) synthetic data for testing
 ├── docs/                     # Documentation
 └── requirements.txt
 ```
@@ -225,17 +255,20 @@ python -m stonco.utils.evaluate_models \
 
 STOnco expects NPZ files with the following structure:
 
-**Training NPZ:**
-- `features`: Gene expression matrix (n_spots × n_genes)
-- `labels`: Binary labels (n_spots,)
-- `coordinates`: Spatial coordinates (n_spots × 2)
-- `slide_ids`: Slide identifiers (n_spots,)
-- `cancer_types`: Cancer type labels (n_spots,)
+**Training NPZ (multi-slide, from `prepare_data build-train-npz`):**
+- `Xs`: list/array of per-slide gene expression matrices `(n_spots_i, n_genes)`
+- `ys`: list/array of per-slide binary labels `(n_spots_i,)` (0/1)
+- `xys`: list/array of per-slide spatial coordinates `(n_spots_i, 2)`
+- `slide_ids`: per-slide identifiers (strings)
+- `gene_names`: gene names (length `n_genes`)
+- optional `barcodes`: per-slide barcodes
 
-**Single Sample NPZ:**
-- `features`: Gene expression matrix
-- `coordinates`: Spatial coordinates
-- `slide_id`: Single slide identifier
+**Single-slide NPZ (from `prepare_data build-single-npz` / `build-val-npz`):**
+- `X`: gene expression matrix `(n_spots, n_genes)`
+- `xy`: spatial coordinates `(n_spots, 2)`
+- `gene_names`: gene names
+- `sample_id`: slide/sample id (optional but recommended)
+- optional `y`: binary labels, `barcodes`
 
 ## Examples
 

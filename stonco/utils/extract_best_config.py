@@ -94,8 +94,9 @@ def get_base_config():
         "gaussian_sigma_factor": 1.0,
         "pca_dim": 64,
         "use_pca": False,
-        "use_domain_adv": True,
         "domain_lambda": 0.3,
+        "use_domain_adv_slide": True,
+        "use_domain_adv_cancer": True,
         "early_patience": 30,
         "heads": 4,  # GATv2 默认
     }
@@ -225,8 +226,11 @@ def create_combined_config(stages_config, stage_info):
             "use_pca": combined.get("use_pca", False)
         },
         "domain_adaptation": {
-            "use_domain_adv": combined.get("use_domain_adv", True),
-            "domain_lambda": combined.get("domain_lambda", 0.3)
+            "use_domain_adv_slide": combined.get("use_domain_adv_slide", True),
+            "use_domain_adv_cancer": combined.get("use_domain_adv_cancer", True),
+            "domain_lambda": combined.get("domain_lambda", 0.3),
+            "lambda_slide": combined.get("lambda_slide", combined.get("domain_lambda", 0.3)),
+            "lambda_cancer": combined.get("lambda_cancer", combined.get("domain_lambda", 0.3)),
         },
         "extraction_info": {
             "stages_found": list(stages_config.keys()),

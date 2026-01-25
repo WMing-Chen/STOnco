@@ -590,19 +590,19 @@ def main():
     
     args = parser.parse_args()
 
-    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'use_domain_adv':True, 'domain_lambda':0.3, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
-           # 控制项
-           'use_pca': False,
-           'concat_lap_pe': True,
-           'lap_pe_use_gaussian': False,
-           # 双域默认配置（与 train.py 对齐）
-           'use_domain_adv_slide': None,   # 若None，将回退到旧字段 use_domain_adv
-           'use_domain_adv_cancer': True,  # 默认开启
-           'lambda_slide': None,           # 若None，将回退到 domain_lambda
-           'lambda_cancer': None,          # 若None，将回退到 domain_lambda
-           # HVG控制（保持与 train.py 一致）
-           'n_hvg': 'all'
-           }
+    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'domain_lambda':0.3, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+	           # 控制项
+	           'use_pca': False,
+	           'concat_lap_pe': True,
+	           'lap_pe_use_gaussian': False,
+	           # 双域默认配置（与 train.py 对齐）
+	           'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
+	           'use_domain_adv_cancer': True,  # 默认开启
+	           'lambda_slide': None,           # 若None，将回退到 domain_lambda
+	           'lambda_cancer': None,          # 若None，将回退到 domain_lambda
+	           # HVG控制（保持与 train.py 一致）
+	           'n_hvg': 'all'
+	           }
 
     # 覆盖配置以支持快速实验和HPO
     if args.epochs is not None:
@@ -612,7 +612,8 @@ def main():
     if args.batch_size_graphs is not None:
         cfg['batch_size_graphs'] = args.batch_size_graphs
     if args.disable_domain_adv:
-        cfg['use_domain_adv'] = False
+        cfg['use_domain_adv_slide'] = False
+        cfg['use_domain_adv_cancer'] = False
     if args.model is not None:
         cfg['model'] = args.model
     if args.heads is not None:
@@ -651,9 +652,10 @@ def main():
     if getattr(args, 'lambda_cancer', None) is not None:
         cfg['lambda_cancer'] = float(args.lambda_cancer)
 
-    # 兼容性映射与默认值填充（与 train.py 对齐）
+    # 默认值填充（新字段，与 train.py 对齐）
     if cfg.get('use_domain_adv_slide', None) is None:
-        cfg['use_domain_adv_slide'] = bool(cfg.get('use_domain_adv', False))
+        cfg['use_domain_adv_slide'] = True
+    cfg['use_domain_adv_slide'] = bool(cfg['use_domain_adv_slide'])
     cfg['use_domain_adv_cancer'] = bool(cfg.get('use_domain_adv_cancer', True))
     if cfg.get('lambda_slide', None) is None:
         cfg['lambda_slide'] = float(cfg.get('domain_lambda', 0.3))

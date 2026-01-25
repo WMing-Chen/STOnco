@@ -228,7 +228,6 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
         dropout=cfg['dropout'],
         model=cfg['model'],
         heads=cfg.get('heads', 4),
-        use_domain_adv=False,
     )
     _ = model.load_state_dict(load_model_state_dict(args.artifacts_dir, map_location=device), strict=False)
     model = model.to(device)

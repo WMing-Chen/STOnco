@@ -14,6 +14,8 @@
 - infer.py：单切片 NPZ 推理（输出预测 CSV；可选保存基因重要性 CSV）
 - batch_infer.py：批量推理，支持多进程预处理；可选保存每张切片的基因重要性 CSV
 - visualize_prediction.py：单切片真实/预测空间分布可视化（SVG）
+- export_spot_embeddings.py：导出每个 spot 的 64-d embedding（z64）
+- visualize_umap_tsne.py：对导出的 embedding 做 UMAP + t-SNE 可视化（SVG）
 - Dual-Domain Adversarial Learning.md：双域自适应设计说明
 - utils.py：模型与元信息存取
 - synthetic_data/：示例合成/模拟数据（可选）
@@ -48,12 +50,12 @@
 - Python 3.12（已测）
 - PyTorch（示例：2.6.0+cu124）
 - PyTorch Geometric 2.6.1（以及 pyg-lib、torch-scatter、torch-sparse、torch-cluster）
-- 其他：scikit-learn、scipy、pandas、joblib、matplotlib
+- 其他：scikit-learn、scipy、pandas、joblib、matplotlib、umap-learn（UMAP 可视化）
 
 安装示例（请按你本机 PyTorch/CUDA 版本替换链接与版本号）：
 
 ```bash
-pip install scikit-learn pandas scipy joblib matplotlib
+pip install scikit-learn pandas scipy joblib matplotlib umap-learn
 pip install --default-timeout=600 \
   torch_scatter torch_sparse torch_cluster pyg-lib \
   -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
@@ -62,7 +64,7 @@ pip install torch_geometric==2.6.1
 
 ## 快速开始
 
-一键式示例流程：从原始 CSV 准备数据 → 训练（示例使用双域对抗默认配置）→ 单/批量推理 → 可视化。
+一键式示例流程：从原始 CSV 准备数据 → 训练（示例使用双域对抗默认配置）→ 单/批量推理 → 可视化 →（可选）导出 embedding 并做 UMAP/t-SNE。
 
 ```bash
 # 0) 路径约定（请按需修改）
@@ -86,7 +88,7 @@ python -m stonco.utils.prepare_data build-val-npz \
   --xy_cols row col \
   --label_col true_label
 
-# 2) 训练（双域对抗：默认启用；未显式给出 lambda_* 时回退到 0.3）
+# 2) 训练（双域对抗：默认启用；alpha=--lambda_*、beta=--grl_beta_* 可独立调节）
 python -m stonco.core.train \
   --train_npz $DATA_ROOT/train_data.npz \
   --artifacts_dir $ARTIFACTS \
@@ -125,6 +127,17 @@ python -m stonco.utils.visualize_prediction \
   --artifacts_dir $ARTIFACTS \
   --slide_idx -1 \
   --out_svg ${PRED_CSV%.*}_vis_val.svg
+
+# 6) 导出 spot embedding（z64）并做 UMAP + t-SNE（可选）
+python -m stonco.utils.export_spot_embeddings \
+  --artifacts_dir $ARTIFACTS \
+  --npz_glob "$VAL_NPZ_DIR/*.npz" \
+  --out_csv $ARTIFACTS/spot_embeddings_val_npz.csv
+python -m stonco.utils.visualize_umap_tsne \
+  --embeddings_csv $ARTIFACTS/spot_embeddings_val_npz.csv \
+  --out_dir $ARTIFACTS/embedding_plots \
+  --max_points 50000 \
+  --seed 42
 ```
 
 默认参数要点：
@@ -132,7 +145,8 @@ python -m stonco.utils.visualize_prediction \
 - 训练（train.py）：
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
   - 双域对抗：细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制；默认两者均启用（slide 对应 batch 域）。
-  - 损失权重：未显式给出 `--lambda_slide/--lambda_cancer` 时回退到 `domain_lambda=0.3`。
+  - alpha（域 loss 权重）：`--lambda_slide/--lambda_cancer`（默认 **1.0/1.0**）。
+  - beta（GRL 对抗强度）：DANN-style schedule（固定），`--grl_beta_slide_target/--grl_beta_cancer_target/--grl_beta_gamma`（默认 **1.0/0.5/10**）。
   - 外部验证：`--val_sample_dir` 指定外部验证 NPZ 目录（单切片），验证指标会合并计算。
   - Loss 组件：`--save_loss_components 1`（默认开启）会保存 `loss_components.csv` 到 artifacts_dir。
   - 解释性：默认开启，`--explain_method ig`，`--ig_steps 50`；训练结束会保存 `per_gene_saliency.csv` 到 artifacts_dir。
@@ -320,7 +334,11 @@ python -m stonco.core.train \
 - 优化器：--lr，--weight_decay
 - 域自适应（双域，对抗式）：
   - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
-  - 损失权重：--lambda_slide（batch 域），--lambda_cancer（未指定时回退到 domain_lambda=0.3）
+  - alpha（域 loss 权重）：--lambda_slide（batch 域），--lambda_cancer（cancer 域）（默认 1.0/1.0）
+  - beta（GRL 对抗强度）：DANN-style schedule（固定）
+    - --grl_beta_slide_target（默认 1.0）
+    - --grl_beta_cancer_target（默认 0.5）
+    - --grl_beta_gamma（默认 10）
 - 划分/验证：
   - --stratify_by_cancer 按癌种分层（默认启用，按比例划分且每癌种保底 1 张，n=1 仅训练）
   - --no_stratify_by_cancer 关闭分层，使用最后 1 张作为验证
@@ -361,7 +379,7 @@ python -m stonco.core.train \
 
 - 双域对抗（癌种域 + 批次域）的典型组合：
 ```bash
-# 仅批次域对抗（Batch-only），常用：lambda_slide=0.3
+# 仅批次域对抗（Batch-only），示例：alpha(lambda_slide)=0.3
 python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts_slide_only \
@@ -371,7 +389,7 @@ python -m stonco.core.train \
   --model gatv2 --heads 4 --hidden 128 --num_layers 3 --dropout 0.3 \
   --device cuda
 
-# 仅癌种域对抗（Cancer-only），常用：lambda_cancer=0.3
+# 仅癌种域对抗（Cancer-only），示例：alpha(lambda_cancer)=0.3
 python -m stonco.core.train \
   --train_npz /path/to/train_data.npz \
   --artifacts_dir /path/to/artifacts_cancer_only \
@@ -392,7 +410,10 @@ python -m stonco.core.train \
   --device cuda
 
 ```
-提示：若未显式传入 `--lambda_slide/--lambda_cancer`，二者会回退到旧字段 `domain_lambda=0.3`（详见 meta.json 中的 cfg）。
+提示：
+- 域标签从 `data/cancer_sample_labels.csv` 读取：`cancer_type`（cancer 域）与 `Batch_id`（batch 域）；`Batch_id` 缺失时回退为 `slide_id`；训练时按当前 fold/train 出现的类别动态映射到连续索引（K 动态）。
+- `--lambda_*` 是 alpha（域 loss 权重），`--grl_beta_*` 是 beta（GRL 对抗强度，schedule 固定为 DANN-style）。
+- 域 loss 以 spot-level 计算（对所有 spot 做全局 mean）；域 CE 默认启用 graph-frequency 的 sqrt 反频率 class weight，并做 `clamp(0.5, 5.0)` + mean-normalize 稳定化。
 
 - 基于癌种的 KFold（随机生成 K 组“每癌种 1 张验证”组合）：
 
@@ -463,7 +484,7 @@ HPO 已独立到 `stonco/core/train_hpo.py`，提供统一三阶段流水线与�
 - --rescore_topk K，多种子复评的 Top-K
 - --rescore_stages 需要复评的阶段列表（逗号分隔）
 - --seeds 多种子列表（逗号分隔）
-- 其余训练相关参数（如 --epochs、--early_patience、--model、--lap_pe_dim 等）与 train.py 保持一致
+- 其余训练相关参数（如 --epochs、--early_patience、--model、--lap_pe_dim 等）基本与 train.py 保持一致；本轮新增的 `--grl_beta_*` 参数暂未在 train_hpo.py 暴露（后续统一）
   - 包含划分参数：`--val_ratio`（默认 0.2）与 `--no_stratify_by_cancer`
 
 示例：
@@ -641,7 +662,50 @@ python -m stonco.utils.visualize_prediction \
 
 ---
 
-## 9. 合成/模拟数据（可选）
+## 9. 导出 Spot Embedding（z64）与 UMAP + t-SNE
+
+用于调试/分析：导出每个 spot 的 64-d 潜变量（来自 task MLP 的 64-d 隐藏层输出），并用 UMAP 与 t-SNE 可视化。
+
+依赖：
+- `umap-learn`（UMAP）；t-SNE 来自 `scikit-learn`。`requirements.txt` 已包含 `umap-learn`。
+
+### 9.1 导出 embedding（CSV）
+
+输入二选一：
+- 一组单切片 NPZ（推荐用于 val_npz/external_val）：
+```bash
+python -m stonco.utils.export_spot_embeddings \
+  --artifacts_dir /path/to/artifacts \
+  --npz_glob '/path/to/val_npz/*.npz' \
+  --out_csv /path/to/artifacts/spot_embeddings_val_npz.csv
+```
+- 一个多切片训练 NPZ（可用 `--subset train|val|all` 按 meta.json 的 train/val ids 过滤）：
+```bash
+python -m stonco.utils.export_spot_embeddings \
+  --artifacts_dir /path/to/artifacts \
+  --train_npz /path/to/train_data.npz \
+  --subset val \
+  --out_csv /path/to/artifacts/spot_embeddings_train_npz_val.csv
+```
+
+### 9.2 UMAP + t-SNE 可视化（SVG）
+
+```bash
+python -m stonco.utils.visualize_umap_tsne \
+  --embeddings_csv /path/to/artifacts/spot_embeddings_val_npz.csv \
+  --out_dir /path/to/artifacts/embedding_plots \
+  --max_points 50000 \
+  --seed 42
+```
+
+输出：
+- `umap_tsne_by_tumor.svg`
+- `umap_tsne_by_batch.svg`
+- `umap_tsne_by_cancer.svg`
+
+---
+
+## 10. 合成/模拟数据（可选）
 
 可用 generate_synthetic_data.py 生成示例数据，快速端到端验证：
 ```bash

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, SAGEConv, GCNConv, LayerNorm, global_mean_pool
+from torch_geometric.nn import GATv2Conv, SAGEConv, GCNConv, LayerNorm
 from torch_geometric.nn.conv import MessagePassing
 from torch_scatter import scatter
 
@@ -87,9 +87,35 @@ class GNNBackbone(nn.Module):
 class ClassifierHead(nn.Module):
     def __init__(self, in_dim):
         super().__init__()
-        self.fc = nn.Linear(in_dim, 1)
-    def forward(self, h):
-        return self.fc(h).squeeze(-1)
+        self.fc1 = nn.Linear(in_dim, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.fc3 = nn.Linear(128, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.fc4 = nn.Linear(64, 1)
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, h, return_z=False):
+        x = self.fc1(h)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.drop(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.drop(x)
+
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.relu(x)
+        z64 = self.drop(x)
+
+        logits = self.fc4(z64).squeeze(-1)
+        if return_z:
+            return logits, z64
+        return logits, None
 
 class DomainHead(nn.Module):
     def __init__(self, in_dim, n_domains, hidden=64):
@@ -118,41 +144,29 @@ class STOnco_Classifier(nn.Module):
         use_domain_adaptation: Whether to enable domain adaptation
     """
     def __init__(self, in_dim, hidden=128, num_layers=3, dropout=0.3, model='gatv2', heads=4,
-                 use_domain_adv=False, n_domains=None, domain_hidden=64,
-                 # 新增双域控制
+                 domain_hidden=64,
                  use_domain_adv_slide=False, n_domains_slide=None,
                  use_domain_adv_cancer=False, n_domains_cancer=None):
         super().__init__()
         self.gnn = GNNBackbone(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout, model=model, heads=heads)
         self.clf = ClassifierHead(self.gnn.out_dim)
-        # 旧字段兼容
-        self.use_domain_adv = use_domain_adv
-        self.dom = None  # 保留旧属性以兼容
-        # 新域对抗开关与head
-        self.use_domain_adv_slide = use_domain_adv_slide or (use_domain_adv and (n_domains is not None))
-        self.use_domain_adv_cancer = use_domain_adv_cancer
-        self.dom_slide = DomainHead(self.gnn.out_dim, n_domains_slide if n_domains_slide is not None else (n_domains if n_domains is not None else 0), hidden=domain_hidden) \
-            if self.use_domain_adv_slide and ((n_domains_slide is not None and n_domains_slide>0) or (n_domains is not None and n_domains>0)) else None
+        self.use_domain_adv_slide = bool(use_domain_adv_slide) and (n_domains_slide is not None and int(n_domains_slide) > 0)
+        self.use_domain_adv_cancer = bool(use_domain_adv_cancer) and (n_domains_cancer is not None and int(n_domains_cancer) > 0)
+        self.dom_slide = DomainHead(self.gnn.out_dim, int(n_domains_slide), hidden=domain_hidden) if self.use_domain_adv_slide else None
         self.dom_cancer = DomainHead(self.gnn.out_dim, n_domains_cancer, hidden=domain_hidden) \
-            if self.use_domain_adv_cancer and (n_domains_cancer is not None and n_domains_cancer>0) else None
+            if self.use_domain_adv_cancer else None
 
-    def forward(self, x, edge_index, batch=None, edge_weight=None, domain_lambda=1.0, lambda_slide=1.0, lambda_cancer=1.0):
+    def forward(self, x, edge_index, batch=None, edge_weight=None, grl_beta_slide=1.0, grl_beta_cancer=1.0, return_z=False):
         h = self.gnn(x, edge_index, edge_weight=edge_weight)
-        logits = self.clf(h)
+        logits, z64 = self.clf(h, return_z=return_z)
         dom_logits_slide = None
         dom_logits_cancer = None
         if (self.dom_slide is not None) or (self.dom_cancer is not None):
-            # 默认采用全图池化，如需图批次请传 batch
-            if batch is None:
-                batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-            pooled = global_mean_pool(h, batch)
             if self.dom_slide is not None:
-                dom_logits_slide = self.dom_slide(grad_reverse(pooled, lambda_slide))
+                dom_logits_slide = self.dom_slide(grad_reverse(h, grl_beta_slide))
             if self.dom_cancer is not None:
-                dom_logits_cancer = self.dom_cancer(grad_reverse(pooled, lambda_cancer))
-        # 保持旧键兼容：dom_logits 指向 slide 的输出
-        return {'logits': logits, 'h': h, 'dom_logits_slide': dom_logits_slide, 'dom_logits_cancer': dom_logits_cancer, 'dom_logits': dom_logits_slide}
-
-
-# Backward compatibility alias
-STRIDE_Classifier = STOnco_Classifier
+                dom_logits_cancer = self.dom_cancer(grad_reverse(h, grl_beta_cancer))
+        out = {'logits': logits, 'dom_logits_slide': dom_logits_slide, 'dom_logits_cancer': dom_logits_cancer}
+        if return_z:
+            out['z64'] = z64
+        return out
