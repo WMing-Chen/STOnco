@@ -202,6 +202,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
     cfg.setdefault('lap_pe_dim', 16)
     cfg.setdefault('edge_attr_dim', 0)
     cfg.setdefault('use_edge_attr', False)
+    cfg.setdefault('clf_hidden', [256, 128, 64])
 
     # 若单切片 npz 无 y，尝试从验证集目录读取 true_label
     if y is None and args.val_root is not None:
@@ -221,6 +222,10 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
     # 构建与加载模型（统一使用 SpotoncoGNNClassifier）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     in_dim = data_g.x.shape[1]
+    clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
+    if isinstance(clf_hidden, str):
+        clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+    clf_hidden = [int(x) for x in clf_hidden]
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'],
@@ -228,6 +233,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
         dropout=cfg['dropout'],
         model=cfg['model'],
         heads=cfg.get('heads', 4),
+        clf_hidden=clf_hidden,
     )
     _ = model.load_state_dict(load_model_state_dict(args.artifacts_dir, map_location=device), strict=False)
     model = model.to(device)

@@ -85,16 +85,26 @@ class GNNBackbone(nn.Module):
         return h
 
 class ClassifierHead(nn.Module):
-    def __init__(self, in_dim):
+    def __init__(self, in_dim, hidden_dims=(256, 128, 64), dropout=0.1):
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.fc4 = nn.Linear(64, 1)
-        self.drop = nn.Dropout(0.1)
+        if hidden_dims is None:
+            hidden_dims = (256, 128, 64)
+        hidden_dims = tuple(int(x) for x in hidden_dims)
+        if len(hidden_dims) != 3:
+            raise ValueError(f'clf_hidden must have exactly 3 integers (h1,h2,64), got {hidden_dims}')
+        if int(hidden_dims[-1]) != 64:
+            raise ValueError(f'clf_hidden must end with 64 (to keep z64 compatible), got {hidden_dims}')
+
+        h1, h2, h3 = (int(hidden_dims[0]), int(hidden_dims[1]), int(hidden_dims[2]))
+
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.bn1 = nn.BatchNorm1d(h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.bn2 = nn.BatchNorm1d(h2)
+        self.fc3 = nn.Linear(h2, h3)
+        self.bn3 = nn.BatchNorm1d(h3)
+        self.fc4 = nn.Linear(h3, 1)
+        self.drop = nn.Dropout(float(dropout))
 
     def forward(self, h, return_z=False):
         x = self.fc1(h)
@@ -144,12 +154,13 @@ class STOnco_Classifier(nn.Module):
         use_domain_adaptation: Whether to enable domain adaptation
     """
     def __init__(self, in_dim, hidden=128, num_layers=3, dropout=0.3, model='gatv2', heads=4,
+                 clf_hidden=(256, 128, 64),
                  domain_hidden=64,
                  use_domain_adv_slide=False, n_domains_slide=None,
                  use_domain_adv_cancer=False, n_domains_cancer=None):
         super().__init__()
         self.gnn = GNNBackbone(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout, model=model, heads=heads)
-        self.clf = ClassifierHead(self.gnn.out_dim)
+        self.clf = ClassifierHead(self.gnn.out_dim, hidden_dims=clf_hidden, dropout=0.1)
         self.use_domain_adv_slide = bool(use_domain_adv_slide) and (n_domains_slide is not None and int(n_domains_slide) > 0)
         self.use_domain_adv_cancer = bool(use_domain_adv_cancer) and (n_domains_cancer is not None and int(n_domains_cancer) > 0)
         self.dom_slide = DomainHead(self.gnn.out_dim, int(n_domains_slide), hidden=domain_hidden) if self.use_domain_adv_slide else None

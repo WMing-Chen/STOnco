@@ -168,6 +168,7 @@ def main():
     cfg.setdefault('hidden', 128)
     cfg.setdefault('num_layers', 3)
     cfg.setdefault('dropout', 0.3)
+    cfg.setdefault('clf_hidden', [256, 128, 64])
 
     pp = Preprocessor.load(artifacts_dir)
     id2batch, id2type = _load_domain_maps()
@@ -202,6 +203,10 @@ def main():
 
         if model is None:
             in_dim = int(g.x.shape[1])
+            clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
+            if isinstance(clf_hidden, str):
+                clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+            clf_hidden = [int(x) for x in clf_hidden]
             m = STOnco_Classifier(
                 in_dim=in_dim,
                 hidden=int(cfg['hidden']),
@@ -209,6 +214,7 @@ def main():
                 dropout=float(cfg['dropout']),
                 model=str(cfg['model']),
                 heads=int(cfg.get('heads', 4)),
+                clf_hidden=clf_hidden,
             )
             _ = m.load_state_dict(load_model_state_dict(artifacts_dir, map_location=device), strict=False)
             model = m.to(device)

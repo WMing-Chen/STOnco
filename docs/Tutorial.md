@@ -327,6 +327,8 @@ python -m stonco.core.train \
 - 模型与结构：
   - --model {gatv2,sage,gcn}（默认 gatv2），--heads（仅 gatv2）
   - --hidden，--num_layers，--dropout
+  - 分类头：--clf_hidden（默认 256,128,64；必须以 64 结尾以保持 z64 导出/下游兼容）
+  - 域头：--dom_hidden（默认 64；作用于 batch/cancer 两个域头）
   - LapPE：--lap_pe_dim（>0 启用，默认 16）、--concat_lap_pe {0,1}、--lap_pe_use_gaussian {0,1}
 - 预处理：
   - --use_pca {0,1}（可选 PCA；默认关闭）
@@ -351,12 +353,13 @@ python -m stonco.core.train \
   - --val_sample_dir 外部验证 NPZ 目录（单切片），验证指标与内部验证合并计算
   - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
   - --save_train_curves 0/1（默认 1）：保存 train_loss.svg 与 train_val_metrics.svg
-  - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于最佳模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
+  - --save_last：若训练实际跑满 `--epochs`，则用最后一个 epoch 覆盖 `artifacts_dir/model.pt`；同时额外保存最优模型到 `artifacts_dir/model_best.pt`（不强制关闭早停；如需保证跑满可用 `--early_patience 0`）
+  - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于 `artifacts_dir/model.pt` 对应的模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
-- 模型：model.pt；元信息：meta.json（含 cfg 与 best_epoch）
-- meta.json 额外包含 train_ids、val_ids、metrics（auroc/auprc/accuracy/macro_f1）
+- 模型：model.pt（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）；可选：model_best.pt（启用 --save_last 时保存最优模型）
+- 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint）
 - 可视化：train_loss.svg（2×3：avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy），train_val_metrics.svg（2×2：val_accuracy/val_macro_f1/val_auroc/val_auprc）
 - Loss 组件：loss_components.csv（avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy/val_*）
 
@@ -367,10 +370,11 @@ python -m stonco.core.train \
 - 按癌种 KFold（--kfold_cancer）：
   - 统一在 artifacts_dir 的同级目录创建 `kfold_val/`；每一折的产物位于 `kfold_val/fold_{i}/`：
     - 预处理器产物（与单次训练一致）
-    - 最优模型 `model.pt` 与 `meta.json`（包含本折的 train/val 划分与最佳指标）
+    - `model.pt`（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）与 `meta.json`（包含本折的 train/val 划分与 best/last 指标等）
+    - （可选）`model_best.pt`（启用 --save_last 时保存最优模型）
   - 汇总表：`kfold_val/kfold_summary.csv`，包含每折的 `fold, best_epoch, auroc, auprc, accuracy, macro_f1, n_train, n_val`，并在日志中打印均值概览。
 - LOCO 留一癌种（--leave_one_cancer_out）：
-  - 在 artifacts_dir 的父目录创建 `loco_eval/`，并为每个癌种建立子目录 `loco_eval/{CancerType}/`，内部包含最优 `model.pt`、`meta.json` 与该癌种的划分信息。
+  - 在 artifacts_dir 的父目录创建 `loco_eval/`，并为每个癌种建立子目录 `loco_eval/{CancerType}/`，内部包含 `model.pt`、`meta.json` 与该癌种的划分信息（若启用 --save_last 且跑满 epochs，将用最后一轮覆盖 model.pt，并保存最优到 model_best.pt）。
   - 汇总表：`loco_eval/loco_summary.csv`，字段与 KFold 类似（含 per-cancer 的最佳指标与样本统计）。
 
 > 详细实现参见 `stonco/core/train.py`

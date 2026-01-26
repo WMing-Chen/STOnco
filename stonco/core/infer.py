@@ -28,6 +28,7 @@ class InferenceEngine:
         self.cfg.setdefault('hidden', 128)
         self.cfg.setdefault('num_layers', 3)
         self.cfg.setdefault('dropout', 0.3)
+        self.cfg.setdefault('clf_hidden', [256, 128, 64])
 
         self.pp = Preprocessor.load(artifacts_dir)
         self.device = torch.device(device) if isinstance(device, str) else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
@@ -38,6 +39,10 @@ class InferenceEngine:
 
     def build_model_if_needed(self, in_dim: int):
         if self.model is None:
+            clf_hidden = self.cfg.get('clf_hidden', [256, 128, 64])
+            if isinstance(clf_hidden, str):
+                clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+            clf_hidden = [int(x) for x in clf_hidden]
             m = STOnco_Classifier(
                 in_dim=in_dim,
                 hidden=self.cfg['hidden'],
@@ -45,6 +50,7 @@ class InferenceEngine:
                 dropout=self.cfg['dropout'],
                 model=self.cfg['model'],
                 heads=self.cfg.get('heads', 4),
+                clf_hidden=clf_hidden,
             )
             _ = m.load_state_dict(load_model_state_dict(self.artifacts_dir, map_location=self.device), strict=False)
             self.model = m.to(self.device)

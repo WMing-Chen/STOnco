@@ -94,12 +94,13 @@ TRAIN_NPZ
 
 写出到 `ARTIFACTS_DIR`（训练主产物）：
 - **必须（下游推理依赖）**
-  - `ARTIFACTS_DIR/model.pt`：模型权重（`infer.py`/`batch_infer.py` 依赖）
-  - `ARTIFACTS_DIR/meta.json`：训练配置与划分信息（推理会读 `cfg`；批量推理内部验证会读 `val_ids`）
+  - `ARTIFACTS_DIR/model.pt`：模型权重（`infer.py`/`batch_infer.py` 依赖；默认保存验证集最优模型；若训练启用 `--save_last` 且实际跑满 `--epochs`，则会用最后一轮覆盖）
+  - `ARTIFACTS_DIR/meta.json`：训练配置与划分信息（推理会读 `cfg`；批量推理内部验证会读 `val_ids`；并记录 best/last 的 epoch 与指标，以及 `saved_checkpoint`）
   - `ARTIFACTS_DIR/genes_hvg.txt`：HVG 列表（由 `Preprocessor.save` 写）
   - `ARTIFACTS_DIR/scaler.joblib`：标准化器（由 `Preprocessor.save` 写）
   - `ARTIFACTS_DIR/pca.joblib`：PCA 信息（可能是 dict：包含 `use_pca` 与 `pca`）
 - **可选（辅助分析/复现）**
+  - `ARTIFACTS_DIR/model_best.pt`：最优模型权重（仅当训练使用 `--save_last` 时额外保存）
   - `ARTIFACTS_DIR/train_loss.svg`：训练曲线图（默认写出）
   - `ARTIFACTS_DIR/train_val_metrics.svg`：验证指标曲线图（默认写出）
   - `ARTIFACTS_DIR/loss_components.csv`：loss 组件记录（需 `--save_loss_components 1`）
@@ -133,7 +134,7 @@ TRAIN_NPZ
       -> 写出 ARTIFACTS_PARENT/kfold_val/fold_k/...
       -> (可选) 从 fold_k 目录加载预处理器，构建 external_val_graphs 参与验证
       -> train_and_validate
-      -> 保存 fold_k 的 model.pt / meta.json / (可选) 训练曲线与 loss CSV
+      -> 保存 fold_k 的 model.pt / meta.json / (可选) model_best.pt / (可选) 训练曲线与 loss CSV
   -> 汇总写出 ARTIFACTS_PARENT/kfold_val/kfold_summary.csv
 ```
 
@@ -142,6 +143,7 @@ TRAIN_NPZ
 写出到 `ARTIFACTS_PARENT/kfold_val/`：
 - `ARTIFACTS_PARENT/kfold_val/fold_1/` ... `fold_K/`
   - `fold_i/model.pt`
+  - `fold_i/model_best.pt`（仅当训练使用 `--save_last` 时额外保存）
   - `fold_i/meta.json`
   - `fold_i/genes_hvg.txt`, `fold_i/scaler.joblib`, `fold_i/pca.joblib`（预处理器产物）
   - `fold_i/train_loss.svg`, `fold_i/train_val_metrics.svg`（默认）
@@ -188,6 +190,7 @@ TRAIN_NPZ
 写出到 `ARTIFACTS_PARENT/loco_eval/`：
 - `ARTIFACTS_PARENT/loco_eval/<cancer_type>/`
   - `model.pt`, `meta.json`
+  - `model_best.pt`（仅当训练使用 `--save_last` 时额外保存）
   - `genes_hvg.txt`, `scaler.joblib`, `pca.joblib`
   - `train_loss.svg`, `train_val_metrics.svg`（默认）
   - `loss_components.csv`（可选）
@@ -264,8 +267,7 @@ TRAIN_NPZ
 
 | 模式 | 主要命令 | 主要写出位置 | 下游最关键依赖 |
 |---|---|---|---|
-| 单次训练 | `python -m stonco.core.train ...` | `ARTIFACTS_DIR/` | `model.pt` + `meta.json` + 预处理器文件 |
+| 单次训练 | `python -m stonco.core.train ...` | `ARTIFACTS_DIR/` | `model.pt` + `meta.json` + 预处理器文件（如启用 `--save_last`，还会写出 `model_best.pt`，且 `model.pt` 可能是最后一轮） |
 | KFold | `train --kfold_cancer K` | `ARTIFACTS_PARENT/kfold_val/fold_i/` + `kfold_summary.csv` | 每折 `fold_i/` 作为独立 `--artifacts_dir` |
 | LOCO | `train --leave_one_cancer_out` | `ARTIFACTS_PARENT/loco_eval/<ct>/` + 顶层汇总 CSV | 每癌种目录 `<ct>/` + 顶层 CSV |
 | HPO | `python -m stonco.core.train_hpo --tune ...` | `ARTIFACTS_PARENT/tuning/` | `best_config*.json`（供 `train.py --config_json` 使用） |
-

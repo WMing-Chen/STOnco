@@ -1,9 +1,9 @@
 import os, joblib, json
 import torch
 
-def save_model(model, path):
+def save_model(model, path, filename='model.pt'):
     os.makedirs(path, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(path, 'model.pt'))
+    torch.save(model.state_dict(), os.path.join(path, filename))
 
 def load_model_state_dict(path, map_location='cpu'):
     return torch.load(os.path.join(path, 'model.pt'), map_location=map_location)

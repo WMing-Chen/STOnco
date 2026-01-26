@@ -67,6 +67,8 @@ python -m stonco.core.train \
 ```
 
 Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics. The `meta.json` now records `train_ids`, `val_ids`, and `metrics` for reproducibility. You can control validation splitting with `--val_ratio` (default 0.2) or disable stratification via `--no_stratify_by_cancer`.
+You can also adjust the classifier/domain-head widths via `--clf_hidden` (must end with 64) and `--dom_hidden` (one hidden layer for both domain heads); values are saved into `meta.json` to keep inference consistent.
+If you want the final saved `model.pt` to be the last epoch (instead of best-by-validation), use `--save_last` (only overwrites `model.pt` when training actually reaches `--epochs`; you can disable early stopping with `--early_patience 0`). When enabled, the best checkpoint is also saved as `model_best.pt`, and `meta.json` includes `last_epoch/last_metrics/saved_checkpoint`.
 Disable early stopping:
 
 ```bash

@@ -228,6 +228,9 @@ def main():
     parser.add_argument('--hidden', type=int, default=None, help='隐藏层维度')
     parser.add_argument('--num_layers', type=int, default=None, help='GNN层数')
     parser.add_argument('--dropout', type=float, default=None, help='Dropout比例')
+    # 新增：分类头与域头结构
+    parser.add_argument('--clf_hidden', default=None, help='分类头隐藏层维度，逗号分隔，必须以64结尾（默认：256,128,64）')
+    parser.add_argument('--dom_hidden', type=int, default=None, help='域头隐藏层维度（默认：64）')
     
     # 新增：设备控制
     parser.add_argument('--device', default=None, help='指定设备（cpu/cuda）,不指定则自动检测')
@@ -264,6 +267,9 @@ def main():
     # 新增：训练曲线保存开关
     parser.add_argument('--save_train_curves', type=int, choices=[0,1], default=1,
                         help='保存训练曲线SVG (0/1, 默认: 1)')
+    # 新增：保存最后一个epoch（仅当实际跑满 epochs 时覆盖 model.pt，同时保存 best 到 model_best.pt）
+    parser.add_argument('--save_last', action='store_true',
+                        help='若训练实际跑满 epochs：用最后一个epoch覆盖 artifacts_dir/model.pt；并额外保存最优模型到 artifacts_dir/model_best.pt（不强制关闭早停）')
 
     args = parser.parse_args()
 
@@ -272,6 +278,9 @@ def main():
            'use_pca': False,
            'concat_lap_pe': True,
            'lap_pe_use_gaussian': False,
+           # 分类头/域头（保持默认结构：clf 256->128->64，dom hidden=64）
+           'clf_hidden': [256, 128, 64],
+           'dom_hidden': 64,
            # 新增：双域默认配置（新字段）
            'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
            'use_domain_adv_cancer': True, # 默认开启
@@ -334,6 +343,32 @@ def main():
         cfg['num_layers'] = args.num_layers
     if args.dropout is not None:
         cfg['dropout'] = args.dropout
+    if getattr(args, 'clf_hidden', None) is not None:
+        # 逗号分隔，例如 "256,128,64"
+        s = str(args.clf_hidden).strip()
+        if s:
+            dims = [int(x.strip()) for x in s.split(',') if x.strip() != '']
+            if len(dims) != 3:
+                raise ValueError(f'--clf_hidden must have exactly 3 integers (h1,h2,64), got: {dims}')
+            if int(dims[-1]) != 64:
+                raise ValueError(f'--clf_hidden must end with 64 (to keep z64 compatible), got: {dims}')
+            cfg['clf_hidden'] = [int(d) for d in dims]
+    if getattr(args, 'dom_hidden', None) is not None:
+        cfg['dom_hidden'] = int(args.dom_hidden)
+
+    # 兼容：若从 config_json 读入 clf_hidden/dom_hidden，做一次校验与规范化
+    if 'clf_hidden' in cfg:
+        dims = cfg['clf_hidden']
+        if isinstance(dims, str):
+            dims = [int(x.strip()) for x in dims.split(',') if x.strip() != '']
+        if not isinstance(dims, (list, tuple)) or len(dims) != 3:
+            raise ValueError(f"cfg['clf_hidden'] must be a list/tuple of 3 ints (h1,h2,64), got: {dims}")
+        dims = [int(x) for x in dims]
+        if int(dims[-1]) != 64:
+            raise ValueError(f"cfg['clf_hidden'] must end with 64 (to keep z64 compatible), got: {dims}")
+        cfg['clf_hidden'] = dims
+    if 'dom_hidden' in cfg:
+        cfg['dom_hidden'] = int(cfg['dom_hidden'])
 
     # 新增：双域对抗参数（新命令行优先级最高）
     if args.use_domain_adv_slide is not None:
@@ -527,6 +562,7 @@ def train_and_validate(
     external_val_graphs=None,
     progress_desc=None,
     progress_leave=False,
+    capture_last_state=False,
 ):
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
@@ -556,7 +592,8 @@ def train_and_validate(
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        domain_hidden=64,
+        clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
+        domain_hidden=int(cfg.get('dom_hidden', 64)),
         use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
@@ -632,6 +669,8 @@ def train_and_validate(
         return total, loss_task, loss_batch, loss_cancer, ce_batch, ce_cancer
 
     best = {'auroc': -1, 'accuracy': -1, 'state': None, 'epoch': -1, 'macro_f1': float('nan'), 'auprc': float('nan')}
+    last_epoch = 0
+    last_metrics = None
     patience = 0
     early_patience = cfg.get('early_patience', None)
     early_stop_enabled = early_patience is not None and early_patience > 0
@@ -804,6 +843,8 @@ def train_and_validate(
             'auroc': m.get('auroc', float('nan')),
             'auprc': m.get('auprc', float('nan')),
         }
+        last_epoch = int(epoch)
+        last_metrics = dict(metrics)
         if report_cb is not None:
             try:
                 report_cb(epoch, metrics)
@@ -833,6 +874,16 @@ def train_and_validate(
             patience += 1
             if early_stop_enabled and patience >= early_patience:
                 break
+    best['last_epoch'] = int(last_epoch)
+    best['last_metrics'] = last_metrics if last_metrics is not None else {
+        'accuracy': float('nan'),
+        'macro_f1': float('nan'),
+        'auroc': float('nan'),
+        'auprc': float('nan'),
+    }
+    best['completed_full_epochs'] = bool(int(last_epoch) == int(cfg.get('epochs', 0)))
+    if capture_last_state:
+        best['last_state'] = copy.deepcopy(model.state_dict())
     return best, hist, best['state']
 
 
@@ -969,6 +1020,10 @@ def _plot_domain_diagnostics(
 
     do_smooth = n_epochs > 100
     line_color = '#1f3a5f'
+    raw_alpha = 0.35
+    raw_lw = 0.6
+    smooth_lw = 1.4
+    chance_lw = smooth_lw
 
     def _series(key):
         vals = hist.get(key, [])
@@ -1021,12 +1076,12 @@ def _plot_domain_diagnostics(
     ax1 = plt.subplot(2, 2, 1)
     ax1.set_facecolor('white')
     if do_smooth:
-        ax1.plot(epochs, batch_ce.values, alpha=0.35, linewidth=1, color=line_color, label='CE (raw)')
-        ax1.plot(epochs, batch_ce_s.values, linewidth=2, color=line_color, label=f'CE (smooth, w={smooth_window})')
+        ax1.plot(epochs, batch_ce.values, alpha=raw_alpha, linewidth=raw_lw, color=line_color, label='CE (raw)')
+        ax1.plot(epochs, batch_ce_s.values, linewidth=smooth_lw, color=line_color, label=f'CE (smooth, w={smooth_window})')
     else:
-        ax1.plot(epochs, batch_ce.values, linewidth=2, color=line_color, label='CE')
+        ax1.plot(epochs, batch_ce.values, linewidth=smooth_lw, color=line_color, label='CE')
     if n_domains_batch is not None and int(n_domains_batch) > 0:
-        ax1.axhline(float(np.log(int(n_domains_batch))), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance (random guess, log({int(n_domains_batch)}))')
+        ax1.axhline(float(np.log(int(n_domains_batch))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (random guess, log({int(n_domains_batch)}))')
     ax1.set_title('Batch Domain CE')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Cross-Entropy (unweighted)')
@@ -1038,12 +1093,12 @@ def _plot_domain_diagnostics(
     ax2 = plt.subplot(2, 2, 2)
     ax2.set_facecolor('white')
     if do_smooth:
-        ax2.plot(epochs, batch_acc.values, alpha=0.35, linewidth=1, color=line_color, label='Accuracy (raw)')
-        ax2.plot(epochs, batch_acc_s.values, linewidth=2, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
+        ax2.plot(epochs, batch_acc.values, alpha=raw_alpha, linewidth=raw_lw, color=line_color, label='Accuracy (raw)')
+        ax2.plot(epochs, batch_acc_s.values, linewidth=smooth_lw, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
     else:
-        ax2.plot(epochs, batch_acc.values, linewidth=2, color=line_color, label='Accuracy')
+        ax2.plot(epochs, batch_acc.values, linewidth=smooth_lw, color=line_color, label='Accuracy')
     if n_domains_batch is not None and int(n_domains_batch) > 0:
-        ax2.axhline(1.0 / float(int(n_domains_batch)), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance accuracy (random, 1/{int(n_domains_batch)})')
+        ax2.axhline(1.0 / float(int(n_domains_batch)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (random, 1/{int(n_domains_batch)})')
     ax2.set_title('Batch Domain Accuracy')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Accuracy')
@@ -1055,12 +1110,12 @@ def _plot_domain_diagnostics(
     ax3 = plt.subplot(2, 2, 3)
     ax3.set_facecolor('white')
     if do_smooth:
-        ax3.plot(epochs, cancer_ce.values, alpha=0.35, linewidth=1, color=line_color, label='CE (raw)')
-        ax3.plot(epochs, cancer_ce_s.values, linewidth=2, color=line_color, label=f'CE (smooth, w={smooth_window})')
+        ax3.plot(epochs, cancer_ce.values, alpha=raw_alpha, linewidth=raw_lw, color=line_color, label='CE (raw)')
+        ax3.plot(epochs, cancer_ce_s.values, linewidth=smooth_lw, color=line_color, label=f'CE (smooth, w={smooth_window})')
     else:
-        ax3.plot(epochs, cancer_ce.values, linewidth=2, color=line_color, label='CE')
+        ax3.plot(epochs, cancer_ce.values, linewidth=smooth_lw, color=line_color, label='CE')
     if n_domains_cancer is not None and int(n_domains_cancer) > 0:
-        ax3.axhline(float(np.log(int(n_domains_cancer))), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance (random guess, log({int(n_domains_cancer)}))')
+        ax3.axhline(float(np.log(int(n_domains_cancer))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (random guess, log({int(n_domains_cancer)}))')
     ax3.set_title('Cancer Domain CE')
     ax3.set_xlabel('Epoch')
     ax3.set_ylabel('Cross-Entropy (unweighted)')
@@ -1072,12 +1127,12 @@ def _plot_domain_diagnostics(
     ax4 = plt.subplot(2, 2, 4)
     ax4.set_facecolor('white')
     if do_smooth:
-        ax4.plot(epochs, cancer_acc.values, alpha=0.35, linewidth=1, color=line_color, label='Accuracy (raw)')
-        ax4.plot(epochs, cancer_acc_s.values, linewidth=2, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
+        ax4.plot(epochs, cancer_acc.values, alpha=raw_alpha, linewidth=raw_lw, color=line_color, label='Accuracy (raw)')
+        ax4.plot(epochs, cancer_acc_s.values, linewidth=smooth_lw, color=line_color, label=f'Accuracy (smooth, w={smooth_window})')
     else:
-        ax4.plot(epochs, cancer_acc.values, linewidth=2, color=line_color, label='Accuracy')
+        ax4.plot(epochs, cancer_acc.values, linewidth=smooth_lw, color=line_color, label='Accuracy')
     if n_domains_cancer is not None and int(n_domains_cancer) > 0:
-        ax4.axhline(1.0 / float(int(n_domains_cancer)), color=line_color, linestyle='--', linewidth=1.5, label=f'Chance accuracy (random, 1/{int(n_domains_cancer)})')
+        ax4.axhline(1.0 / float(int(n_domains_cancer)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (random, 1/{int(n_domains_cancer)})')
     ax4.set_title('Cancer Domain Accuracy')
     ax4.set_xlabel('Epoch')
     ax4.set_ylabel('Accuracy')
@@ -1113,23 +1168,43 @@ def run_single_training(args, cfg, device):
         external_val_graphs=external_val_graphs,
         progress_desc='Train',
         progress_leave=True,
+        capture_last_state=bool(getattr(args, 'save_last', False)),
     )
 
-    # 保存最优模型
+    # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        domain_hidden=64,
+        clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
+        domain_hidden=int(cfg.get('dom_hidden', 64)),
         use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
+    save_last = bool(getattr(args, 'save_last', False))
+    completed_full_epochs = bool(best.get('completed_full_epochs', False))
+    last_state = best.get('last_state', None)
+
     model.load_state_dict(best_state)
-    save_model(model, args.artifacts_dir)
+    if save_last:
+        save_model(model, args.artifacts_dir, filename='model_best.pt')
+        if completed_full_epochs and last_state is not None:
+            model.load_state_dict(last_state)
+            save_model(model, args.artifacts_dir)  # model.pt
+            saved_checkpoint = 'last'
+        else:
+            save_model(model, args.artifacts_dir)  # model.pt
+            saved_checkpoint = 'best'
+    else:
+        save_model(model, args.artifacts_dir)  # model.pt
+        saved_checkpoint = 'best'
     train_ids = list(getattr(args, '_train_ids', []))
     val_ids = list(getattr(args, '_val_ids', []))
     meta = {
         'cfg': cfg,
         'best_epoch': best['epoch'],
+        'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
+        'completed_full_epochs': bool(completed_full_epochs),
+        'saved_checkpoint': saved_checkpoint,
         'val_ids': val_ids,
         'train_ids': train_ids,
         'metrics': {
@@ -1139,6 +1214,8 @@ def run_single_training(args, cfg, device):
             'macro_f1': best.get('macro_f1', float('nan')),
         }
     }
+    # 追加：最后一个epoch的指标（与 saved_checkpoint 对齐）
+    meta['last_metrics'] = dict(best.get('last_metrics', {}))
     save_json(meta, os.path.join(args.artifacts_dir, 'meta.json'))
     print('Saved artifacts to', args.artifacts_dir)
 
@@ -1342,6 +1419,7 @@ def run_kfold_training(args, cfg, device):
             external_val_graphs=external_val_graphs,
             progress_desc=f'Fold {i}/{total_folds}',
             progress_leave=False,
+            capture_last_state=bool(getattr(args, 'save_last', False)),
         )
 
         if getattr(args, 'save_train_curves', 1):
@@ -1373,16 +1451,32 @@ def run_kfold_training(args, cfg, device):
             except Exception as e:
                 print(f'[KFold] Warning: failed to save loss components CSV: {e}')
 
-        # 保存最优模型及元信息
+        # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            domain_hidden=64,
+            clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
+            domain_hidden=int(cfg.get('dom_hidden', 64)),
             use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
+        save_last = bool(getattr(args, 'save_last', False))
+        completed_full_epochs = bool(best.get('completed_full_epochs', False))
+        last_state = best.get('last_state', None)
+
         model.load_state_dict(best_state)
-        save_model(model, fold_dir)
+        if save_last:
+            save_model(model, fold_dir, filename='model_best.pt')
+            if completed_full_epochs and last_state is not None:
+                model.load_state_dict(last_state)
+                save_model(model, fold_dir)  # model.pt
+                saved_checkpoint = 'last'
+            else:
+                save_model(model, fold_dir)  # model.pt
+                saved_checkpoint = 'best'
+        else:
+            save_model(model, fold_dir)  # model.pt
+            saved_checkpoint = 'best'
         model_path = os.path.join(fold_dir, 'model.pt')
         if os.path.exists(model_path):
             print(f"[KFold] Saved model to {model_path}")
@@ -1391,6 +1485,9 @@ def run_kfold_training(args, cfg, device):
         meta = {
             'cfg': cfg,
             'best_epoch': best['epoch'],
+            'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
+            'completed_full_epochs': bool(completed_full_epochs),
+            'saved_checkpoint': saved_checkpoint,
             'val_ids': val_ids,
             'train_ids': train_ids,
             'metrics': {
@@ -1400,6 +1497,7 @@ def run_kfold_training(args, cfg, device):
                 'macro_f1': best.get('macro_f1', float('nan')),
             }
         }
+        meta['last_metrics'] = dict(best.get('last_metrics', {}))
         meta_path = os.path.join(fold_dir, 'meta.json')
         save_json(meta, meta_path)
         print(f"[KFold] Saved meta to {meta_path}")
@@ -1522,6 +1620,7 @@ def run_loco_training(args, cfg, device):
             external_val_graphs=external_val_graphs,
             progress_desc=f'LOCO {ct}',
             progress_leave=False,
+            capture_last_state=bool(getattr(args, 'save_last', False)),
         )
 
         if getattr(args, 'save_train_curves', 1):
@@ -1553,19 +1652,38 @@ def run_loco_training(args, cfg, device):
             except Exception as e:
                 print(f'[LOCO] Warning: failed to save loss components CSV: {e}')
 
-        # 保存模型与meta
+        # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
         model = STOnco_Classifier(
             in_dim=in_dim,
             hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            domain_hidden=64,
+            clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
+            domain_hidden=int(cfg.get('dom_hidden', 64)),
             use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
             use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
         )
+        save_last = bool(getattr(args, 'save_last', False))
+        completed_full_epochs = bool(best.get('completed_full_epochs', False))
+        last_state = best.get('last_state', None)
+
         model.load_state_dict(best_state)
-        save_model(model, loco_dir)
+        if save_last:
+            save_model(model, loco_dir, filename='model_best.pt')
+            if completed_full_epochs and last_state is not None:
+                model.load_state_dict(last_state)
+                save_model(model, loco_dir)  # model.pt
+                saved_checkpoint = 'last'
+            else:
+                save_model(model, loco_dir)  # model.pt
+                saved_checkpoint = 'best'
+        else:
+            save_model(model, loco_dir)  # model.pt
+            saved_checkpoint = 'best'
         meta = {
             'cfg': cfg,
             'best_epoch': best['epoch'],
+            'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
+            'completed_full_epochs': bool(completed_full_epochs),
+            'saved_checkpoint': saved_checkpoint,
             'val_ids': val_ids,
             'train_ids': train_ids,
             'metrics': {
@@ -1575,6 +1693,7 @@ def run_loco_training(args, cfg, device):
                 'macro_f1': best.get('macro_f1', float('nan')),
             }
         }
+        meta['last_metrics'] = dict(best.get('last_metrics', {}))
         save_json(meta, os.path.join(loco_dir, 'meta.json'))
 
         # 新增：逐样本（逐 slide）评估，集中写到顶层 loco_per_slide.csv
