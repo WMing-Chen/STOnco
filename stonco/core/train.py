@@ -240,7 +240,8 @@ def main():
     parser.add_argument('--use_domain_adv_cancer', type=int, choices=[0,1], default=None, help='启用/关闭癌种域对抗（1/0）')
     parser.add_argument('--lambda_slide', type=float, default=None, help='批次域对抗损失权重')
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
-    # 新增：GRL beta schedule（固定 DANN-style；仅暴露 target 与 gamma）
+    # 新增：GRL beta schedule（默认 DANN-style；可切换 constant）
+    parser.add_argument('--grl_beta_mode', choices=['dann', 'constant'], default=None, help='GRL beta 模式：dann(从0平滑涨到target)/constant(全程恒定=target)')
     parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='批次域 GRL 目标强度（DANN schedule），默认1.0')
     parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度（DANN schedule），默认0.5')
     parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10')
@@ -285,15 +286,16 @@ def main():
            'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
            'use_domain_adv_cancer': True, # 默认开启
            # alpha（域 loss 权重）
-           'lambda_slide': 1.0,
-           'lambda_cancer': 1.0,
-           # beta（GRL 对抗强度，DANN-style schedule）
-           'grl_beta_slide_target': 1.0,
-           'grl_beta_cancer_target': 0.5,
-           'grl_beta_gamma': 10.0,
-           # 新增：HVG控制
-           'n_hvg': 'all'
-           }
+	           'lambda_slide': 1.0,
+	           'lambda_cancer': 1.0,
+	           # beta（GRL 对抗强度）
+	           'grl_beta_mode': 'dann',
+	           'grl_beta_slide_target': 1.0,
+	           'grl_beta_cancer_target': 0.5,
+	           'grl_beta_gamma': 10.0,
+	           # 新增：HVG控制
+	           'n_hvg': 'all'
+	           }
 
     # 先从JSON加载作为基准配置（若提供）
     if args.config_json is not None:
@@ -379,6 +381,8 @@ def main():
         cfg['lambda_slide'] = float(args.lambda_slide)
     if args.lambda_cancer is not None:
         cfg['lambda_cancer'] = float(args.lambda_cancer)
+    if getattr(args, 'grl_beta_mode', None) is not None:
+        cfg['grl_beta_mode'] = str(args.grl_beta_mode)
     if getattr(args, 'grl_beta_slide_target', None) is not None:
         cfg['grl_beta_slide_target'] = float(args.grl_beta_slide_target)
     if getattr(args, 'grl_beta_cancer_target', None) is not None:
@@ -395,12 +399,16 @@ def main():
         cfg['lambda_slide'] = 1.0
     if cfg.get('lambda_cancer', None) is None:
         cfg['lambda_cancer'] = 1.0
+    if cfg.get('grl_beta_mode', None) is None:
+        cfg['grl_beta_mode'] = 'dann'
     if cfg.get('grl_beta_slide_target', None) is None:
         cfg['grl_beta_slide_target'] = 1.0
     if cfg.get('grl_beta_cancer_target', None) is None:
         cfg['grl_beta_cancer_target'] = 0.5
     if cfg.get('grl_beta_gamma', None) is None:
         cfg['grl_beta_gamma'] = 10.0
+    if str(cfg.get('grl_beta_mode', 'dann')) not in {'dann', 'constant'}:
+        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
     if args.device is not None:
@@ -573,6 +581,10 @@ def train_and_validate(
         gamma = float(gamma)
         return beta_target * (2.0 / (1.0 + math.exp(-gamma * p)) - 1.0)
 
+    grl_mode = str(cfg.get('grl_beta_mode', 'dann'))
+    if grl_mode not in {'dann', 'constant'}:
+        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
+
     def _make_graph_frequency_weights(graph_labels, k, device):
         k = int(k)
         if k <= 0:
@@ -718,10 +730,14 @@ def train_and_validate(
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            p = float(global_step) / float(total_steps) if total_steps > 0 else 0.0
-            beta_gamma = float(cfg.get('grl_beta_gamma', 10.0))
-            grl_beta_slide = _dann_beta(p, float(cfg.get('grl_beta_slide_target', 1.0)), beta_gamma)
-            grl_beta_cancer = _dann_beta(p, float(cfg.get('grl_beta_cancer_target', 0.5)), beta_gamma)
+            if grl_mode == 'constant':
+                grl_beta_slide = float(cfg.get('grl_beta_slide_target', 1.0))
+                grl_beta_cancer = float(cfg.get('grl_beta_cancer_target', 0.5))
+            else:
+                p = float(global_step) / float(total_steps) if total_steps > 0 else 0.0
+                beta_gamma = float(cfg.get('grl_beta_gamma', 10.0))
+                grl_beta_slide = _dann_beta(p, float(cfg.get('grl_beta_slide_target', 1.0)), beta_gamma)
+                grl_beta_cancer = _dann_beta(p, float(cfg.get('grl_beta_cancer_target', 0.5)), beta_gamma)
             out = model(
                 batch.x,
                 batch.edge_index,

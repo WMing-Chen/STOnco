@@ -10,9 +10,9 @@
 当前代码现实情况（用于避免“文档写了但代码并不是那样”）：
 
 1. **主任务已是 spot-level 二分类**：`STOnco_Classifier` 输出 `logits` 为每个节点/spot 的 logit；训练用 `BCEWithLogitsLoss`（`pos_weight=1.0` 等价于不加权）。
-2. **域对抗当前是 graph-level**：代码对 `h` 做 `global_mean_pool` 后再进域头；且 `lambda_slide/lambda_cancer` 同时用作 GRL 强度与 loss 权重（未解耦）。
+2. **域对抗当前是 spot-level**：域头直接作用于每个 spot 表征 `h`（同一张图内所有 spot 共享同一个域标签，loss 处展开到 spot 级）；并且已将 alpha（`lambda_slide/lambda_cancer`）与 beta（GRL 强度，`grl_beta_*`）解耦，支持 `--grl_beta_mode {dann,constant}`。
 3. **域标签来源已固定**：`data/cancer_sample_labels.csv` 中有 `Batch_id`（27）与 `cancer_type`（11）；训练时按当前 fold 出现的样本动态映射到连续索引（K 动态）。
-4. **依赖缺失 UMAP**：当前 `requirements.txt` 没有 `umap-learn`，因此要实现“UMAP + t-SNE”，需补充依赖。
+4. **UMAP 依赖已包含**：`requirements.txt` 已包含 `umap-learn`，可直接进行 UMAP + t-SNE 可视化。
 
 v5 下面的方案全部以这些事实为基础展开。
 
@@ -32,7 +32,7 @@ v5 下面的方案全部以这些事实为基础展开。
    - Domain B：`cancer_type`（**K 动态**：按 train/fold 出现的癌种类别数）
 4. **解耦 GRL 强度（beta）与域损失权重（alpha）**
    - 保留现有 CLI：`lambda_slide/lambda_cancer` 作为 **alpha（loss 权重）**，减少破坏性改动
-   - 新增 `grl_beta_*_target + grl_beta_gamma` 控制 **GRL 对 encoder 的对抗强度**（schedule 固定为 DANN-style）
+   - 使用 `--grl_beta_mode` 选择 **beta 策略**：`dann`（DANN schedule 0→target）或 `constant`（全程恒定 beta=`*_target`）；并用 `grl_beta_*_target + grl_beta_gamma`（仅 `dann`）控制强度
 
 ---
 
@@ -129,15 +129,18 @@ L_task = mean_spot( BCEWithLogits(logit, y) )
   - 直接复用现有 CLI：`lambda_slide` / `lambda_cancer`
   - v5 默认：`lambda_slide = 1.0`，`lambda_cancer = 1.0`
 - **beta**：GRL 强度（encoder 对抗强度）
-  - 新增 `grl_beta_*_target` + `grl_beta_gamma`（schedule 固定为 DANN-style）
+  - `--grl_beta_mode {dann,constant}`：选择 DANN schedule 或全程恒定
+  - `--grl_beta_slide_target/--grl_beta_cancer_target`：目标/恒定强度；`--grl_beta_gamma`：仅 `dann` 使用
 
-### 4.2 beta schedule（DANN-style，v5 冻结）
+### 4.2 beta schedule（默认 DANN；支持 constant）
 
 ```
 beta(p) = beta_target * (2 / (1 + exp(-gamma * p)) - 1)
 p = current_step / total_steps
 gamma = 10 (可配置)
 ```
+
+> 补充：当 `--grl_beta_mode constant` 时，`beta` 全程恒定为 `beta_target`（忽略 `gamma`）。
 
 > 说明：beta 只影响 encoder 的对抗强度；alpha（lambda_*) 只影响域 loss 在总 loss 中的权重。
 
@@ -256,12 +259,13 @@ L_total =
 - `--lambda_cancer`：cancer 域 loss 权重（默认 **1.0**）
 
 新增（控制 GRL beta；你已确认参数名前缀为 `grl_`）：
+- `--grl_beta_mode`：`dann`（默认）或 `constant`
 - `--grl_beta_slide_target`：batch 域 GRL 目标强度（默认 **1.0**）
 - `--grl_beta_cancer_target`：cancer 域 GRL 目标强度（默认 **0.5**）
-- `--grl_beta_gamma`：DANN schedule 的 gamma（默认 **10**）
+- `--grl_beta_gamma`：DANN schedule 的 gamma（默认 **10**，仅 `dann` 使用）
 
 说明（冻结）：
-- `grl_beta_schedule` **不作为 CLI 参数暴露**，固定使用 DANN-style schedule（见 4.2）
+- `grl_beta_schedule` **不作为 CLI 参数暴露**；beta 策略由 `--grl_beta_mode` 控制（见 4.2）
 
 ---
 
@@ -275,7 +279,7 @@ L_total =
 - [x] alpha/beta 解耦：保留 `lambda_slide/lambda_cancer` 作为 alpha，并新增 GRL beta schedule（`grl_*`）
 - [x] alpha 默认强度：`lambda_slide=lambda_cancer=1.0`
 - [x] GRL beta 参数命名：新增参数统一加前缀 `grl_`
-- [x] GRL beta schedule：固定 DANN-style（不暴露 `grl_beta_schedule` CLI）
+- [x] GRL beta schedule：默认 DANN-style，并支持 `--grl_beta_mode constant`
 - [x] class weight 稳定化：`clamp(0.5, 5.0)` + `mean-normalize`
 - [x] 64-d 潜变量：取 task MLP 的 64 维隐藏层输出
 - [x] 增加 `umap-learn` 依赖，保证 UMAP+t-SNE

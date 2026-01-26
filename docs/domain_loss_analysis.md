@@ -9,30 +9,30 @@
 
 ## 2. 现象可能的“合理解释”
 - **GRL 目标本身是让域不可分**：域头参数在最小化 CE，但主干在反向最大化 CE；当二者拉扯到平衡，域 loss 会稳定在接近随机水平（约 `log(K)`），并非持续下降。
-- **日志里的域 loss 已经乘过权重**：`avg_*_domain_loss` 是 `lambda_* * CE`；如果 `lambda_*` 小，曲线自然显得平坦。
+- **日志里的域 loss 已经乘过权重**：`avg_*_domain_loss` 是 `lambda_* * L_domain`；如果 `lambda_*` 小，曲线自然显得平坦。可优先看原始 CE 曲线 `avg_*_domain_ce`（训练日志/CSV 会保存）。
 
 ## 3. 可能原因（按优先级）
 ### P0. 先确认现象是否“误判”
-- 域 loss 是否已经接近随机基线？对于 K 类域，随机 CE 约为 `log(K)`；可用 `avg_*_domain_loss / lambda_*` 近似估计原始 CE，再与 `log(K)` 对比。
+- 域 loss 是否已经接近随机基线？对于 K 类域，随机 CE 约为 `log(K)`；优先用 `avg_*_domain_ce` 与 `log(K)` 对比（`avg_*_domain_loss` 已乘过 `lambda_*` 且可能为带权版本）。
 - 训练是否实际跑满 1000 epoch？早停或中断会导致曲线稀疏或看似“不动”。
 
 ### P1. 数据与域标签质量问题（最常见）
 - `Batch_id` 缺失时会回退为 `slide_id`：这会造成 **每个切片一个域**，类别数过多且样本极少，域头难学习，CE 难下降。代码位置：`stonco/core/train.py` 中 `_resolve_batch_id`。
 - `cancer_type` 缺失时回退到前缀或 `UNKNOWN`：可能引入噪声/错误标签，降低域头可学习性。
-- 域类别极度不平衡：CrossEntropy 未加权，长尾类别会导致域 loss 下降不明显。
+- 域类别极度不平衡：虽然训练端已默认按 **graph-frequency 的 sqrt 反频率**做 class-weight（并 clamp + mean-normalize），但若某些域样本过少，域头仍可能学不动或震荡。
 
 ### P2. 优化与批大小设置
 - `batch_size_graphs` 偏小（默认 2）：单步看到的域类别太少，域头梯度噪声大，loss 不稳定。
 - 学习率偏高/无调度：1000 epoch 下 `lr=1e-3` 可能让损失震荡。
 
 ### P3. 结构与对抗强度
-- 目前 **`lambda_*` 同时用于 GRL 强度和 loss 权重**：对抗太强时会直接“压制”域头学习，导致 loss 无明显下降。
+- 当前实现已将 **alpha（`lambda_*`，域 loss 权重）** 与 **beta（GRL 对抗强度）** 解耦：beta 由 `--grl_beta_mode/--grl_beta_*` 控制。若对抗过强（尤其是 `--grl_beta_mode constant` 且 beta 较大），可能会让域头更快被“混淆”到接近随机水平，从而表现为 loss 不再明显下降。
 - 域头容量有限（两层 MLP）：若域信号微弱或类别多，域头很难学到区分能力。
 
 ## 4. 建议（按优先级，先低风险）
 ### 优先级 P0：不改代码的检查
 - 检查训练日志是否有 `[Warn] Batch_id missing` 或 `fallback` 提示（说明标签质量有问题）。
-- 估算域损失基线：`avg_*_domain_loss / lambda_*` 与 `log(K)` 对比，判断是否已接近随机。
+- 估算域损失基线：优先用 `avg_*_domain_ce` 与 `log(K)` 对比；若只看 `avg_*_domain_loss`，需要注意它已乘过 `lambda_*` 且 domain loss 可能是带权版本。
 - 统计域类别数和每类样本量，确认是否过于稀疏（建议每类至少 5-10 张切片）。
 
 ### 优先级 P1：仅改参数的调整
@@ -42,9 +42,8 @@
 - 适度降低学习率（如 `1e-4`）或引入简单衰减（若你愿意改代码）。
 
 ### 优先级 P2：需要改代码的提升项（建议确认后再动）
-- **解耦 GRL 强度与 loss 权重**：例如 `grl_lambda` 与 `loss_lambda` 分离，先让域头学起来，再逐步增大 GRL 强度。
-- **对抗强度 warm-up**：前 10%~30% epoch 线性从 0 增到目标 `lambda`，稳定训练。
-- **域 loss 加权**：按域类别频次做 class-weight，缓解不平衡。
+- **对抗强度策略**：根据稳定性选择 `--grl_beta_mode dann`（warm-up/平滑增长）或 `constant`（全程恒定）；并联动调小 `--grl_beta_*_target` 或 `--lambda_*`。
+- **域 loss 加权策略**：当前默认是 graph-frequency 的 sqrt 反频率（clamp+mean-normalize）；若仍不稳，可考虑调整 clamp 范围、改为按 spot-frequency、或关闭权重对比效果。
 - **记录域准确率**：仅靠 loss 不直观，建议加 domain accuracy 曲线辅助判断。
 
 ## 5. 结论小结

@@ -180,9 +180,9 @@ Total_Loss = Task_Loss + λ_slide × Batch_Domain_Loss + λ_cancer × Cancer_Dom
 In `train.py`:
 
 - `--lambda_slide` / `--lambda_cancer` are **loss weights (alpha)**.
-- GRL strength uses a DANN-style schedule (fixed) with:
-  - `--grl_beta_slide_target`, `--grl_beta_cancer_target` (target beta; default `1.0/0.5`)
-  - `--grl_beta_gamma` (schedule steepness; default `10`)
+- GRL strength (beta) is controlled by `--grl_beta_mode`:
+  - `dann` (default): DANN-style schedule from 0 → target, with `--grl_beta_slide_target`, `--grl_beta_cancer_target` (default `1.0/0.5`) and `--grl_beta_gamma` (default `10`)
+  - `constant`: beta is fixed to `*_target` for the whole training (gamma is ignored)
 - Domain labels are read from `data/cancer_sample_labels.csv`: `cancer_type` and `Batch_id` (`Batch_id` falls back to `slide_id` if missing). Domain class counts are inferred per run/fold.
 
 ## Project Structure

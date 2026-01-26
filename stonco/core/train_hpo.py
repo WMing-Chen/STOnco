@@ -585,6 +585,11 @@ def main():
     parser.add_argument('--use_domain_adv_cancer', type=int, choices=[0,1], default=None, help='启用/关闭癌种域对抗（1/0）')
     parser.add_argument('--lambda_slide', type=float, default=None, help='切片域对抗损失权重')
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
+    # 新增：GRL beta schedule（与 train.py 对齐）
+    parser.add_argument('--grl_beta_mode', choices=['dann', 'constant'], default=None, help='GRL beta 模式：dann(从0平滑涨到target)/constant(全程恒定=target)')
+    parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='切片域 GRL 目标强度（dann/constant），默认1.0')
+    parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度（dann/constant），默认0.5')
+    parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10')
     # 新增：HVG控制
     parser.add_argument('--n_hvg', default='all', help="高变基因数量，或'all'使用全部基因（默认'all'）")
     
@@ -596,13 +601,18 @@ def main():
 	           'concat_lap_pe': True,
 	           'lap_pe_use_gaussian': False,
 	           # 双域默认配置（与 train.py 对齐）
-	           'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
-	           'use_domain_adv_cancer': True,  # 默认开启
-	           'lambda_slide': None,           # 若None，将回退到 domain_lambda
-	           'lambda_cancer': None,          # 若None，将回退到 domain_lambda
-	           # HVG控制（保持与 train.py 一致）
-	           'n_hvg': 'all'
-	           }
+		           'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
+		           'use_domain_adv_cancer': True,  # 默认开启
+		           'lambda_slide': None,           # 若None，将回退到 domain_lambda
+		           'lambda_cancer': None,          # 若None，将回退到 domain_lambda
+		           # beta（GRL 对抗强度，与 train.py 对齐）
+		           'grl_beta_mode': 'dann',
+		           'grl_beta_slide_target': 1.0,
+		           'grl_beta_cancer_target': 0.5,
+		           'grl_beta_gamma': 10.0,
+		           # HVG控制（保持与 train.py 一致）
+		           'n_hvg': 'all'
+		           }
 
     # 覆盖配置以支持快速实验和HPO
     if args.epochs is not None:
@@ -651,6 +661,14 @@ def main():
         cfg['lambda_slide'] = float(args.lambda_slide)
     if getattr(args, 'lambda_cancer', None) is not None:
         cfg['lambda_cancer'] = float(args.lambda_cancer)
+    if getattr(args, 'grl_beta_mode', None) is not None:
+        cfg['grl_beta_mode'] = str(args.grl_beta_mode)
+    if getattr(args, 'grl_beta_slide_target', None) is not None:
+        cfg['grl_beta_slide_target'] = float(args.grl_beta_slide_target)
+    if getattr(args, 'grl_beta_cancer_target', None) is not None:
+        cfg['grl_beta_cancer_target'] = float(args.grl_beta_cancer_target)
+    if getattr(args, 'grl_beta_gamma', None) is not None:
+        cfg['grl_beta_gamma'] = float(args.grl_beta_gamma)
 
     # 默认值填充（新字段，与 train.py 对齐）
     if cfg.get('use_domain_adv_slide', None) is None:
@@ -661,6 +679,16 @@ def main():
         cfg['lambda_slide'] = float(cfg.get('domain_lambda', 0.3))
     if cfg.get('lambda_cancer', None) is None:
         cfg['lambda_cancer'] = float(cfg.get('domain_lambda', 0.3))
+    if cfg.get('grl_beta_mode', None) is None:
+        cfg['grl_beta_mode'] = 'dann'
+    if cfg.get('grl_beta_slide_target', None) is None:
+        cfg['grl_beta_slide_target'] = 1.0
+    if cfg.get('grl_beta_cancer_target', None) is None:
+        cfg['grl_beta_cancer_target'] = 0.5
+    if cfg.get('grl_beta_gamma', None) is None:
+        cfg['grl_beta_gamma'] = 10.0
+    if str(cfg.get('grl_beta_mode', 'dann')) not in {'dann', 'constant'}:
+        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
     if args.device is not None:

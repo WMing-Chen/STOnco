@@ -146,7 +146,9 @@ python -m stonco.utils.visualize_umap_tsne \
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
   - 双域对抗：细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制；默认两者均启用（slide 对应 batch 域）。
   - alpha（域 loss 权重）：`--lambda_slide/--lambda_cancer`（默认 **1.0/1.0**）。
-  - beta（GRL 对抗强度）：DANN-style schedule（固定），`--grl_beta_slide_target/--grl_beta_cancer_target/--grl_beta_gamma`（默认 **1.0/0.5/10**）。
+  - beta（GRL 对抗强度）：由 `--grl_beta_mode` 控制（默认 `dann`）
+    - `dann`：DANN-style schedule（0→target），`--grl_beta_slide_target/--grl_beta_cancer_target/--grl_beta_gamma`（默认 **1.0/0.5/10**）
+    - `constant`：全程恒定 beta=`*_target`（忽略 `--grl_beta_gamma`）
   - 外部验证：`--val_sample_dir` 指定外部验证 NPZ 目录（单切片），验证指标会合并计算。
   - Loss 组件：`--save_loss_components 1`（默认开启）会保存 `loss_components.csv` 到 artifacts_dir。
   - 解释性：默认开启，`--explain_method ig`，`--ig_steps 50`；训练结束会保存 `per_gene_saliency.csv` 到 artifacts_dir。
@@ -337,10 +339,12 @@ python -m stonco.core.train \
 - 域自适应（双域，对抗式）：
   - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
   - alpha（域 loss 权重）：--lambda_slide（batch 域），--lambda_cancer（cancer 域）（默认 1.0/1.0）
-  - beta（GRL 对抗强度）：DANN-style schedule（固定）
-    - --grl_beta_slide_target（默认 1.0）
-    - --grl_beta_cancer_target（默认 0.5）
-    - --grl_beta_gamma（默认 10）
+  - beta（GRL 对抗强度）：--grl_beta_mode {dann,constant}（默认 dann）
+    - dann：DANN-style schedule（0→target）
+      - --grl_beta_slide_target（默认 1.0）
+      - --grl_beta_cancer_target（默认 0.5）
+      - --grl_beta_gamma（默认 10）
+    - constant：全程恒定 beta=`*_target`（忽略 --grl_beta_gamma）
 - 划分/验证：
   - --stratify_by_cancer 按癌种分层（默认启用，按比例划分且每癌种保底 1 张，n=1 仅训练）
   - --no_stratify_by_cancer 关闭分层，使用最后 1 张作为验证
@@ -416,7 +420,7 @@ python -m stonco.core.train \
 ```
 提示：
 - 域标签从 `data/cancer_sample_labels.csv` 读取：`cancer_type`（cancer 域）与 `Batch_id`（batch 域）；`Batch_id` 缺失时回退为 `slide_id`；训练时按当前 fold/train 出现的类别动态映射到连续索引（K 动态）。
-- `--lambda_*` 是 alpha（域 loss 权重），`--grl_beta_*` 是 beta（GRL 对抗强度，schedule 固定为 DANN-style）。
+- `--lambda_*` 是 alpha（域 loss 权重），beta（GRL 对抗强度）由 `--grl_beta_mode` 控制：`dann` 为 DANN schedule，`constant` 为全程恒定。
 - 域 loss 以 spot-level 计算（对所有 spot 做全局 mean）；域 CE 默认启用 graph-frequency 的 sqrt 反频率 class weight，并做 `clamp(0.5, 5.0)` + mean-normalize 稳定化。
 
 - 基于癌种的 KFold（随机生成 K 组“每癌种 1 张验证”组合）：
@@ -488,7 +492,7 @@ HPO 已独立到 `stonco/core/train_hpo.py`，提供统一三阶段流水线与�
 - --rescore_topk K，多种子复评的 Top-K
 - --rescore_stages 需要复评的阶段列表（逗号分隔）
 - --seeds 多种子列表（逗号分隔）
-- 其余训练相关参数（如 --epochs、--early_patience、--model、--lap_pe_dim 等）基本与 train.py 保持一致；本轮新增的 `--grl_beta_*` 参数暂未在 train_hpo.py 暴露（后续统一）
+- 其余训练相关参数（如 --epochs、--early_patience、--model、--lap_pe_dim 等）基本与 train.py 保持一致；GRL beta 相关参数也已在 train_hpo.py 暴露（`--grl_beta_mode/--grl_beta_*`），可用于 HPO/复评时固定对抗强度或保持 DANN schedule。
   - 包含划分参数：`--val_ratio`（默认 0.2）与 `--no_stratify_by_cancer`
 
 示例：

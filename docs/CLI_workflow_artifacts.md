@@ -77,6 +77,17 @@ python -m stonco.core.train \
   --val_sample_dir ./processed_data/val_npz
 ```
 
+固定 GRL 强度（beta 全程恒定，不使用 DANN schedule），示例：slide/batch=0.3、cancer=0.2：
+
+```bash
+python -m stonco.core.train \
+  --train_npz ./processed_data/train_data.npz \
+  --artifacts_dir ./artifacts \
+  --grl_beta_mode constant \
+  --grl_beta_slide_target 0.3 \
+  --grl_beta_cancer_target 0.2
+```
+
 ### 2.2 执行流程图（高层）
 
 ```text
