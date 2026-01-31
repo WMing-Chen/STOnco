@@ -74,6 +74,8 @@ VAL_NPZ_DIR=$DATA_ROOT/val_npz
 PRED_CSV=/path/to/preds.csv
 
 # 1) 数据准备
+# 注：每个切片子目录需包含 3 个 CSV：`*_exp.csv`、`*_coordinates.csv`、`*_image_features.csv`（`Barcode` + 2048 维特征）。
+# 若某些 spot 在 image_features.csv 中缺失，会自动填充为 0，并记录 `img_mask=0`（同时打印 warning）。
 # 1.1 训练集（多切片）NPZ
 python -m stonco.utils.prepare_data build-train-npz \
   --train_dir $DATA_ROOT/ST_train_datasets \
@@ -95,6 +97,8 @@ python -m stonco.core.train \
   --use_domain_adv_slide 1 --use_domain_adv_cancer 1 \
   --epochs 80 --early_patience 20 --batch_size_graphs 2 \
   --save_loss_components 1
+# （可选）启用图像特征早期融合（方案1）：在训练命令后追加
+#   --use_image_features 1 --img_use_pca 1 --img_pca_dim 256
 
 # 3) 单切片推理（对验证集中的任意一张）
 # 先任选一个 NPZ（例如第一张）
@@ -169,6 +173,10 @@ python -m stonco.utils.visualize_umap_tsne \
   - xys：同上，每项形状 (n_spots_i, 2)
   - slide_ids：长度 N_slide 的列表/数组（字符串或整数）
   - gene_names：长度 n_genes 的列表
+  - （可选，图像特征）X_imgs/img_masks/img_feature_names：
+    - X_imgs：长度 N_slide 的列表，每项 (n_spots_i, 2048) float32
+    - img_masks：长度 N_slide 的列表，每项 (n_spots_i,) uint8，取值 {0,1}
+    - img_feature_names：长度 2048 的列表（训练/推理必须一致）
 
 - 单切片 NPZ（推理或验证单张）：
   - X：形状 (n_spots, n_genes)
@@ -177,11 +185,20 @@ python -m stonco.utils.visualize_umap_tsne \
   - barcodes：该切片的条形码（字符串数组）
   - sample_id：样本/切片 ID（字符串）
   - 可选 y：形状 (n_spots,)，取值 {0,1}
+  - （可选，图像特征）X_img/img_mask/img_feature_names：
+    - X_img：(n_spots, 2048) float32
+    - img_mask：(n_spots,) uint8，取值 {0,1}
+    - img_feature_names：长度 2048 的列表（与训练产物中的 img_feature_names.txt 一致）
+
+说明：
+- 本次更新将图像特征作为“早期融合”节点特征的一部分：`x = [Xp_gene, Xp_img, img_mask, (LapPE)]`。
+- 是否启用由训练时 `meta.json:cfg.use_image_features` 决定；推理/批推理/可视化/导出 embedding 会自动读取 cfg 保持一致。
 
 从 CSV 构建 NPZ 的约定（见 prepare_data.py）：
 - exp.csv：首列必须为 Barcode，其余列为基因（列名即基因名）；数值列会转为浮点，缺失置 0。
 - coordinates.csv：必须包含 Barcode 列（大小写不敏感匹配），以及指定的 x/y 列（默认 row、col）。
-- 构建时按 Barcode 交集对齐，保持坐标文件的顺序；基因顺序保持与 exp.csv 一致。
+- image_features.csv：必须包含 Barcode 列，且除 Barcode 外恰好 2048 个特征列；特征值需为有限数（NaN/inf 会报错），列名/顺序需在全体切片一致。
+- 构建时按 Barcode 对齐并保持坐标文件的顺序：gene 用 `coord ∩ exp`；image 对 `barcodes_used` 做 reindex，缺失则填 0 并记录 `img_mask=0`。
 
 ---
 
@@ -230,9 +247,11 @@ python -m stonco.utils.prepare_data build-val-npz \
   SlideA/
     xxx_coordinates.csv
     xxx_exp.csv
+    xxx_image_features.csv
   SlideB/
     yyy_coordinates.csv
     yyy_exp.csv
+    yyy_image_features.csv
   ...
 ```
 - 验证目录（用于 build-val-npz）：
@@ -241,17 +260,19 @@ python -m stonco.utils.prepare_data build-val-npz \
   Slide1/
     *_coordinates.csv
     *_exp.csv
+    *_image_features.csv
   Slide2/
     *_coordinates.csv
     *_exp.csv
+    *_image_features.csv
   ...
 ```
-注意：每个切片子目录中脚本会“自动检测”文件，优先选择以 `coordinates.csv` 和 `exp.csv` 结尾的文件名；文件名前缀可以任意。
+注意：每个切片子目录中脚本会按后缀严格检测 `*coordinates.csv` / `*exp.csv` / `*image_features.csv`（大小写不敏感）。每一类必须且只能匹配到 1 个文件，否则会报错（build-train-npz）或 Warning 跳过该切片（build-val-npz）。
 
 ### 4.2 CSV 字段要求与校验
 
 - 表达矩阵（exp.csv）：
-  - 第 1 列必须为 `Barcode`（区分大小写），其余列为基因（列名即基因名）。
+  - 第 1 列必须为 `Barcode`（大小写不敏感，但必须是第 1 列），其余列为基因（列名即基因名）。
   - 所有基因表达值会转换为浮点，无法解析的值记为 0.0。
 - 坐标（coordinates.csv）：
   - 必须包含 `Barcode` 列（大小写不敏感匹配），以及指定的 x/y 列（默认 `row`、`col`）。
@@ -259,11 +280,19 @@ python -m stonco.utils.prepare_data build-val-npz \
   - 训练时要求存在标签列（默认 `true_label`）。标签可以是：
     - 数值型：会被强制为二值（非 0 视为 1）。
     - 字符型：支持映射 `tumor`→1、`normal`→0、`mal`→1、`nmal`→0；未知值会提示 Warning 并映射为 0。
+- 图像特征（image_features.csv）：
+  - 必须包含 `Barcode` 列。
+  - 除 `Barcode` 外必须有且仅有 2048 个特征列；特征列名/顺序必须在所有切片之间一致（训练/推理也必须一致）。
+  - `Barcode` 不允许重复；特征值不允许出现 NaN/inf（数据准备阶段会直接报错）。
+  - 对齐时允许部分 spot 缺失图像特征：缺失行会填充为 0，并写入 `img_mask=0`（同时打印 warning）。
 
 ### 4.3 条形码对齐与顺序
 
-- 以两个 CSV 的 `Barcode` 交集为准做对齐；若交集为空会报错。
+- gene（exp/coordinates）：以两个 CSV 的 `Barcode` 交集为准做对齐；若交集为空会报错。
 - 对齐后严格“按坐标文件的顺序”排列 spots；表达矩阵按该顺序重建。
+- image（image_features）：对 `barcodes_used` 做 reindex/左连接：
+  - 缺失的 barcode：该行图像向量填 0，`img_mask=0`
+  - 匹配到的 barcode：写入 2048 维向量，`img_mask=1`
 
 ### 4.4 基因集合与顺序策略
 
@@ -282,11 +311,19 @@ python -m stonco.utils.prepare_data build-val-npz \
   - `slide_ids`: List[str]，切片/子目录名
   - `gene_names`: List[str]，并集后的基因列表
   - `barcodes`: List[np.ndarray]，每项为该切片的条形码（dtype='U64'）
+  - 图像特征（新增）：
+    - `X_imgs`: List[np.ndarray]，每项 (n_spots_i, 2048) float32
+    - `img_masks`: List[np.ndarray]，每项 (n_spots_i,) uint8（0/1）
+    - `img_feature_names`: List[str]，长度 2048（全体切片一致，存 1 份）
 - 单切片 NPZ（build-single-npz）：
   - `X` (n_spots, n_genes) float32，`xy` (n_spots,2) float32
   - `gene_names` List[str]，`barcodes` (n_spots,) U64
   - `sample_id` str（默认从坐标文件所在文件夹名推断）
   - 可选 `y` (n_spots,) int64
+  - 图像特征（新增）：
+    - `X_img` (n_spots, 2048) float32
+    - `img_mask` (n_spots,) uint8（0/1）
+    - `img_feature_names` List[str]，长度 2048
 - 验证集 NPZ（build-val-npz）：
   - 为每个子目录分别生成一个单切片 NPZ，文件名为 `<子目录名>.npz`。
 
@@ -299,10 +336,12 @@ python -m stonco.utils.prepare_data build-val-npz \
 ### 4.7 错误处理与提示
 
 - build-train-npz：
-  - 若某切片缺少 `coordinates.csv` 或 `exp.csv`，或标签列缺失，会报错并中止（训练需要完整标签）。
+  - 每个切片子目录必须且只能匹配到 1 个 `*coordinates.csv`、1 个 `*exp.csv`、1 个 `*image_features.csv`；否则会报错并中止。
+  - 若标签列缺失，会报错并中止（训练需要完整标签）。
   - 若 `Barcode` 交集为空，报错并中止。
+  - `image_features.csv` 若出现 `Barcode` 重复、特征列数≠2048、特征值出现 NaN/inf、或跨切片特征列名/顺序不一致，会报错并中止。
 - build-val-npz：
-  - 若某子目录文件缺失，会 Warning 并跳过，不中止整个流程。
+  - 若某子目录缺少上述任一类文件，或文件匹配不唯一，会 Warning 并跳过该切片，不中止整个流程。
 
 ---
 
@@ -335,6 +374,10 @@ python -m stonco.core.train \
 - 预处理：
   - --use_pca {0,1}（可选 PCA；默认关闭）
   - --n_hvg N 或 'all'（默认 'all' 表示使用所有基因）
+  - 图像特征早期融合（方案1，可选）：
+    - --use_image_features {0,1}（默认 0，保持 gene-only 行为；启用后节点输入为 `gene → image → img_mask → (LapPE)`）
+    - --img_use_pca {0,1}（默认 1，对 2048 维图像特征做 PCA 降维）
+    - --img_pca_dim（默认 256，仅当 --img_use_pca 1 生效；若有效 spot 数（img_mask==1）小于该值会直接报错）
 - 优化器：--lr，--weight_decay
 - 域自适应（双域，对抗式）：
   - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
@@ -362,6 +405,7 @@ python -m stonco.core.train \
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
+- 图像预处理（当 --use_image_features 1）：img_feature_names.txt，img_scaler.joblib，img_pca.joblib（若 --img_use_pca 1）
 - 模型：model.pt（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）；可选：model_best.pt（启用 --save_last 时保存最优模型）
 - 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint）
 - 可视化：train_loss.svg（2×3：avg_total_loss/avg_task_loss/Var_risk/avg_cancer_domain_loss/avg_batch_domain_loss/train_accuracy），train_val_metrics.svg（2×2：val_accuracy/val_macro_f1/val_auroc/val_auprc）
@@ -418,6 +462,9 @@ python -m stonco.core.train \
   --device cuda
 
 ```
+
+启用图像特征早期融合（方案1）时，在上述任意训练命令后追加：
+- `--use_image_features 1 --img_use_pca 1 --img_pca_dim 256`
 提示：
 - 域标签从 `data/cancer_sample_labels.csv` 读取：`cancer_type`（cancer 域）与 `Batch_id`（batch 域）；`Batch_id` 缺失时回退为 `slide_id`；训练时按当前 fold/train 出现的类别动态映射到连续索引（K 动态）。
 - `--lambda_*` 是 alpha（域 loss 权重），beta（GRL 对抗强度）由 `--grl_beta_mode` 控制：`dann` 为 DANN schedule，`constant` 为全程恒定。
@@ -535,6 +582,10 @@ python -m stonco.core.infer \
 - 支持两类输入：
   - 单切片 NPZ：包含 X, xy, gene_names（以及可选 barcodes、y、sample_id）。
   - 数据集 NPZ：包含 Xs/xys（多张切片），可通过 `--index` 选择第几张（默认 0）。
+- 若训练 cfg 启用了图像特征（`meta.json:cfg.use_image_features=1`）：
+  - 推理会加载 `artifacts_dir` 下的 `img_scaler.joblib` +（可选）`img_pca.joblib`，并按 `x=[Xp_gene, Xp_img, img_mask, (LapPE)]` 构图。
+  - 输入 NPZ 若包含 `X_img/img_mask`（或数据集 NPZ 的 `X_imgs/img_masks`），则必须同时包含 `img_feature_names`，并与 `artifacts_dir/img_feature_names.txt` 完全一致；否则直接报错。
+  - 输入 NPZ 不含 image keys 时会自动兜底为 `X_img=0, img_mask=0`（可运行，但等价于该输入“无图像信息”）。
 - 输出 CSV 列：`spot_idx, x, y, p_tumor`；默认写到 `preds.csv`，或按 `--out_csv` 指定的路径保存（自动创建目录）。
 - 解释性输出（默认开启，可用 `--no_explain` 关闭）：
   - `--explain_saliency` 默认开启；`--no_explain` 关闭解释性计算
@@ -559,6 +610,7 @@ python -m stonco.core.batch_infer \
   --out_csv /path/to/batch_preds.csv
 ```
 - 读取 `artifacts_dir` 下的预处理器与 `meta.json` 的 cfg，对匹配到的每个 NPZ 执行“读取→预处理→图构建→推理”。
+- 若 `meta.json:cfg.use_image_features=1`，批量推理会对每个 NPZ 按同样规则读取/兜底 image keys，并强校验 `img_feature_names` 一致性（不一致直接报错）。
 - 性能参数：
   - `--num_threads` 控制 CPU 线程；`--num_workers` 控制 DataLoader 进程数（>0 时在子进程并行读取/预处理/构图）。
 - 二值阈值：`--threshold`（默认 0.5），用于将 `p_tumor` 转成 `pred_label`。
@@ -632,6 +684,7 @@ python -m stonco.utils.plot_accuracy_bars \
 ## 8. 可视化（visualize_prediction.py）
 
 对单张或批量切片绘制真实/预测在空间坐标下的散点图，并在标题显示准确率（若存在 y 或可从验证目录解析）。脚本会读取 artifacts_dir/meta.json 的 cfg，确保与训练时的预处理和图构建一致。
+若 `meta.json:cfg.use_image_features=1`，可视化脚本也会按同样规则读取/兜底 `X_img/img_mask`（并强校验 `img_feature_names` 与训练一致），以保证模型输入维度一致。
 
 - 使用训练 NPZ 中的某张（例如最后一张作为验证）：
 ```bash
@@ -695,6 +748,10 @@ python -m stonco.utils.export_spot_embeddings \
   --subset val \
   --out_csv /path/to/artifacts/spot_embeddings_train_npz_val.csv
 ```
+
+说明：
+- 若 `meta.json:cfg.use_image_features=1`，导出 embedding 时会加载图像预处理器（`img_scaler.joblib` + 可选 `img_pca.joblib`），并按 `x=[Xp_gene, Xp_img, img_mask, (LapPE)]` 构图。
+- 输入 NPZ 若包含 `X_img/img_mask`（或训练 NPZ 的 `X_imgs/img_masks`），必须同时提供 `img_feature_names` 且与训练产物一致；否则直接报错。若缺失 image keys，则自动兜底为 `X_img=0, img_mask=0`。
 
 ### 9.2 UMAP + t-SNE 可视化（SVG）
 

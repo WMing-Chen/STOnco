@@ -1,5 +1,5 @@
 import argparse, os, numpy as np, torch, math
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from .models import STOnco_Classifier
 from stonco.utils.utils import save_model, save_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
@@ -147,22 +147,17 @@ def _k_random_combinations(present_ids, k, rng, val_ratio=0.2):
 
 # ---------------------------------------------------------------------------
 
-def assemble_pyg(Xp, xy, y, cfg):
-    from stonco.utils.preprocessing import GraphBuilder
+def assemble_pyg(Xp_gene, xy, y, cfg, Xp_img=None, img_mask=None):
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, mean_nd = gb.build_knn(xy)
     # 计算PE（可选使用高斯距离权重）
     if cfg.get('lap_pe_dim', 0) and cfg.get('lap_pe_dim', 0) > 0:
-        pe = gb.lap_pe(edge_index, Xp.shape[0], k=cfg['lap_pe_dim'],
+        pe = gb.lap_pe(edge_index, Xp_gene.shape[0], k=cfg['lap_pe_dim'],
                        edge_weight=edge_weight if cfg.get('lap_pe_use_gaussian', False) else None,
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    # 控制是否拼接PE
-    if cfg.get('concat_lap_pe', True) and pe is not None:
-        x = np.hstack([Xp, pe]).astype('float32')
-    else:
-        x = Xp.astype('float32')
+    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float(), y=torch.from_numpy(y).long())
     data.num_nodes = x.shape[0]
     return data
@@ -217,6 +212,10 @@ def main():
     parser.add_argument('--num_threads', type=int, default=None, help='设置PyTorch计算线程数（CPU模式下限制核心占用）')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader数据加载工作进程数')
     parser.add_argument('--use_pca', type=int, choices=[0, 1], default=None, help='是否使用PCA（1/0）')
+    # 新增：图像特征早期融合（方案1）
+    parser.add_argument('--use_image_features', type=int, choices=[0, 1], default=None, help='是否启用图像特征早期融合（1/0）')
+    parser.add_argument('--img_use_pca', type=int, choices=[0, 1], default=None, help='图像特征是否使用PCA降维（1/0）')
+    parser.add_argument('--img_pca_dim', type=int, default=None, help='图像特征PCA维度（默认256，仅当 img_use_pca=1 生效）')
     # 新增：HVG数量控制（支持数值或'all'；默认'all'表示使用全部基因）
     parser.add_argument('--n_hvg', default='all', help="高变基因数量，或'all'使用全部基因（默认'all'）")
     # 新增：从JSON加载配置（支持meta风格或扁平字典）
@@ -277,6 +276,10 @@ def main():
     cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
            # 控制项
            'use_pca': False,
+           # 方案1：早期融合（默认关闭以保持旧行为）
+           'use_image_features': False,
+           'img_use_pca': True,
+           'img_pca_dim': 256,
            'concat_lap_pe': True,
            'lap_pe_use_gaussian': False,
            # 分类头/域头（保持默认结构：clf 256->128->64，dom hidden=64）
@@ -332,6 +335,12 @@ def main():
         cfg['lap_pe_dim'] = args.lap_pe_dim
     if args.use_pca is not None:
         cfg['use_pca'] = bool(args.use_pca)
+    if getattr(args, 'use_image_features', None) is not None:
+        cfg['use_image_features'] = bool(args.use_image_features)
+    if getattr(args, 'img_use_pca', None) is not None:
+        cfg['img_use_pca'] = bool(args.img_use_pca)
+    if getattr(args, 'img_pca_dim', None) is not None:
+        cfg['img_pca_dim'] = int(args.img_pca_dim)
     # 新增：覆盖 HVG 数量（字符串'all'或可解析为整数的字符串/整数）
     if getattr(args, 'n_hvg', None) is not None:
         cfg['n_hvg'] = args.n_hvg
@@ -448,9 +457,34 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     支持：当 --stratify_by_cancer 启用时，采用癌种分层划分（每癌种1张为验证）。
     """
     data = np.load(args.train_npz, allow_pickle=True)
+    files = set(data.files)
     Xs = list(data['Xs']); ys = list(data['ys']); xys = list(data['xys']); slide_ids = list(data['slide_ids'])
     gene_names = list(data['gene_names'])
-    slides = [{'X':X,'y':y,'xy':xy,'slide_id':sid} for X,y,xy,sid in zip(Xs, ys, xys, slide_ids)]
+
+    use_image_features = bool(cfg.get('use_image_features', False))
+    X_imgs = None
+    img_masks = None
+    img_feature_names = None
+    if use_image_features:
+        required = {'X_imgs', 'img_masks', 'img_feature_names'}
+        missing = sorted(list(required - files))
+        if missing:
+            raise ValueError(f"use_image_features=1 requires keys {sorted(required)} in train_npz, missing: {missing}")
+        X_imgs = list(data['X_imgs'])
+        img_masks = list(data['img_masks'])
+        img_feature_names = list(data['img_feature_names'])
+        if not (len(X_imgs) == len(img_masks) == len(Xs)):
+            raise ValueError(
+                f'Length mismatch in train_npz: len(Xs)={len(Xs)}, len(X_imgs)={len(X_imgs)}, len(img_masks)={len(img_masks)}'
+            )
+
+    slides = []
+    for i, (X, y, xy, sid) in enumerate(zip(Xs, ys, xys, slide_ids)):
+        item = {'X': X, 'y': y, 'xy': xy, 'slide_id': sid}
+        if use_image_features:
+            item['X_img'] = X_imgs[i]
+            item['img_mask'] = img_masks[i]
+        slides.append(item)
 
     # 域标签准备
     present_ids = [str(sid) for sid in slide_ids]
@@ -473,10 +507,21 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     if save_preprocessor_dir is not None:
         pp.save(save_preprocessor_dir)
 
+    img_pp = None
+    if use_image_features:
+        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+        img_pp.fit([s['X_img'] for s in slides], [s['img_mask'] for s in slides])
+        if save_preprocessor_dir is not None:
+            img_pp.save(save_preprocessor_dir, img_feature_names=img_feature_names)
+
     pyg_graphs = []
     for s in slides:
-        Xp = pp.transform(s['X'], gene_names)
-        data_g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
+        Xp_gene = pp.transform(s['X'], gene_names)
+        if use_image_features:
+            Xp_img = img_pp.transform(s['X_img'], s['img_mask'])
+            data_g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg, Xp_img=Xp_img, img_mask=s['img_mask'])
+        else:
+            data_g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg)
         data_g.slide_id = str(s['slide_id'])
         # 注入域标签（图级）
         batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
@@ -531,6 +576,19 @@ def _build_external_val_graphs(args, cfg, preprocessor_dir):
         print(f"[Warn] Failed to load preprocessor from {preprocessor_dir}: {e}")
         return []
 
+    use_image_features = bool(cfg.get('use_image_features', False))
+    img_pp = None
+    expected_img_feature_names = None
+    if use_image_features:
+        try:
+            img_pp = ImagePreprocessor.load(preprocessor_dir, img_use_pca=cfg.get('img_use_pca', True))
+            expected_img_feature_names = img_pp.feature_names
+            if not expected_img_feature_names:
+                raise ValueError('img_feature_names.txt is missing or empty.')
+        except Exception as e:
+            print(f"[Warn] Failed to load image preprocessor from {preprocessor_dir}: {e}")
+            return []
+
     # 外部验证仅用于分类指标计算，不注入域标签
 
     graphs = []
@@ -549,8 +607,23 @@ def _build_external_val_graphs(args, cfg, preprocessor_dir):
         gene_names = list(d['gene_names'])
         sample_id = str(d.get('sample_id', Path(npz_path).stem))
 
-        Xp = pp.transform(X, gene_names)
-        g = assemble_pyg(Xp, xy, y, cfg)
+        Xp_gene = pp.transform(X, gene_names)
+        if use_image_features:
+            if {'X_img', 'img_mask'}.issubset(set(d.files)):
+                X_img = d['X_img']
+                img_mask = d['img_mask']
+                if 'img_feature_names' not in d.files:
+                    raise ValueError(f"Missing 'img_feature_names' in {npz_path}")
+                img_feature_names = list(d['img_feature_names'])
+                if expected_img_feature_names is not None and img_feature_names != expected_img_feature_names:
+                    raise ValueError(f"img_feature_names mismatch in {npz_path} (sample_id={sample_id})")
+            else:
+                X_img = np.zeros((X.shape[0], int(img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+                img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+            Xp_img = img_pp.transform(X_img, img_mask)
+            g = assemble_pyg(Xp_gene, xy, y, cfg, Xp_img=Xp_img, img_mask=img_mask)
+        else:
+            g = assemble_pyg(Xp_gene, xy, y, cfg)
         g.slide_id = sample_id
 
         graphs.append(g)
@@ -1356,9 +1429,34 @@ def run_kfold_training(args, cfg, device):
     """
     # 读取数据并构建图
     data = np.load(args.train_npz, allow_pickle=True)
+    files = set(data.files)
     Xs = list(data['Xs']); ys = list(data['ys']); xys = list(data['xys']); slide_ids = list(data['slide_ids'])
     gene_names = list(data['gene_names'])
-    slides = [{'X': X, 'y': y, 'xy': xy, 'slide_id': sid} for X, y, xy, sid in zip(Xs, ys, xys, slide_ids)]
+
+    use_image_features = bool(cfg.get('use_image_features', False))
+    X_imgs = None
+    img_masks = None
+    img_feature_names = None
+    if use_image_features:
+        required = {'X_imgs', 'img_masks', 'img_feature_names'}
+        missing = sorted(list(required - files))
+        if missing:
+            raise ValueError(f"use_image_features=1 requires keys {sorted(required)} in train_npz, missing: {missing}")
+        X_imgs = list(data['X_imgs'])
+        img_masks = list(data['img_masks'])
+        img_feature_names = list(data['img_feature_names'])
+        if not (len(X_imgs) == len(img_masks) == len(Xs)):
+            raise ValueError(
+                f'Length mismatch in train_npz: len(Xs)={len(Xs)}, len(X_imgs)={len(X_imgs)}, len(img_masks)={len(img_masks)}'
+            )
+
+    slides = []
+    for i, (X, y, xy, sid) in enumerate(zip(Xs, ys, xys, slide_ids)):
+        item = {'X': X, 'y': y, 'xy': xy, 'slide_id': sid}
+        if use_image_features:
+            item['X_img'] = X_imgs[i]
+            item['img_mask'] = img_masks[i]
+        slides.append(item)
 
     present_ids = [str(sid) for sid in slide_ids]
     id2type, type2present = _build_type_to_present_ids(present_ids)
@@ -1376,10 +1474,19 @@ def run_kfold_training(args, cfg, device):
     pp = Preprocessor(n_hvg=n_hvg_val, pca_dim=cfg['pca_dim'], use_pca=cfg.get('use_pca', True))
     pp.fit(slides, gene_names)
 
+    img_pp = None
+    if use_image_features:
+        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+        img_pp.fit([s['X_img'] for s in slides], [s['img_mask'] for s in slides])
+
     pyg_graphs = []
     for s in slides:
-        Xp = pp.transform(s['X'], gene_names)
-        data_g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
+        Xp_gene = pp.transform(s['X'], gene_names)
+        if use_image_features:
+            Xp_img = img_pp.transform(s['X_img'], s['img_mask'])
+            data_g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg, Xp_img=Xp_img, img_mask=s['img_mask'])
+        else:
+            data_g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg)
         data_g.slide_id = str(s['slide_id'])
         batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
         data_g.bat_dom = torch.tensor(batch_to_idx[batch_id], dtype=torch.long)
@@ -1415,6 +1522,8 @@ def run_kfold_training(args, cfg, device):
         # 保存本折的预处理器产物（此处pp基于全体拟合，若需严格无泄漏，可改为每折重拟合）
         try:
             pp.save(fold_dir)
+            if use_image_features:
+                img_pp.save(fold_dir, img_feature_names=img_feature_names)
             print(f"[KFold] Saved preprocessor artifacts to {fold_dir}")
         except Exception:
             pass
@@ -1554,8 +1663,26 @@ def run_loco_training(args, cfg, device):
     产物目录：在 artifacts_dir 同级目录创建 loco_eval/ct/ 子目录。
     """
     data = np.load(args.train_npz, allow_pickle=True)
+    files = set(data.files)
     Xs = list(data['Xs']); ys = list(data['ys']); xys = list(data['xys']); slide_ids = list(map(str, list(data['slide_ids'])))
     gene_names = list(data['gene_names'])
+
+    use_image_features = bool(cfg.get('use_image_features', False))
+    X_imgs = None
+    img_masks = None
+    img_feature_names = None
+    if use_image_features:
+        required = {'X_imgs', 'img_masks', 'img_feature_names'}
+        missing = sorted(list(required - files))
+        if missing:
+            raise ValueError(f"use_image_features=1 requires keys {sorted(required)} in train_npz, missing: {missing}")
+        X_imgs = list(data['X_imgs'])
+        img_masks = list(data['img_masks'])
+        img_feature_names = list(data['img_feature_names'])
+        if not (len(X_imgs) == len(img_masks) == len(Xs)):
+            raise ValueError(
+                f'Length mismatch in train_npz: len(Xs)={len(Xs)}, len(X_imgs)={len(X_imgs)}, len(img_masks)={len(img_masks)}'
+            )
 
     id2type, type2present = _build_type_to_present_ids(slide_ids)
     _, _, id2batch, _ = _load_cancer_labels()
@@ -1570,7 +1697,13 @@ def run_loco_training(args, cfg, device):
     per_slide_rows = []
 
     # 将原始slides打包便于按索引选择
-    slides_all = [{'X': X, 'y': y, 'xy': xy, 'slide_id': sid} for X, y, xy, sid in zip(Xs, ys, xys, slide_ids)]
+    slides_all = []
+    for i, (X, y, xy, sid) in enumerate(zip(Xs, ys, xys, slide_ids)):
+        item = {'X': X, 'y': y, 'xy': xy, 'slide_id': sid}
+        if use_image_features:
+            item['X_img'] = X_imgs[i]
+            item['img_mask'] = img_masks[i]
+        slides_all.append(item)
 
     for ct in tqdm(cancer_types, desc='LOCO', total=len(cancer_types)):
         val_ids = sorted(type2present[ct])
@@ -1595,6 +1728,15 @@ def run_loco_training(args, cfg, device):
         except Exception:
             pass
 
+        img_pp = None
+        if use_image_features:
+            img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+            img_pp.fit([s['X_img'] for s in slides_train], [s['img_mask'] for s in slides_train])
+            try:
+                img_pp.save(loco_dir, img_feature_names=img_feature_names)
+            except Exception:
+                pass
+
         # 构建图并注入域标签
         # 域索引基于全部出现的batch/cancer，以保持head维度稳定
         batch_fallback_cache = set()
@@ -1607,8 +1749,12 @@ def run_loco_training(args, cfg, device):
             for s in slides_all:
                 if s['slide_id'] not in id_list:
                     continue
-                Xp = pp.transform(s['X'], gene_names)
-                g = assemble_pyg(Xp, s['xy'], s['y'], cfg)
+                Xp_gene = pp.transform(s['X'], gene_names)
+                if use_image_features:
+                    Xp_img = img_pp.transform(s['X_img'], s['img_mask'])
+                    g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg, Xp_img=Xp_img, img_mask=s['img_mask'])
+                else:
+                    g = assemble_pyg(Xp_gene, s['xy'], s['y'], cfg)
                 g.slide_id = str(s['slide_id'])
                 batch_id = _resolve_batch_id(str(s['slide_id']), id2batch, batch_fallback_cache)
                 g.bat_dom = torch.tensor(batch_to_idx[batch_id], dtype=torch.long)

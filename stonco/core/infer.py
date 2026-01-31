@@ -1,5 +1,5 @@
 import argparse, os, numpy as np, torch
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from stonco.utils.utils import load_json, load_model_state_dict
 from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData
@@ -29,8 +29,14 @@ class InferenceEngine:
         self.cfg.setdefault('num_layers', 3)
         self.cfg.setdefault('dropout', 0.3)
         self.cfg.setdefault('clf_hidden', [256, 128, 64])
+        self.cfg.setdefault('use_image_features', False)
+        self.cfg.setdefault('img_use_pca', True)
+        self.cfg.setdefault('img_pca_dim', 256)
 
         self.pp = Preprocessor.load(artifacts_dir)
+        self.img_pp = None
+        if bool(self.cfg.get('use_image_features', False)):
+            self.img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(self.cfg.get('img_use_pca', True)))
         self.device = torch.device(device) if isinstance(device, str) else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
         # 构建一个dummy图以确定输入维度
@@ -57,19 +63,16 @@ class InferenceEngine:
             self.model.eval()
         return self.model
 
-    def assemble_pyg(self, Xp: np.ndarray, xy: np.ndarray) -> PyGData:
+    def assemble_pyg(self, Xp_gene: np.ndarray, xy: np.ndarray, Xp_img: np.ndarray | None = None, img_mask: np.ndarray | None = None) -> PyGData:
         gb = GraphBuilder(knn_k=self.cfg['knn_k'], gaussian_sigma_factor=self.cfg['gaussian_sigma_factor'])
         edge_index, edge_weight, _ = gb.build_knn(xy)
         if self.cfg.get('lap_pe_dim', 0) and self.cfg.get('lap_pe_dim', 0) > 0:
-            pe = gb.lap_pe(edge_index, Xp.shape[0], k=self.cfg['lap_pe_dim'],
+            pe = gb.lap_pe(edge_index, Xp_gene.shape[0], k=self.cfg['lap_pe_dim'],
                            edge_weight=edge_weight if self.cfg.get('lap_pe_use_gaussian', False) else None,
                            use_gaussian_weights=self.cfg.get('lap_pe_use_gaussian', False))
         else:
             pe = None
-        if self.cfg.get('concat_lap_pe', True) and pe is not None:
-            x = np.hstack([Xp, pe]).astype('float32')
-        else:
-            x = Xp.astype('float32')
+        x = build_node_features_early_fusion(Xp_gene, self.cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
         data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
         data.num_nodes = x.shape[0]
         return data
@@ -130,21 +133,17 @@ class InferenceEngine:
         attr_gene = (attr_z / scale).detach().cpu().numpy()
         return attr_gene
 
-def assemble_pyg(Xp, xy, cfg):
-    from stonco.utils.preprocessing import GraphBuilder
+def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
-    edge_index, edge_weight, mean_nd = gb.build_knn(xy)
+    edge_index, edge_weight, _ = gb.build_knn(xy)
     # lapPE（可选：使用高斯权重并控制是否拼接）
     if cfg.get('lap_pe_dim', 0) and cfg.get('lap_pe_dim', 0) > 0:
-        pe = gb.lap_pe(edge_index, Xp.shape[0], k=cfg['lap_pe_dim'],
+        pe = gb.lap_pe(edge_index, Xp_gene.shape[0], k=cfg['lap_pe_dim'],
                        edge_weight=edge_weight if cfg.get('lap_pe_use_gaussian', False) else None,
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
-        x = np.hstack([Xp, pe]).astype('float32')
-    else:
-        x = Xp.astype('float32')
+    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
     data.num_nodes = x.shape[0]
     return data
@@ -184,6 +183,7 @@ def main():
         X = data['X']
         xy = data['xy']
         sample_tag = 'single'
+        idx = None
     elif {'Xs', 'xys'}.issubset(files):
         idx = 0 if args.index is None else args.index
         Xs = data['Xs']
@@ -195,8 +195,37 @@ def main():
         raise ValueError(f"Unsupported NPZ structure. Found keys: {sorted(files)}")
     gene_names = list(data['gene_names'])
 
-    Xp = engine.pp.transform(X, gene_names)
-    data_g = engine.assemble_pyg(Xp, xy)
+    Xp_gene = engine.pp.transform(X, gene_names)
+
+    if bool(cfg.get('use_image_features', False)):
+        if engine.img_pp is None:
+            raise RuntimeError('use_image_features=1 but failed to load ImagePreprocessor from artifacts_dir.')
+
+        has_img_arrays = False
+        if {'X_img', 'img_mask'}.issubset(files):
+            X_img = data['X_img']
+            img_mask = data['img_mask']
+            has_img_arrays = True
+        elif {'X_imgs', 'img_masks'}.issubset(files) and idx is not None:
+            X_img = data['X_imgs'][idx]
+            img_mask = data['img_masks'][idx]
+            has_img_arrays = True
+        else:
+            X_img = np.zeros((X.shape[0], int(engine.img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+            img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+
+        if has_img_arrays:
+            if 'img_feature_names' not in files:
+                raise ValueError("NPZ contains X_img/X_imgs but missing required key 'img_feature_names'")
+            img_feature_names = list(data['img_feature_names'])
+            expected = engine.img_pp.feature_names
+            if expected is not None and img_feature_names != expected:
+                raise ValueError('img_feature_names mismatch between NPZ and artifacts_dir/img_feature_names.txt')
+
+        Xp_img = engine.img_pp.transform(X_img, img_mask)
+        data_g = engine.assemble_pyg(Xp_gene, xy, Xp_img=Xp_img, img_mask=img_mask)
+    else:
+        data_g = engine.assemble_pyg(Xp_gene, xy)
 
     probs = engine.predict_proba(data_g)
 

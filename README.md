@@ -14,6 +14,7 @@ STOnco is a PyTorch Geometric-based framework for tumor/non-tumor binary classif
 - **Dual-Domain Adversarial Learning**: Reduces dependency on cancer-specific signals and batch effects
 - **Spot-Level Domain Heads + GRL Scheduling**: Domain adversarial learning at the spot level with decoupled loss weight and GRL strength
 - **Multiple GNN Architectures**: Support for GATv2, GCN, and GraphSAGE models
+- **Optional Image Feature Early Fusion (Scheme 1)**: Concatenate per-spot image features into node inputs with independent preprocessing (StandardScaler + optional PCA)
 - **Complete Pipeline**: From data preparation to training, inference, and visualization
 - **Hyperparameter Optimization**: Built-in HPO with multi-stage pipeline
 - **Batch Processing**: Efficient inference on multiple samples
@@ -43,6 +44,13 @@ pip install -e .
 
 ### 1. Data Preparation
 
+Each slide directory must contain exactly 3 CSV files (case-insensitive suffix matching):
+- `*exp.csv`
+- `*coordinates.csv`
+- `*image_features.csv` (Barcode + 2048 image feature columns; column names/order must be consistent across slides)
+
+If a spot is missing from `*image_features.csv`, its image vector is filled with zeros and `img_mask=0` is recorded (with a warning). Non-finite image values (NaN/inf) will raise an error during data preparation.
+
 ```bash
 python -m stonco.utils.prepare_data build-train-npz \
     --train_dir /path/to/visium/data/ST_train_datasets \
@@ -65,6 +73,22 @@ python -m stonco.core.train \
     --artifacts_dir ./artifacts \
     --model gatv2
 ```
+
+Enable image feature early fusion (Scheme 1):
+
+```bash
+python -m stonco.core.train \
+    --train_npz ./processed_data/train_data.npz \
+    --artifacts_dir ./artifacts \
+    --model gatv2 \
+    --use_image_features 1 \
+    --img_use_pca 1 \
+    --img_pca_dim 256
+```
+
+When `--use_image_features 1`, training also saves the image preprocessor artifacts to `--artifacts_dir`:
+`img_feature_names.txt`, `img_scaler.joblib`, and (if `--img_use_pca 1`) `img_pca.joblib`.
+If `--img_use_pca 1`, training requires the number of valid image spots (where `img_mask==1`) to be at least `--img_pca_dim`.
 
 Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics. The `meta.json` now records `train_ids`, `val_ids`, and `metrics` for reproducibility. You can control validation splitting with `--val_ratio` (default 0.2) or disable stratification via `--no_stratify_by_cancer`.
 You can also adjust the classifier/domain-head widths via `--clf_hidden` (must end with 64) and `--dom_hidden` (one hidden layer for both domain heads); values are saved into `meta.json` to keep inference consistent.
@@ -105,6 +129,10 @@ python -m stonco.core.batch_infer \
     --out_csv ./predictions/batch_predictions.csv
 ```
 Batch inference writes spot-level predictions to `out_csv` and also emits a slide-level summary CSV (`batch_preds_summary.csv`) in the same directory.
+
+Note: if the model was trained with `use_image_features=1`, inference will use image features according to `meta.json:cfg`.
+If the input NPZ contains `X_img/img_mask/img_feature_names`, they must match `artifacts_dir/img_feature_names.txt` (otherwise an error is raised).
+If the input NPZ does not include image keys, inference falls back to `X_img=0` and `img_mask=0` (runs as gene-only for that input, but the model still expects the fused input dimension).
 
 KFold batch inference (per fold):
 
@@ -264,6 +292,10 @@ STOnco expects NPZ files with the following structure:
 - `slide_ids`: per-slide identifiers (strings)
 - `gene_names`: gene names (length `n_genes`)
 - optional `barcodes`: per-slide barcodes
+- optional image keys (required if training with `--use_image_features 1`):
+  - `X_imgs`: list/array of per-slide image feature matrices `(n_spots_i, 2048)` (float32)
+  - `img_masks`: list/array of per-slide image masks `(n_spots_i,)` (uint8 0/1)
+  - `img_feature_names`: image feature names (length 2048; must match across slides and between train/infer)
 
 **Single-slide NPZ (from `prepare_data build-single-npz` / `build-val-npz`):**
 - `X`: gene expression matrix `(n_spots, n_genes)`
@@ -271,6 +303,10 @@ STOnco expects NPZ files with the following structure:
 - `gene_names`: gene names
 - `sample_id`: slide/sample id (optional but recommended)
 - optional `y`: binary labels, `barcodes`
+- optional image keys:
+  - `X_img`: image feature matrix `(n_spots, 2048)` (float32)
+  - `img_mask`: image mask `(n_spots,)` (uint8 0/1)
+  - `img_feature_names`: image feature names (length 2048; must match training)
 
 ## Examples
 

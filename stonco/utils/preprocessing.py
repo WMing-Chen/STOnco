@@ -11,6 +11,23 @@ try:
 except Exception:
     _SCANPY = False
 
+def build_node_features_early_fusion(Xp_gene, cfg, Xp_img=None, img_mask=None, pe=None):
+    xs = [Xp_gene]
+    if Xp_img is not None:
+        if img_mask is None:
+            raise ValueError('img_mask is required when Xp_img is provided')
+        img_mask = np.asarray(img_mask).reshape(-1)
+        if img_mask.shape[0] != Xp_gene.shape[0]:
+            raise ValueError(f'img_mask length mismatch: {img_mask.shape[0]} vs n_spots={Xp_gene.shape[0]}')
+        img_mask_col = img_mask.astype('float32').reshape(-1, 1)
+        xs.extend([Xp_img, img_mask_col])
+
+    x = np.hstack(xs).astype('float32')
+    if cfg.get('concat_lap_pe', True) and pe is not None:
+        x = np.hstack([x, pe]).astype('float32')
+    return x
+
+
 class Preprocessor:
     def __init__(self, n_hvg=2000, norm_target=1e4, do_log1p=True, pca_dim=64, zclip=5.0, use_pca=True):
         self.n_hvg = n_hvg
@@ -113,6 +130,121 @@ class Preprocessor:
         inst.hvg = hvg
         inst.scaler = scaler
         inst.pca = pca
+        inst.fitted = True
+        return inst
+
+class ImagePreprocessor:
+    def __init__(self, img_use_pca=True, img_pca_dim=256):
+        self.use_pca = bool(img_use_pca)
+        self.pca_dim = int(img_pca_dim)
+        self.scaler = StandardScaler()
+        if self.use_pca:
+            self.pca = PCA(
+                n_components=self.pca_dim,
+                whiten=False,
+                svd_solver='randomized',
+                random_state=42,
+            )
+        else:
+            self.pca = None
+        self.feature_names = None
+        self.fitted = False
+
+    def fit(self, X_img_list, img_masks_list=None):
+        X_list = []
+        if img_masks_list is None:
+            for X_img in X_img_list:
+                X_list.append(np.asarray(X_img, dtype=np.float32))
+        else:
+            for X_img, m in zip(X_img_list, img_masks_list):
+                X_img = np.asarray(X_img, dtype=np.float32)
+                m = np.asarray(m).reshape(-1)
+                if m.shape[0] != X_img.shape[0]:
+                    raise ValueError(f'img_mask length mismatch: {m.shape[0]} vs X_img rows={X_img.shape[0]}')
+                idx = (m.astype(np.uint8) == 1)
+                if idx.any():
+                    X_list.append(X_img[idx])
+        if not X_list:
+            raise ValueError('No valid image features to fit ImagePreprocessor (all img_mask==0).')
+        X_fit = np.vstack(X_list)
+        if self.use_pca and X_fit.shape[0] < self.pca_dim:
+            raise ValueError(
+                f'img_use_pca=1 requires n_valid_spots({X_fit.shape[0]}) >= img_pca_dim({self.pca_dim}).'
+            )
+        self.scaler.fit(X_fit)
+        Xz = self.scaler.transform(X_fit)
+        if self.use_pca:
+            self.pca.fit(Xz)
+        self.fitted = True
+
+    def out_dim(self):
+        if self.use_pca and self.pca is not None:
+            return int(getattr(self.pca, 'n_components_', self.pca_dim))
+        if hasattr(self.scaler, 'mean_') and self.scaler.mean_ is not None:
+            return int(self.scaler.mean_.shape[0])
+        return int(self.pca_dim) if self.use_pca else 2048
+
+    def transform(self, X_img, img_mask=None):
+        assert self.fitted, 'ImagePreprocessor not fitted'
+        X_img = np.asarray(X_img, dtype=np.float32)
+        if X_img.ndim != 2:
+            raise ValueError(f'X_img must be 2D, got shape={X_img.shape}')
+        n = int(X_img.shape[0])
+        out_dim = int(self.out_dim())
+        Xp = np.zeros((n, out_dim), dtype=np.float32)
+        if img_mask is None:
+            idx = np.arange(n, dtype=int)
+        else:
+            img_mask = np.asarray(img_mask).reshape(-1)
+            if img_mask.shape[0] != n:
+                raise ValueError(f'img_mask length mismatch: {img_mask.shape[0]} vs X_img rows={n}')
+            idx = np.where(img_mask.astype(np.uint8) == 1)[0]
+        if idx.size == 0:
+            return Xp
+
+        X_valid = X_img[idx]
+        Xz = self.scaler.transform(X_valid)
+        if self.use_pca and self.pca is not None:
+            Xz = self.pca.transform(Xz)
+        Xp[idx] = Xz.astype(np.float32)
+        return Xp
+
+    def save(self, artifacts_dir, img_feature_names=None):
+        assert self.fitted, 'ImagePreprocessor not fitted'
+        os.makedirs(artifacts_dir, exist_ok=True)
+        if img_feature_names is not None:
+            with open(os.path.join(artifacts_dir, 'img_feature_names.txt'), 'w') as f:
+                for name in img_feature_names:
+                    f.write(str(name) + '\n')
+            self.feature_names = list(map(str, img_feature_names))
+        joblib.dump(self.scaler, os.path.join(artifacts_dir, 'img_scaler.joblib'))
+        if self.use_pca and self.pca is not None:
+            joblib.dump(self.pca, os.path.join(artifacts_dir, 'img_pca.joblib'))
+
+    @classmethod
+    def load(cls, artifacts_dir, img_use_pca=True):
+        scaler_path = os.path.join(artifacts_dir, 'img_scaler.joblib')
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f'img_scaler.joblib not found in artifacts_dir: {artifacts_dir}')
+        scaler = joblib.load(scaler_path)
+        inst = cls(img_use_pca=bool(img_use_pca), img_pca_dim=256)
+        inst.scaler = scaler
+
+        pca_path = os.path.join(artifacts_dir, 'img_pca.joblib')
+        if bool(img_use_pca):
+            if not os.path.exists(pca_path):
+                raise FileNotFoundError(f'img_pca.joblib not found in artifacts_dir: {artifacts_dir}')
+            inst.pca = joblib.load(pca_path)
+            inst.pca_dim = int(getattr(inst.pca, 'n_components_', inst.pca_dim))
+            inst.use_pca = True
+        else:
+            inst.pca = None
+            inst.use_pca = False
+
+        names_path = os.path.join(artifacts_dir, 'img_feature_names.txt')
+        if os.path.exists(names_path):
+            with open(names_path, 'r') as f:
+                inst.feature_names = [line.strip() for line in f if line.strip() != '']
         inst.fitted = True
         return inst
 

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, build_node_features_early_fusion
 from stonco.utils.utils import load_json
 from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
@@ -14,20 +14,17 @@ from stonco.utils.plot_accuracy_bars import plot_accuracy_bars
 from stonco.core.infer import InferenceEngine
 
 
-def assemble_pyg(Xp: np.ndarray, xy: np.ndarray, cfg: dict) -> PyGData:
+def assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.ndarray | None = None, img_mask: np.ndarray | None = None) -> PyGData:
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, _ = gb.build_knn(xy)
     # lapPE with optional gaussian weighting and concat flag
     if cfg.get('lap_pe_dim', 0) and cfg.get('lap_pe_dim', 0) > 0:
-        pe = gb.lap_pe(edge_index, Xp.shape[0], k=cfg['lap_pe_dim'],
+        pe = gb.lap_pe(edge_index, Xp_gene.shape[0], k=cfg['lap_pe_dim'],
                        edge_weight=edge_weight if cfg.get('lap_pe_use_gaussian', False) else None,
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
-        x = np.hstack([Xp, pe]).astype('float32')
-    else:
-        x = Xp.astype('float32')
+    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
         x=torch.from_numpy(x),
         edge_index=torch.from_numpy(edge_index).long(),
@@ -38,10 +35,12 @@ def assemble_pyg(Xp: np.ndarray, xy: np.ndarray, cfg: dict) -> PyGData:
 
 # 新增：基于文件列表的 Dataset，将 NPZ 读取、预处理与图构建放入 __getitem__，以便 DataLoader 多进程并行
 class SlideNPZDataset:
-    def __init__(self, files, preprocessor: Preprocessor, cfg: dict):
+    def __init__(self, files, preprocessor: Preprocessor, cfg: dict, img_preprocessor=None, expected_img_feature_names=None):
         self.files = list(files)
         self.pp = preprocessor
         self.cfg = cfg
+        self.img_pp = img_preprocessor
+        self.expected_img_feature_names = expected_img_feature_names
     def __len__(self):
         return len(self.files)
     def __getitem__(self, idx):
@@ -54,8 +53,25 @@ class SlideNPZDataset:
         # 读取 y_true（如果存在）
         y_true = d.get('y', None)
         
-        Xp = self.pp.transform(X, gene_names)
-        g = assemble_pyg(Xp, xy, self.cfg)
+        Xp_gene = self.pp.transform(X, gene_names)
+        if bool(self.cfg.get('use_image_features', False)):
+            if self.img_pp is None:
+                raise RuntimeError('use_image_features=1 but img_preprocessor is not provided.')
+            if {'X_img', 'img_mask'}.issubset(set(d.files)):
+                X_img = d['X_img']
+                img_mask = d['img_mask']
+                if 'img_feature_names' not in d.files:
+                    raise ValueError(f"Missing 'img_feature_names' in {f}")
+                img_feature_names = list(d['img_feature_names'])
+                if self.expected_img_feature_names is not None and img_feature_names != self.expected_img_feature_names:
+                    raise ValueError(f'img_feature_names mismatch in {f}')
+            else:
+                X_img = np.zeros((X.shape[0], int(self.img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+                img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+            Xp_img = self.img_pp.transform(X_img, img_mask)
+            g = assemble_pyg(Xp_gene, xy, self.cfg, Xp_img=Xp_img, img_mask=img_mask)
+        else:
+            g = assemble_pyg(Xp_gene, xy, self.cfg)
         g.file_name = os.path.basename(f)
         # 保存坐标、barcodes、sample_id 和 y_true 用于回填输出
         g.xy = torch.from_numpy(xy).float()
@@ -128,7 +144,15 @@ def main():
     def _predict_external_files(files, source_label):
         if not files:
             return
-        dataset = SlideNPZDataset(files, pp, cfg)
+        img_pp = engine.img_pp if bool(cfg.get('use_image_features', False)) else None
+        expected_img_feature_names = img_pp.feature_names if img_pp is not None else None
+        dataset = SlideNPZDataset(
+            files,
+            pp,
+            cfg,
+            img_preprocessor=img_pp,
+            expected_img_feature_names=expected_img_feature_names,
+        )
         loader = PyGDataLoader(dataset, batch_size=1, shuffle=False, num_workers=max(0, args.num_workers))
         for batch in loader:
             probs = engine.predict_proba(batch)
@@ -194,9 +218,22 @@ def main():
             print('[Warn] meta.json has no val_ids; skip internal validation prediction.')
             return
         d = np.load(train_npz_path, allow_pickle=True)
+        train_files = set(d.files)
         slide_ids = list(map(str, list(d['slide_ids'])))
         Xs = list(d['Xs']); ys = list(d['ys']); xys = list(d['xys'])
         gene_names = list(d['gene_names'])
+        use_image_features = bool(cfg.get('use_image_features', False))
+        if use_image_features:
+            required = {'X_imgs', 'img_masks', 'img_feature_names'}
+            missing_keys = sorted(list(required - train_files))
+            if missing_keys:
+                raise ValueError(f'use_image_features=1 requires keys {sorted(required)} in train_npz, missing: {missing_keys}')
+            expected = engine.img_pp.feature_names if engine.img_pp is not None else None
+            img_feature_names = list(d['img_feature_names'])
+            if expected is not None and img_feature_names != expected:
+                raise ValueError('img_feature_names mismatch between train_npz and artifacts_dir/img_feature_names.txt')
+            X_imgs = list(d['X_imgs'])
+            img_masks = list(d['img_masks'])
         id_to_idx = {sid: i for i, sid in enumerate(slide_ids)}
         missing = [sid for sid in val_ids if sid not in id_to_idx]
         if missing:
@@ -208,8 +245,14 @@ def main():
             X = Xs[idx]
             xy = xys[idx]
             y_true = ys[idx] if ys is not None else None
-            Xp = engine.pp.transform(X, gene_names)
-            g = assemble_pyg(Xp, xy, cfg)
+            Xp_gene = engine.pp.transform(X, gene_names)
+            if use_image_features:
+                X_img = X_imgs[idx]
+                img_mask = img_masks[idx]
+                Xp_img = engine.img_pp.transform(X_img, img_mask)
+                g = assemble_pyg(Xp_gene, xy, cfg, Xp_img=Xp_img, img_mask=img_mask)
+            else:
+                g = assemble_pyg(Xp_gene, xy, cfg)
             probs = engine.predict_proba(g)
             _append_rows_from_graph(sid, xy, probs, y_true, None, 'internal')
 

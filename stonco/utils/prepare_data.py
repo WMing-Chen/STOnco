@@ -7,6 +7,19 @@ import numpy as np
 import pandas as pd
 
 
+IMG_FEATURE_DIM = 2048
+
+
+def _find_unique_file_by_suffix(sample_dir: str, suffix: str, kind: str, sample_id: str) -> str:
+    files = [f for f in os.listdir(sample_dir) if f.lower().endswith(suffix.lower())]
+    if len(files) != 1:
+        raise RuntimeError(
+            f"Expected exactly 1 '*{suffix}' file for {kind} in sample_dir={sample_dir} "
+            f"(sample_id={sample_id}), found {len(files)}: {files}"
+        )
+    return os.path.join(sample_dir, files[0])
+
+
 def _read_expression(exp_csv: str) -> Tuple[pd.Index, List[str], pd.DataFrame]:
     df = pd.read_csv(exp_csv)
     if df.shape[1] < 2:
@@ -74,6 +87,46 @@ def _read_coords(coord_csv: str, x_col: str, y_col: str, label_col: str | None) 
     return barcodes, xy, y
 
 
+def _read_image_features(image_csv: str) -> Tuple[pd.Index, List[str], pd.DataFrame]:
+    df = pd.read_csv(image_csv)
+    colmap = {str(c).lower(): c for c in df.columns}
+    bc_col = colmap.get('barcode', None)
+    if bc_col is None:
+        raise ValueError(f"Image features CSV must contain 'Barcode' column: {image_csv}. Available: {list(df.columns)}")
+
+    barcodes = df[bc_col].astype(str)
+    if barcodes.duplicated().any():
+        dup = barcodes[barcodes.duplicated()].tolist()[:10]
+        raise ValueError(f"Duplicate Barcode values found in image features CSV: {image_csv}. Examples: {dup}")
+
+    feat_cols = [c for c in df.columns if c != bc_col]
+    if len(feat_cols) != IMG_FEATURE_DIM:
+        raise ValueError(
+            f"Image features CSV must have exactly {IMG_FEATURE_DIM} feature columns (excluding Barcode): "
+            f"{image_csv}. Got {len(feat_cols)}."
+        )
+
+    feature_names = [str(c) for c in feat_cols]
+    feats = df[feat_cols].copy()
+    for c in feats.columns:
+        feats[c] = pd.to_numeric(feats[c], errors='coerce')
+    if feats.isna().any().any():
+        bad_cols = feats.columns[feats.isna().any()].tolist()[:10]
+        raise ValueError(f"Found NaN (or non-numeric) in image features CSV: {image_csv}. Bad cols examples: {bad_cols}")
+
+    arr = feats.to_numpy(dtype=np.float32)
+    if not np.isfinite(arr).all():
+        bad = np.argwhere(~np.isfinite(arr))
+        i, j = int(bad[0, 0]), int(bad[0, 1])
+        bc = str(barcodes.iloc[i])
+        col = feature_names[j]
+        val = arr[i, j]
+        raise ValueError(f"Found non-finite value in image features CSV: {image_csv} (Barcode={bc}, col={col}, value={val})")
+
+    feats.index = barcodes
+    return feats.index, feature_names, feats
+
+
 def _union_gene_order(slide_gene_lists: List[List[str]]) -> List[str]:
     seen: Dict[str, None] = {}
     for genes in slide_gene_lists:
@@ -109,39 +162,61 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
     slide_ys: List[np.ndarray] = []
     slide_ids: List[str] = []
     slide_barcodes_aligned: List[pd.Index] = []
+    slide_X_imgs: List[np.ndarray] = []
+    slide_img_masks: List[np.ndarray] = []
+    img_feature_names_ref: List[str] | None = None
 
     for sd in subdirs:
         slide_path = os.path.join(train_dir, sd)
-        # auto-detect files: prefer *coordinates.csv and *exp.csv
-        coord_files = [f for f in os.listdir(slide_path) if f.lower().endswith('coordinates.csv')]
-        exp_files = [f for f in os.listdir(slide_path) if f.lower().endswith('exp.csv')]
-        if not coord_files or not exp_files:
-            raise RuntimeError(f"Missing coordinates/exp CSV in {slide_path}. Found: {os.listdir(slide_path)}")
-        coord_csv = os.path.join(slide_path, coord_files[0])
-        exp_csv = os.path.join(slide_path, exp_files[0])
+        coord_csv = _find_unique_file_by_suffix(slide_path, 'coordinates.csv', kind='coordinates', sample_id=sd)
+        exp_csv = _find_unique_file_by_suffix(slide_path, 'exp.csv', kind='expression', sample_id=sd)
+        img_csv = _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
 
         bc_exp, genes, expr = _read_expression(exp_csv)
         bc_coord, xy, y = _read_coords(coord_csv, x_col=x_col, y_col=y_col, label_col=label_col)
 
-        # align by intersection of barcodes, keep coordinate order
-        bc_inter = pd.Index(bc_coord, dtype=str).intersection(pd.Index(bc_exp, dtype=str))
-        if len(bc_inter) == 0:
+        # align by intersection of barcodes, keep coordinates.csv barcode order
+        bc_coord_arr = np.asarray(bc_coord, dtype=str)
+        bc_exp_set = set(map(str, bc_exp))
+        keep_mask = np.array([bc in bc_exp_set for bc in bc_coord_arr], dtype=bool)
+        barcodes_used = bc_coord_arr[keep_mask]
+        if barcodes_used.shape[0] == 0:
             raise RuntimeError(f"No overlapping Barcodes between {coord_csv} and {exp_csv}")
-        # Reindex expr to coord order
-        expr_aligned = expr.reindex(pd.Index(bc_inter), copy=False)
-        xy_aligned = xy[np.isin(bc_coord, bc_inter)]
-        y_aligned = y[np.isin(bc_coord, bc_inter)] if y is not None else None
+        expr_aligned = expr.reindex(pd.Index(barcodes_used, dtype=str), copy=False)
+        xy_aligned = xy[keep_mask]
+        y_aligned = y[keep_mask] if y is not None else None
+
+        _, img_feature_names, img_df = _read_image_features(img_csv)
+        if img_feature_names_ref is None:
+            img_feature_names_ref = img_feature_names
+        elif img_feature_names != img_feature_names_ref:
+            raise ValueError(
+                f"Image feature names/order mismatch across slides. sample_id={sd}. "
+                f"Expected first 5={img_feature_names_ref[:5]}, got first 5={img_feature_names[:5]}"
+            )
+        img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
+        row_has_any_nan = img_aligned.isna().any(axis=1)
+        img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
+        missing_count = int((img_mask == 0).sum())
+        if missing_count > 0:
+            print(
+                f"Warning: sample_id={sd} missing image features for {missing_count} / {len(img_mask)} spots "
+                f"(filled with zeros, img_mask=0)"
+            )
+        X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
 
         slide_exprs.append(expr_aligned)
         slide_barcodes.append(expr_aligned.index)
         slide_genes.append(genes)
-        slide_coords_bc.append(pd.Index(bc_inter))
+        slide_coords_bc.append(pd.Index(barcodes_used))
         slide_xys.append(xy_aligned)
         if y_aligned is None:
             raise RuntimeError(f"Training requires labels. '{coord_csv}' must contain column '{label_col}'.")
         slide_ys.append(y_aligned.astype(int))
         slide_ids.append(sd)
-        slide_barcodes_aligned.append(pd.Index(bc_inter))
+        slide_barcodes_aligned.append(pd.Index(barcodes_used))
+        slide_X_imgs.append(X_img)
+        slide_img_masks.append(img_mask.astype(np.uint8))
 
     union_genes = _union_gene_order(slide_genes)
 
@@ -156,6 +231,9 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         ys.append(y.astype(np.int64))
         barcodes_arrays.append(np.array(barcodes.astype(str), dtype='U64'))
 
+    if img_feature_names_ref is None:
+        raise RuntimeError('No image features loaded. This should not happen.')
+
     np.savez_compressed(
         out_npz,
         Xs=np.array(Xs, dtype=object),
@@ -164,6 +242,9 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         slide_ids=np.array(slide_ids, dtype=object),
         gene_names=np.array(union_genes, dtype=object),
         barcodes=np.array(barcodes_arrays, dtype=object),
+        X_imgs=np.array(slide_X_imgs, dtype=object),
+        img_masks=np.array(slide_img_masks, dtype=object),
+        img_feature_names=np.array(img_feature_names_ref, dtype=object),
     )
     print(f"Saved training NPZ to: {out_npz}")
 
@@ -172,19 +253,35 @@ def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_c
     bc_exp, genes, expr = _read_expression(exp_csv)
     bc_coord, xy, y = _read_coords(coord_csv, x_col=x_col, y_col=y_col, label_col=label_col)
 
-    # align by intersection, keep coordinate order
-    bc_inter = pd.Index(bc_coord, dtype=str).intersection(pd.Index(bc_exp, dtype=str))
-    if len(bc_inter) == 0:
+    # align by intersection of barcodes, keep coordinates.csv barcode order
+    bc_coord_arr = np.asarray(bc_coord, dtype=str)
+    bc_exp_set = set(map(str, bc_exp))
+    keep_mask = np.array([bc in bc_exp_set for bc in bc_coord_arr], dtype=bool)
+    barcodes_used = bc_coord_arr[keep_mask]
+    if barcodes_used.shape[0] == 0:
         raise RuntimeError(f"No overlapping Barcodes between {coord_csv} and {exp_csv}")
 
-    expr_aligned = expr.reindex(pd.Index(bc_inter), copy=False)
-    xy_aligned = xy[np.isin(bc_coord, bc_inter)]
-    y_aligned = y[np.isin(bc_coord, bc_inter)] if y is not None else None
-    barcodes_aligned = np.array(bc_inter.astype(str), dtype='U64')
+    expr_aligned = expr.reindex(pd.Index(barcodes_used, dtype=str), copy=False)
+    xy_aligned = xy[keep_mask]
+    y_aligned = y[keep_mask] if y is not None else None
+    barcodes_aligned = np.array(barcodes_used.astype(str), dtype='U64')
     
     # Infer sample_id from file path if not provided
     if sample_id is None:
         sample_id = Path(coord_csv).parent.name
+
+    img_csv = _find_unique_file_by_suffix(Path(coord_csv).parent.as_posix(), 'image_features.csv', kind='image_features', sample_id=sample_id)
+    _, img_feature_names, img_df = _read_image_features(img_csv)
+    img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
+    row_has_any_nan = img_aligned.isna().any(axis=1)
+    img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
+    missing_count = int((img_mask == 0).sum())
+    if missing_count > 0:
+        print(
+            f"Warning: sample_id={sample_id} missing image features for {missing_count} / {len(img_mask)} spots "
+            f"(filled with zeros, img_mask=0)"
+        )
+    X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
 
     # Keep original gene order as in CSV
     X = expr_aligned.to_numpy(dtype=float)
@@ -194,6 +291,9 @@ def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_c
         'gene_names': np.array(genes, dtype=object),
         'barcodes': barcodes_aligned,
         'sample_id': sample_id,
+        'X_img': X_img.astype(np.float32),
+        'img_mask': img_mask.astype(np.uint8),
+        'img_feature_names': np.array(img_feature_names, dtype=object),
     }
     if y_aligned is not None:
         save_dict['y'] = y_aligned.astype(np.int64)
@@ -215,15 +315,13 @@ def build_val_npz(val_dir: str, out_dir: str, x_col: str, y_col: str, label_col:
     print(f"Processing {len(subdirs)} validation slides...")
     for sd in subdirs:
         slide_path = os.path.join(val_dir, sd)
-        # auto-detect files: prefer *coordinates.csv and *exp.csv
-        coord_files = [f for f in os.listdir(slide_path) if f.lower().endswith('coordinates.csv')]
-        exp_files = [f for f in os.listdir(slide_path) if f.lower().endswith('exp.csv')]
-        if not coord_files or not exp_files:
-            print(f"Warning: Missing coordinates/exp CSV in {slide_path}. Skipping.")
+        try:
+            coord_csv = _find_unique_file_by_suffix(slide_path, 'coordinates.csv', kind='coordinates', sample_id=sd)
+            exp_csv = _find_unique_file_by_suffix(slide_path, 'exp.csv', kind='expression', sample_id=sd)
+            _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
+        except Exception as e:
+            print(f"Warning: {e}. Skipping.")
             continue
-        
-        coord_csv = os.path.join(slide_path, coord_files[0])
-        exp_csv = os.path.join(slide_path, exp_files[0])
         out_npz = os.path.join(out_dir, f"{sd}.npz")
         
         try:

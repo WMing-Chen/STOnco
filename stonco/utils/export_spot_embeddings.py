@@ -9,7 +9,7 @@ import torch
 from torch_geometric.data import Data as PyGData
 
 from stonco.core.models import STOnco_Classifier
-from stonco.utils.preprocessing import GraphBuilder, Preprocessor
+from stonco.utils.preprocessing import GraphBuilder, Preprocessor, ImagePreprocessor, build_node_features_early_fusion
 from stonco.utils.utils import load_json, load_model_state_dict
 
 
@@ -40,23 +40,20 @@ def _load_domain_maps():
     return id2batch, id2type
 
 
-def _assemble_pyg(Xp: np.ndarray, xy: np.ndarray, cfg: dict) -> PyGData:
+def _assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.ndarray | None = None, img_mask: np.ndarray | None = None) -> PyGData:
     gb = GraphBuilder(knn_k=int(cfg['knn_k']), gaussian_sigma_factor=float(cfg['gaussian_sigma_factor']))
     edge_index, edge_weight, _ = gb.build_knn(xy)
     if cfg.get('lap_pe_dim', 0) and int(cfg.get('lap_pe_dim', 0)) > 0:
         pe = gb.lap_pe(
             edge_index,
-            Xp.shape[0],
+            Xp_gene.shape[0],
             k=int(cfg['lap_pe_dim']),
             edge_weight=edge_weight if cfg.get('lap_pe_use_gaussian', False) else None,
             use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False),
         )
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
-        x = np.hstack([Xp, pe]).astype('float32')
-    else:
-        x = Xp.astype('float32')
+    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
         x=torch.from_numpy(x),
         edge_index=torch.from_numpy(edge_index).long(),
@@ -78,6 +75,9 @@ def _iter_samples_from_train_npz(train_npz: str, subset: str, meta: dict):
     slide_ids = [str(s) for s in list(data['slide_ids'])]
     gene_names = list(data['gene_names'])
     barcodes_list = list(data['barcodes']) if 'barcodes' in files else None
+    X_imgs = list(data['X_imgs']) if 'X_imgs' in files else None
+    img_masks = list(data['img_masks']) if 'img_masks' in files else None
+    img_feature_names = list(data['img_feature_names']) if 'img_feature_names' in files else None
 
     keep_ids = None
     if subset != 'all':
@@ -94,6 +94,15 @@ def _iter_samples_from_train_npz(train_npz: str, subset: str, meta: dict):
                 barcodes = barcodes_list[i]
             except Exception:
                 barcodes = None
+        X_img = None
+        img_mask = None
+        if X_imgs is not None and img_masks is not None:
+            try:
+                X_img = X_imgs[i]
+                img_mask = img_masks[i]
+            except Exception:
+                X_img = None
+                img_mask = None
         yield {
             'sample_id': sid,
             'X': Xs[i],
@@ -101,6 +110,9 @@ def _iter_samples_from_train_npz(train_npz: str, subset: str, meta: dict):
             'y': ys[i],
             'gene_names': gene_names,
             'barcodes': barcodes,
+            'X_img': X_img,
+            'img_mask': img_mask,
+            'img_feature_names': img_feature_names,
         }
 
 
@@ -117,6 +129,9 @@ def _iter_samples_from_npz_glob(npz_glob: str):
         sample_id = str(d.get('sample_id', Path(path).stem))
         y = d['y'] if 'y' in keys else None
         barcodes = d.get('barcodes', None)
+        X_img = d['X_img'] if 'X_img' in keys else None
+        img_mask = d['img_mask'] if 'img_mask' in keys else None
+        img_feature_names = list(d['img_feature_names']) if 'img_feature_names' in keys else None
         yield {
             'sample_id': sample_id,
             'X': d['X'],
@@ -124,6 +139,9 @@ def _iter_samples_from_npz_glob(npz_glob: str):
             'y': y,
             'gene_names': list(d['gene_names']),
             'barcodes': barcodes,
+            'X_img': X_img,
+            'img_mask': img_mask,
+            'img_feature_names': img_feature_names,
         }
 
 
@@ -169,8 +187,19 @@ def main():
     cfg.setdefault('num_layers', 3)
     cfg.setdefault('dropout', 0.3)
     cfg.setdefault('clf_hidden', [256, 128, 64])
+    cfg.setdefault('use_image_features', False)
+    cfg.setdefault('img_use_pca', True)
+    cfg.setdefault('img_pca_dim', 256)
 
     pp = Preprocessor.load(artifacts_dir)
+    use_image_features = bool(cfg.get('use_image_features', False))
+    img_pp = None
+    expected_img_feature_names = None
+    if use_image_features:
+        img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', True)))
+        expected_img_feature_names = img_pp.feature_names
+        if not expected_img_feature_names:
+            raise ValueError('use_image_features=1 but artifacts_dir/img_feature_names.txt is missing or empty.')
     id2batch, id2type = _load_domain_maps()
 
     if args.train_npz is not None:
@@ -198,8 +227,24 @@ def main():
         gene_names = list(sample['gene_names'])
         barcodes = sample.get('barcodes', None)
 
-        Xp = pp.transform(X, gene_names)
-        g = _assemble_pyg(Xp, xy, cfg).to(device)
+        Xp_gene = pp.transform(X, gene_names)
+        if use_image_features:
+            X_img = sample.get('X_img', None)
+            img_mask = sample.get('img_mask', None)
+            has_img_arrays = X_img is not None and img_mask is not None
+            if has_img_arrays:
+                img_feature_names = sample.get('img_feature_names', None)
+                if img_feature_names is None:
+                    raise ValueError(f"Sample {sample_id} contains X_img but missing img_feature_names")
+                if expected_img_feature_names is not None and list(img_feature_names) != expected_img_feature_names:
+                    raise ValueError(f'img_feature_names mismatch for sample {sample_id}')
+            else:
+                X_img = np.zeros((X.shape[0], int(img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+                img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+            Xp_img = img_pp.transform(X_img, img_mask)
+            g = _assemble_pyg(Xp_gene, xy, cfg, Xp_img=Xp_img, img_mask=img_mask).to(device)
+        else:
+            g = _assemble_pyg(Xp_gene, xy, cfg).to(device)
 
         if model is None:
             in_dim = int(g.x.shape[1])

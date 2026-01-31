@@ -31,25 +31,22 @@ from torch_geometric.data import Data as PyGData
 # 新增：读取验证集坐标与标签
 import pandas as pd
 
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from stonco.core.models import STOnco_Classifier
 from stonco.utils.utils import load_model_state_dict, load_json
 
 
-def assemble_pyg(Xp, xy, cfg):
+def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, _ = gb.build_knn(xy)
     # lapPE（可选：使用高斯权重并控制是否拼接）
     if cfg.get('lap_pe_dim', 0) and cfg.get('lap_pe_dim', 0) > 0:
-        pe = gb.lap_pe(edge_index, Xp.shape[0], k=cfg['lap_pe_dim'],
+        pe = gb.lap_pe(edge_index, Xp_gene.shape[0], k=cfg['lap_pe_dim'],
                        edge_weight=edge_weight if cfg.get('lap_pe_use_gaussian', False) else None,
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
-        x = np.hstack([Xp, pe]).astype('float32')
-    else:
-        x = Xp.astype('float32')
+    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
         x=torch.from_numpy(x),
         edge_index=torch.from_numpy(edge_index).long(),
@@ -73,7 +70,10 @@ def load_one_slide(train_npz=None, single_npz=None, slide_idx=-1):
         gene_names = list(data['gene_names'])
         sid = slide_ids[slide_idx]
         barcodes = None  # 训练NPZ不包含barcodes
-        return X, y, xy, gene_names, sid, barcodes
+        X_img = data['X_imgs'][slide_idx] if 'X_imgs' in data.files else None
+        img_mask = data['img_masks'][slide_idx] if 'img_masks' in data.files else None
+        img_feature_names = list(data['img_feature_names']) if 'img_feature_names' in data.files else None
+        return X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names
     else:
         data = np.load(single_npz, allow_pickle=True)
         X = data['X']
@@ -83,7 +83,10 @@ def load_one_slide(train_npz=None, single_npz=None, slide_idx=-1):
         # 从NPZ读取sample_id和barcodes
         sid = str(data.get('sample_id', Path(single_npz).stem))
         barcodes = data.get('barcodes', None)
-        return X, y, xy, gene_names, sid, barcodes
+        X_img = data['X_img'] if 'X_img' in data.files else None
+        img_mask = data['img_mask'] if 'img_mask' in data.files else None
+        img_feature_names = list(data['img_feature_names']) if 'img_feature_names' in data.files else None
+        return X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names
 
 # 新增：从验证集目录读取真实标签，并按 (row,col) 与 xy 对齐
 def load_true_labels_from_valdir(val_root: str, slide_id: str, xy: np.ndarray, x_col: str = 'row', y_col: str = 'col', label_col: str = 'true_label') -> np.ndarray:
@@ -169,7 +172,7 @@ def main():
 def process_single_slide(npz_file, args):
     """处理单个NPZ文件并生成SVG"""
     # 加载数据
-    X, y, xy, gene_names, sid, barcodes = load_one_slide(single_npz=npz_file)
+    X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names = load_one_slide(single_npz=npz_file)
     
     # 从meta.json加载配置，保持与训练一致
     meta = load_json(os.path.join(args.artifacts_dir, 'meta.json'))
@@ -179,30 +182,33 @@ def process_single_slide(npz_file, args):
     out_svg = os.path.join(args.out_dir, f'{sid}.svg')
     
     # 处理可视化
-    visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg)
+    visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=X_img, img_mask=img_mask, img_feature_names=img_feature_names)
     print(f'Saved visualization for {sid} to {out_svg}')
 
 
 def process_single_slide_main(args):
     """处理单个切片的主函数"""
     # 加载数据（一张切片）
-    X, y, xy, gene_names, sid, barcodes = load_one_slide(train_npz=args.train_npz, single_npz=args.npz, slide_idx=args.slide_idx)
+    X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names = load_one_slide(train_npz=args.train_npz, single_npz=args.npz, slide_idx=args.slide_idx)
     
     # 从meta.json加载配置，保持与训练一致
     meta = load_json(os.path.join(args.artifacts_dir, 'meta.json'))
     cfg = dict(meta.get('cfg', {}))
     
     # 处理可视化
-    visualize_slide(X, xy, gene_names, sid, y, cfg, args, args.out_svg)
+    visualize_slide(X, xy, gene_names, sid, y, cfg, args, args.out_svg, X_img=X_img, img_mask=img_mask, img_feature_names=img_feature_names)
 
 
-def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
+def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, img_mask=None, img_feature_names=None):
     """可视化单个切片的核心逻辑"""
     # 兼容旧模型：若缺失新字段则给默认
     cfg.setdefault('lap_pe_dim', 16)
     cfg.setdefault('edge_attr_dim', 0)
     cfg.setdefault('use_edge_attr', False)
     cfg.setdefault('clf_hidden', [256, 128, 64])
+    cfg.setdefault('use_image_features', False)
+    cfg.setdefault('img_use_pca', True)
+    cfg.setdefault('img_pca_dim', 256)
 
     # 若单切片 npz 无 y，尝试从验证集目录读取 true_label
     if y is None and args.val_root is not None:
@@ -216,8 +222,25 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg):
 
     # 预处理与图构建
     pp = Preprocessor.load(args.artifacts_dir)
-    Xp = pp.transform(X, gene_names)
-    data_g = assemble_pyg(Xp, xy, cfg)
+    Xp_gene = pp.transform(X, gene_names)
+    if bool(cfg.get('use_image_features', False)):
+        img_pp = ImagePreprocessor.load(args.artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', True)))
+        expected = img_pp.feature_names
+        if not expected:
+            raise ValueError('use_image_features=1 but artifacts_dir/img_feature_names.txt is missing or empty.')
+        has_img_arrays = X_img is not None and img_mask is not None
+        if has_img_arrays:
+            if img_feature_names is None:
+                raise ValueError(f"Slide {sid} contains X_img but missing img_feature_names")
+            if list(img_feature_names) != expected:
+                raise ValueError(f'img_feature_names mismatch for slide {sid}')
+        else:
+            X_img = np.zeros((X.shape[0], int(img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+            img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+        Xp_img = img_pp.transform(X_img, img_mask)
+        data_g = assemble_pyg(Xp_gene, xy, cfg, Xp_img=Xp_img, img_mask=img_mask)
+    else:
+        data_g = assemble_pyg(Xp_gene, xy, cfg)
 
     # 构建与加载模型（统一使用 SpotoncoGNNClassifier）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
