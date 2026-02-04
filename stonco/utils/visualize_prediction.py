@@ -9,7 +9,7 @@
   python Spotonco/visualize_prediction.py \
     --train_npz Spotonco/synthetic_data/train_data.npz \
     --artifacts_dir Spotonco/artifacts_synth \
-    --slide_idx -1 \
+    --slide_id GC10 \
     --out_svg Spotonco/synthetic_data/vis_val_slide.svg
 
 或（若单切片 npz 内含 y）：
@@ -36,6 +36,50 @@ from stonco.core.models import STOnco_Classifier
 from stonco.utils.utils import load_model_state_dict, load_json
 
 
+def transform_xy(
+    xy: np.ndarray,
+    *,
+    xy_start: int | None = None,
+    y_start: int | None = None,
+    mirror_y: bool = False,
+    rotate_ccw: int = 0,
+) -> np.ndarray:
+    xy_plot = np.asarray(xy, dtype=float).copy()
+
+    # 1) 先按 Y 轴镜像（等价于左右翻转）：以当前 x 的范围中线为对称轴，保持坐标为正且范围不变
+    if mirror_y:
+        x_min = float(xy_plot[:, 0].min())
+        x_max = float(xy_plot[:, 0].max())
+        xy_plot[:, 0] = (x_min + x_max) - xy_plot[:, 0]
+
+    # 2) 再逆时针旋转（围绕当前 bounding box 的中心）
+    rotate_ccw = int(rotate_ccw or 0)
+    if rotate_ccw % 360 != 0:
+        if rotate_ccw not in (90, 180, 270):
+            raise ValueError('rotate_ccw must be one of: 0, 90, 180, 270')
+        center = (xy_plot.min(axis=0) + xy_plot.max(axis=0)) / 2.0
+        shifted = xy_plot - center
+        if rotate_ccw == 90:
+            shifted = np.stack([-shifted[:, 1], shifted[:, 0]], axis=1)
+        elif rotate_ccw == 180:
+            shifted = -shifted
+        elif rotate_ccw == 270:
+            shifted = np.stack([shifted[:, 1], -shifted[:, 0]], axis=1)
+        xy_plot = shifted + center
+
+    # 3) 最后整体平移，让最小值从 0/1 开始
+    if xy_start is not None:
+        mins = xy_plot.min(axis=0)
+        xy_plot = (xy_plot - mins) + float(xy_start)
+
+    # 4) 或者仅平移 y，让 y 最小值从 0/1 开始（不改变 x）
+    if y_start is not None:
+        y_min = float(xy_plot[:, 1].min())
+        xy_plot[:, 1] = (xy_plot[:, 1] - y_min) + float(y_start)
+
+    return xy_plot
+
+
 def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
     gb = GraphBuilder(knn_k=cfg['knn_k'], gaussian_sigma_factor=cfg['gaussian_sigma_factor'])
     edge_index, edge_weight, _ = gb.build_knn(xy)
@@ -56,20 +100,32 @@ def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
     return data
 
 
-def load_one_slide(train_npz=None, single_npz=None, slide_idx=-1):
+def load_one_slide(train_npz=None, single_npz=None, slide_idx=-1, slide_id=None):
     if train_npz:
         data = np.load(train_npz, allow_pickle=True)
         Xs = list(data['Xs'])
         ys = list(data['ys'])
         xys = list(data['xys'])
-        slide_ids = list(data['slide_ids'])
+        slide_ids = [str(s) for s in list(data['slide_ids'])]
+        if slide_id is not None:
+            sid_str = str(slide_id)
+            try:
+                slide_idx = slide_ids.index(sid_str)
+            except ValueError as e:
+                raise ValueError(f"slide_id '{sid_str}' not found in train_npz. Available (first 20): {slide_ids[:20]}") from e
         # 选择指定切片
         X = Xs[slide_idx]
         y = ys[slide_idx]
         xy = xys[slide_idx]
         gene_names = list(data['gene_names'])
         sid = slide_ids[slide_idx]
-        barcodes = None  # 训练NPZ不包含barcodes
+        barcodes_list = list(data['barcodes']) if 'barcodes' in data.files else None
+        barcodes = None
+        if barcodes_list is not None:
+            try:
+                barcodes = barcodes_list[slide_idx]
+            except Exception:
+                barcodes = None
         X_img = data['X_imgs'][slide_idx] if 'X_imgs' in data.files else None
         img_mask = data['img_masks'][slide_idx] if 'img_masks' in data.files else None
         img_feature_names = list(data['img_feature_names']) if 'img_feature_names' in data.files else None
@@ -136,6 +192,7 @@ def main():
     parser.add_argument('--npz', default=None, help='单切片 npz（可选，若包含 y 则可计算准确率）')
     parser.add_argument('--npz_glob', default=None, help='批量处理：NPZ文件glob模式，如 "val_npz/*.npz"')
     parser.add_argument('--slide_idx', type=int, default=-1, help='当使用 train_npz 时选择的切片索引，默认 -1（最后一张）')
+    parser.add_argument('--slide_id', default=None, help='当使用 train_npz 时选择的切片ID（优先于 --slide_idx），如 GC10')
     parser.add_argument('--artifacts_dir', default='Spotonco/artifacts_synth', help='模型与预处理产物目录')
     parser.add_argument('--threshold', type=float, default=0.5, help='分类阈值')
     parser.add_argument('--out_svg', default='Spotonco/synthetic_data/vis_slide.svg', help='输出 SVG 路径')
@@ -144,7 +201,30 @@ def main():
     parser.add_argument('--val_root', default='Spotonco/data/ST_validation_datasets', help='验证集根目录，子目录为每个切片（含 *coordinates.csv，含 true_label 列）')
     parser.add_argument('--xy_cols', nargs=2, default=['row', 'col'], metavar=('X_COL', 'Y_COL'), help='coordinates.csv 中表示坐标的列名（默认 row col）')
     parser.add_argument('--label_col', default='true_label', help='coordinates.csv 中标签列名（默认 true_label）')
+    parser.add_argument(
+        '--xy_start',
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help='将坐标整体平移，使 x/y 的最小值从 0 或 1 开始（例如 --xy_start 0 或 --xy_start 1）；默认不平移',
+    )
+    parser.add_argument(
+        '--y_start',
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help='仅平移 y 坐标，使 y 的最小值从 0 或 1 开始（例如 --y_start 0）；默认不平移',
+    )
+    parser.add_argument('--invert_yaxis', dest='invert_yaxis', action='store_true', default=True, help='是否反转 y 轴（默认开启，符合显微镜/图像坐标系：y 向下增大）')
+    parser.add_argument('--no_invert_yaxis', dest='invert_yaxis', action='store_false', help='关闭 y 轴反转（y 向上增大，常规笛卡尔坐标）')
+    parser.add_argument('--invert_xaxis', dest='invert_xaxis', action='store_true', default=False, help='反转 x 轴（最终图像左右镜像）')
+    parser.add_argument('--no_invert_xaxis', dest='invert_xaxis', action='store_false', help='不反转 x 轴（默认）')
+    parser.add_argument('--mirror_y', action='store_true', help='对坐标按 Y 轴镜像（左右翻转），在旋转之前执行（若你希望“最终左右镜像”，更推荐用 --invert_xaxis）')
+    parser.add_argument('--rotate_ccw', type=int, choices=[0, 90, 180, 270], default=0, help='对坐标逆时针旋转角度（0/90/180/270），在镜像之后执行')
     args = parser.parse_args()
+
+    if args.xy_start is not None and args.y_start is not None:
+        raise ValueError('请不要同时使用 --xy_start 与 --y_start；前者平移 x/y，后者仅平移 y。')
 
     # 检查参数组合
     mode_count = sum([args.train_npz is not None, args.npz is not None, args.npz_glob is not None])
@@ -189,7 +269,7 @@ def process_single_slide(npz_file, args):
 def process_single_slide_main(args):
     """处理单个切片的主函数"""
     # 加载数据（一张切片）
-    X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names = load_one_slide(train_npz=args.train_npz, single_npz=args.npz, slide_idx=args.slide_idx)
+    X, y, xy, gene_names, sid, barcodes, X_img, img_mask, img_feature_names = load_one_slide(train_npz=args.train_npz, single_npz=args.npz, slide_idx=args.slide_idx, slide_id=args.slide_id)
     
     # 从meta.json加载配置，保持与训练一致
     meta = load_json(os.path.join(args.artifacts_dir, 'meta.json'))
@@ -279,6 +359,14 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
             acc = (pred[mask] == y_arr[mask]).mean()
 
     # 作图
+    xy_plot = transform_xy(
+    xy,
+    xy_start=args.xy_start,
+    y_start=args.y_start,
+    mirror_y=True,       # 使用现有的 mirror_y 参数
+    rotate_ccw=270,      # 将旋转角度改为 270
+    )
+
     cmap = {0: '#4472C4', 1: '#D9534F'}  # 非肿瘤: 蓝，肿瘤: 红
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
 
@@ -286,7 +374,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     if y is not None:
         y_plot = np.asarray(y)
         colors_true = [cmap[int(v)] if v in (0, 1) else '#BDBDBD' for v in y_plot]
-        axes[0].scatter(xy[:, 0], xy[:, 1], c=colors_true, s=6, linewidths=0, alpha=0.9)
+        axes[0].scatter(xy_plot[:, 0], xy_plot[:, 1], c=colors_true, s=6, linewidths=0, alpha=0.9)
         axes[0].set_title('Ground Truth')
     else:
         axes[0].text(0.5, 0.5, 'No ground-truth labels', ha='center', va='center', transform=axes[0].transAxes)
@@ -294,7 +382,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
 
     # 右：预测标签
     colors_pred = [cmap[int(v)] for v in pred]
-    axes[1].scatter(xy[:, 0], xy[:, 1], c=colors_pred, s=6, linewidths=0, alpha=0.9)
+    axes[1].scatter(xy_plot[:, 0], xy_plot[:, 1], c=colors_pred, s=6, linewidths=0, alpha=0.9)
     axes[1].set_title('Prediction (thr=%.2f)' % args.threshold)
 
     # 公共外观
@@ -302,7 +390,10 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
         ax.set_xlabel('x')
         ax.set_ylabel('y')
         ax.set_aspect('equal')
-        ax.invert_yaxis()  # 与显微镜图像坐标一致（可选）
+        if bool(args.invert_yaxis):
+            ax.invert_yaxis()  # 与显微镜图像坐标一致（可选）
+        if bool(args.invert_xaxis):
+            ax.invert_xaxis()
 
     # 标注准确率
     if acc is not None:

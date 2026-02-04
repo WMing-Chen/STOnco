@@ -85,7 +85,7 @@ class GNNBackbone(nn.Module):
         return h
 
 class ClassifierHead(nn.Module):
-    def __init__(self, in_dim, hidden_dims=(256, 128, 64), dropout=0.1):
+    def __init__(self, in_dim, hidden_dims=(256, 128, 64), dropout=0.3):
         super().__init__()
         if hidden_dims is None:
             hidden_dims = (256, 128, 64)

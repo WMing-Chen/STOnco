@@ -1,7 +1,7 @@
 import argparse, os, numpy as np, torch, math
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from .models import STOnco_Classifier
-from stonco.utils.utils import save_model, save_json
+from stonco.utils.utils import save_model, save_json, load_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 import torch.nn.functional as F
 import torch.nn as nn
@@ -253,6 +253,8 @@ def main():
     parser.add_argument('--split_seed', type=int, default=42, help='分层/交叉验证随机种子')
     parser.add_argument('--split_test_only', action='store_true', help='仅测试划分逻辑，不进行训练，打印每折的统计信息')
     parser.add_argument('--leave_one_cancer_out', action='store_true', help='启用留一癌种评估模式（对每个癌种单独训练：其为验证，其余为训练）')
+    parser.add_argument('--loco_resume', action='store_true', help='LOCO模式断点续跑：若 loco_eval/{CancerType}/meta.json 已存在且 cfg 匹配，则跳过该癌种训练')
+    parser.add_argument('--loco_force_rerun', action='store_true', help='LOCO模式强制重跑：即使已存在结果也重新训练并覆盖（优先级高于 --loco_resume）')
     parser.add_argument('--val_sample_dir', default=None, help='外部验证样本目录（单切片NPZ），将与内部验证集共同评估')
 
     # 新增：解释性输出（基因重要性）
@@ -1662,6 +1664,107 @@ def run_loco_training(args, cfg, device):
     预处理（PCA/Scaler等）严格在训练集拟合，避免泄漏。
     产物目录：在 artifacts_dir 同级目录创建 loco_eval/ct/ 子目录。
     """
+    _NAN = float('nan')
+
+    def _safe_metrics(meta, key):
+        try:
+            return dict(meta.get(key, {}) or {})
+        except Exception:
+            return {}
+
+    def _loco_collect_completed(base_dir: str):
+        rows = []
+        per_slide_dfs = []
+        for name in sorted(os.listdir(base_dir)):
+            d = os.path.join(base_dir, name)
+            if not os.path.isdir(d):
+                continue
+            meta_path = os.path.join(d, 'meta.json')
+            if not os.path.exists(meta_path):
+                continue
+            try:
+                meta = load_json(meta_path)
+            except Exception:
+                continue
+            metrics_best = _safe_metrics(meta, 'metrics')
+            metrics_last = _safe_metrics(meta, 'last_metrics')
+            saved_checkpoint = str(meta.get('saved_checkpoint', 'best'))
+            best_epoch = int(meta.get('best_epoch', -1))
+            last_epoch = int(meta.get('last_epoch', best_epoch))
+            saved_epoch = last_epoch if saved_checkpoint == 'last' else best_epoch
+            saved_metrics = dict(metrics_best)
+            if saved_checkpoint == 'last' and len(metrics_last) > 0:
+                saved_metrics.update(metrics_last)
+            rows.append({
+                'cancer_type': name,
+                'saved_checkpoint': saved_checkpoint,
+                'completed_full_epochs': bool(meta.get('completed_full_epochs', False)),
+                'best_epoch': best_epoch,
+                'last_epoch': last_epoch,
+                'saved_epoch': int(saved_epoch),
+                # 兼容旧列：默认仍汇总 best（meta['metrics']）
+                'auroc': metrics_best.get('auroc', _NAN),
+                'auprc': metrics_best.get('auprc', _NAN),
+                'accuracy': metrics_best.get('accuracy', _NAN),
+                'macro_f1': metrics_best.get('macro_f1', _NAN),
+                # 新增：last 与 saved（与 model.pt 对齐）
+                'last_auroc': metrics_last.get('auroc', _NAN),
+                'last_auprc': metrics_last.get('auprc', _NAN),
+                'last_accuracy': metrics_last.get('accuracy', _NAN),
+                'last_macro_f1': metrics_last.get('macro_f1', _NAN),
+                'saved_auroc': saved_metrics.get('auroc', _NAN),
+                'saved_auprc': saved_metrics.get('auprc', _NAN),
+                'saved_accuracy': saved_metrics.get('accuracy', _NAN),
+                'saved_macro_f1': saved_metrics.get('macro_f1', _NAN),
+                'n_train': int(len(meta.get('train_ids', []) or [])),
+                'n_val': int(len(meta.get('val_ids', []) or [])),
+            })
+            ps_path = os.path.join(d, 'per_slide.csv')
+            if os.path.exists(ps_path):
+                try:
+                    per_slide_dfs.append(pd.read_csv(ps_path))
+                except Exception:
+                    pass
+        return rows, per_slide_dfs
+
+    def _loco_write_summaries(base_dir: str):
+        results_rows, per_slide_dfs = _loco_collect_completed(base_dir)
+
+        # 汇总CSV（整体节点合并后的指标，不混入样本均值）
+        try:
+            if len(results_rows) > 0:
+                df = pd.DataFrame(results_rows)
+                summary_path = os.path.join(base_dir, 'loco_summary.csv')
+                df.to_csv(summary_path, index=False)
+        except Exception as e:
+            print(f"Warning: failed to write LOCO summary CSV: {e}")
+
+        # 顶层逐样本与“样本均值”汇总（若存在 per_slide.csv）
+        try:
+            if len(per_slide_dfs) > 0:
+                df_ps = pd.concat(per_slide_dfs, ignore_index=True)
+                per_slide_path = os.path.join(base_dir, 'loco_per_slide.csv')
+                df_ps.to_csv(per_slide_path, index=False)
+
+                metrics = ['auroc', 'auprc', 'accuracy', 'macro_f1']
+                summary_rows = []
+                for ct, sub in df_ps.groupby('cancer_type'):
+                    row = {'cancer_type': ct, 'n_val_slides': int(len(sub))}
+                    for m in metrics:
+                        row[f'mean_{m}_slide'] = float(sub[m].mean()) if m in sub else float('nan')
+                        row[f'std_{m}_slide'] = float(sub[m].std()) if m in sub else float('nan')
+                    summary_rows.append(row)
+                all_row = {'cancer_type': 'ALL', 'n_val_slides': int(len(df_ps))}
+                for m in metrics:
+                    all_row[f'mean_{m}_slide'] = float(df_ps[m].mean()) if m in df_ps else float('nan')
+                    all_row[f'std_{m}_slide'] = float(df_ps[m].std()) if m in df_ps else float('nan')
+                summary_rows.append(all_row)
+                df_ps_sum = pd.DataFrame(summary_rows)
+                per_slide_sum_path = os.path.join(base_dir, 'loco_per_slide_summary.csv')
+                df_ps_sum.to_csv(per_slide_sum_path, index=False)
+        except Exception as e:
+            print(f"Warning: failed to write per-slide CSVs: {e}")
+
     data = np.load(args.train_npz, allow_pickle=True)
     files = set(data.files)
     Xs = list(data['Xs']); ys = list(data['ys']); xys = list(data['xys']); slide_ids = list(map(str, list(data['slide_ids'])))
@@ -1693,7 +1796,7 @@ def run_loco_training(args, cfg, device):
     os.makedirs(base_loco_dir, exist_ok=True)
 
     results = []
-    # 新增：跨癌种的逐样本记录（顶层汇总输出）
+    # 新增：跨癌种的逐样本记录（顶层汇总输出；仅用于本次进程内统计）
     per_slide_rows = []
 
     # 将原始slides打包便于按索引选择
@@ -1713,6 +1816,53 @@ def run_loco_training(args, cfg, device):
             continue
         loco_dir = os.path.join(base_loco_dir, ct)
         os.makedirs(loco_dir, exist_ok=True)
+
+        # 断点续跑：若已存在完成标记（meta.json + model.pt 且 cfg 匹配），则跳过该癌种
+        if bool(getattr(args, 'loco_force_rerun', False)) is False and bool(getattr(args, 'loco_resume', False)) is True:
+            meta_path = os.path.join(loco_dir, 'meta.json')
+            model_path = os.path.join(loco_dir, 'model.pt')
+            if os.path.exists(meta_path) and os.path.exists(model_path):
+                try:
+                    meta_prev = load_json(meta_path)
+                    if dict(meta_prev.get('cfg', {})) == dict(cfg):
+                        metrics_prev = _safe_metrics(meta_prev, 'metrics')
+                        last_metrics_prev = _safe_metrics(meta_prev, 'last_metrics')
+                        saved_checkpoint_prev = str(meta_prev.get('saved_checkpoint', 'best'))
+                        best_epoch_prev = int(meta_prev.get('best_epoch', -1))
+                        last_epoch_prev = int(meta_prev.get('last_epoch', best_epoch_prev))
+                        saved_epoch_prev = last_epoch_prev if saved_checkpoint_prev == 'last' else best_epoch_prev
+                        saved_metrics_prev = dict(metrics_prev)
+                        if saved_checkpoint_prev == 'last' and len(last_metrics_prev) > 0:
+                            saved_metrics_prev.update(last_metrics_prev)
+                        results.append({
+                            'cancer_type': ct,
+                            'saved_checkpoint': saved_checkpoint_prev,
+                            'completed_full_epochs': bool(meta_prev.get('completed_full_epochs', False)),
+                            'best_epoch': best_epoch_prev,
+                            'last_epoch': last_epoch_prev,
+                            'saved_epoch': int(saved_epoch_prev),
+                            'auroc': metrics_prev.get('auroc', _NAN),
+                            'auprc': metrics_prev.get('auprc', _NAN),
+                            'accuracy': metrics_prev.get('accuracy', _NAN),
+                            'macro_f1': metrics_prev.get('macro_f1', _NAN),
+                            'last_auroc': last_metrics_prev.get('auroc', _NAN),
+                            'last_auprc': last_metrics_prev.get('auprc', _NAN),
+                            'last_accuracy': last_metrics_prev.get('accuracy', _NAN),
+                            'last_macro_f1': last_metrics_prev.get('macro_f1', _NAN),
+                            'saved_auroc': saved_metrics_prev.get('auroc', _NAN),
+                            'saved_auprc': saved_metrics_prev.get('auprc', _NAN),
+                            'saved_accuracy': saved_metrics_prev.get('accuracy', _NAN),
+                            'saved_macro_f1': saved_metrics_prev.get('macro_f1', _NAN),
+                            'n_train': int(len(meta_prev.get('train_ids', []) or [])),
+                            'n_val': int(len(meta_prev.get('val_ids', []) or [])),
+                        })
+                        print(f'[LOCO] Resume: skip cancer_type={ct} (found existing meta/model with matching cfg)')
+                        _loco_write_summaries(base_loco_dir)
+                        continue
+                    else:
+                        print(f'[LOCO] Resume: cfg mismatch for cancer_type={ct}, will re-train and overwrite')
+                except Exception as e:
+                    print(f'[LOCO] Resume: failed to read meta for cancer_type={ct}, will re-train. err={e}')
 
         # 拟合预处理器（仅训练集）
         slides_train = [s for s in slides_all if s['slide_id'] in train_ids]
@@ -1842,6 +1992,7 @@ def run_loco_training(args, cfg, device):
             saved_checkpoint = 'best'
         meta = {
             'cfg': cfg,
+            'train_npz': str(args.train_npz),
             'best_epoch': best['epoch'],
             'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
             'completed_full_epochs': bool(completed_full_epochs),
@@ -1858,10 +2009,15 @@ def run_loco_training(args, cfg, device):
         meta['last_metrics'] = dict(best.get('last_metrics', {}))
         save_json(meta, os.path.join(loco_dir, 'meta.json'))
 
-        # 新增：逐样本（逐 slide）评估，集中写到顶层 loco_per_slide.csv
+        best_epoch_val = int(best.get('epoch', -1))
+        last_epoch_val = int(best.get('last_epoch', best_epoch_val))
+        saved_epoch_val = last_epoch_val if saved_checkpoint == 'last' else best_epoch_val
+
+        # 新增：逐样本（逐 slide）评估：每癌种先落盘到 loco_dir/per_slide.csv，顶层汇总可随时重建
         try:
             model = model.to(device)
             model.eval()
+            per_slide_ct_rows = []
             with torch.no_grad():
                 for g in val_graphs:
                     vg = g.to(device)
@@ -1878,7 +2034,7 @@ def run_loco_training(args, cfg, device):
                     n_pos = int((y_np == 1).sum())
                     n_neg = int((y_np == 0).sum())
                     pos_rate = float(n_pos / n_nodes) if n_nodes > 0 else float('nan')
-                    per_slide_rows.append({
+                    row = {
                         'cancer_type': ct,
                         'slide_id': str(g.slide_id),
                         'n_nodes': n_nodes,
@@ -1889,67 +2045,51 @@ def run_loco_training(args, cfg, device):
                         'auprc': m_slide.get('auprc', float('nan')),
                         'accuracy': m_slide.get('accuracy', float('nan')),
                         'macro_f1': m_slide.get('macro_f1', float('nan')),
-                        'best_epoch': best['epoch']
-                    })
+                        'best_epoch': best_epoch_val,
+                        'last_epoch': last_epoch_val,
+                        'saved_checkpoint': saved_checkpoint,
+                        'saved_epoch': int(saved_epoch_val),
+                    }
+                    per_slide_rows.append(row)
+                    per_slide_ct_rows.append(row)
+            if len(per_slide_ct_rows) > 0:
+                try:
+                    pd.DataFrame(per_slide_ct_rows).to_csv(os.path.join(loco_dir, 'per_slide.csv'), index=False)
+                except Exception as e:
+                    print(f"[LOCO] Warning: failed to write per_slide.csv for cancer_type={ct}: {e}")
         except Exception as e:
             print(f"[LOCO] Warning: per-slide evaluation failed for cancer_type={ct}: {e}")
 
         results.append({
             'cancer_type': ct,
-            'best_epoch': best['epoch'],
+            'saved_checkpoint': saved_checkpoint,
+            'completed_full_epochs': bool(completed_full_epochs),
+            'best_epoch': best_epoch_val,
+            'last_epoch': last_epoch_val,
+            'saved_epoch': int(saved_epoch_val),
             'auroc': best.get('auroc', float('nan')),
             'auprc': best.get('auprc', float('nan')),
             'accuracy': best.get('accuracy', float('nan')),
             'macro_f1': best.get('macro_f1', float('nan')),
+            'last_auroc': dict(best.get('last_metrics', {}) or {}).get('auroc', float('nan')),
+            'last_auprc': dict(best.get('last_metrics', {}) or {}).get('auprc', float('nan')),
+            'last_accuracy': dict(best.get('last_metrics', {}) or {}).get('accuracy', float('nan')),
+            'last_macro_f1': dict(best.get('last_metrics', {}) or {}).get('macro_f1', float('nan')),
+            'saved_auroc': (dict(best.get('last_metrics', {}) or {}).get('auroc', float('nan')) if saved_checkpoint == 'last' else best.get('auroc', float('nan'))),
+            'saved_auprc': (dict(best.get('last_metrics', {}) or {}).get('auprc', float('nan')) if saved_checkpoint == 'last' else best.get('auprc', float('nan'))),
+            'saved_accuracy': (dict(best.get('last_metrics', {}) or {}).get('accuracy', float('nan')) if saved_checkpoint == 'last' else best.get('accuracy', float('nan'))),
+            'saved_macro_f1': (dict(best.get('last_metrics', {}) or {}).get('macro_f1', float('nan')) if saved_checkpoint == 'last' else best.get('macro_f1', float('nan'))),
             'n_train': len(train_ids),
             'n_val': len(val_ids)
         })
 
-    # 新增：写出顶层逐样本与“样本均值”汇总
-    try:
-        if len(per_slide_rows) > 0:
-            df_ps = pd.DataFrame(per_slide_rows)
-            per_slide_path = os.path.join(base_loco_dir, 'loco_per_slide.csv')
-            df_ps.to_csv(per_slide_path, index=False)
-            print(f"Saved per-slide metrics to {per_slide_path}")
+        # 每个癌种完成后就更新一次顶层汇总（防止中途异常导致汇总缺失）
+        _loco_write_summaries(base_loco_dir)
 
-            # 构建按癌种的样本级均值/标准差汇总，以及 ALL 行
-            metrics = ['auroc', 'auprc', 'accuracy', 'macro_f1']
-            summary_rows = []
-            for ct, sub in df_ps.groupby('cancer_type'):
-                row = {
-                    'cancer_type': ct,
-                    'n_val_slides': int(len(sub))
-                }
-                for m in metrics:
-                    row[f'mean_{m}_slide'] = float(sub[m].mean()) if m in sub else float('nan')
-                    # 使用样本标准差（与 pandas 默认一致）；若只有一个样本则 std 为 NaN
-                    row[f'std_{m}_slide'] = float(sub[m].std()) if m in sub else float('nan')
-                summary_rows.append(row)
-            # ALL 行
-            all_row = {'cancer_type': 'ALL', 'n_val_slides': int(len(df_ps))}
-            for m in metrics:
-                all_row[f'mean_{m}_slide'] = float(df_ps[m].mean()) if m in df_ps else float('nan')
-                all_row[f'std_{m}_slide'] = float(df_ps[m].std()) if m in df_ps else float('nan')
-            summary_rows.append(all_row)
-
-            df_ps_sum = pd.DataFrame(summary_rows)
-            per_slide_sum_path = os.path.join(base_loco_dir, 'loco_per_slide_summary.csv')
-            df_ps_sum.to_csv(per_slide_sum_path, index=False)
-            print(f"Saved per-slide summary to {per_slide_sum_path}")
-    except Exception as e:
-        print(f"Warning: failed to write per-slide CSVs: {e}")
-
-    # 汇总CSV（保持现有：整体节点合并后的指标，不混入样本均值）
-    try:
-        df = pd.DataFrame(results)
-        summary_path = os.path.join(base_loco_dir, 'loco_summary.csv')
-        df.to_csv(summary_path, index=False)
-        print(f"Saved LOCO summary to {summary_path}")
-    except Exception as e:
-        print(f"Warning: failed to write LOCO summary CSV: {e}")
-
-    return {'loco_results': results, 'base_dir': base_loco_dir}
+    # 结束后再刷新一次顶层汇总，并返回从磁盘收集到的结果（包含 resume 跳过的癌种）
+    _loco_write_summaries(base_loco_dir)
+    final_rows, _ = _loco_collect_completed(base_loco_dir)
+    return {'loco_results': final_rows, 'base_dir': base_loco_dir}
 
 
 def _run_split_test(args, cfg):
