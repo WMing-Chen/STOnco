@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, SAGEConv, GCNConv, LayerNorm
 from torch_geometric.nn.conv import MessagePassing
 from torch_scatter import scatter
+from stonco.utils.utils import normalize_gnn_hidden
 
 class GradientReversalFunction(torch.autograd.Function):
     @staticmethod
@@ -49,22 +50,25 @@ class WeightedSAGEConv(MessagePassing):
         return e_w.view(-1, 1) * x_j
 
 class GNNBackbone(nn.Module):
-    def __init__(self, in_dim, hidden=128, num_layers=3, dropout=0.3, model='gatv2', heads=4):
+    def __init__(self, in_dim, hidden=(256, 128, 64), num_layers=3, dropout=0.3, model='gatv2', heads=4):
         super().__init__()
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.model = model
         dim_prev = in_dim
-        for i in range(num_layers):
+        hidden_list, effective_num_layers = normalize_gnn_hidden(hidden=hidden, num_layers=num_layers)
+        self.hidden_dims = list(hidden_list)
+        self.num_layers = int(effective_num_layers)
+        for hidden_dim in self.hidden_dims:
             if model == 'gatv2':
-                conv = GATv2Conv(dim_prev, hidden, heads=heads, concat=True, dropout=dropout)
-                dim_next = hidden * heads
+                conv = GATv2Conv(dim_prev, hidden_dim, heads=heads, concat=True, dropout=dropout)
+                dim_next = hidden_dim * heads
             elif model == 'gcn':
-                conv = GCNConv(dim_prev, hidden, add_self_loops=True, normalize=True)
-                dim_next = hidden
+                conv = GCNConv(dim_prev, hidden_dim, add_self_loops=True, normalize=True)
+                dim_next = hidden_dim
             else:  # 'sage'
-                conv = WeightedSAGEConv(dim_prev, hidden)
-                dim_next = hidden
+                conv = WeightedSAGEConv(dim_prev, hidden_dim)
+                dim_next = hidden_dim
             self.convs.append(conv)
             self.norms.append(LayerNorm(dim_next))
             dim_prev = dim_next
@@ -153,7 +157,7 @@ class STOnco_Classifier(nn.Module):
         domain_config: Configuration for domain heads (optional)
         use_domain_adaptation: Whether to enable domain adaptation
     """
-    def __init__(self, in_dim, hidden=128, num_layers=3, dropout=0.3, model='gatv2', heads=4,
+    def __init__(self, in_dim, hidden=(256, 128, 64), num_layers=3, dropout=0.3, model='gatv2', heads=4,
                  clf_hidden=(256, 128, 64),
                  domain_hidden=64,
                  use_domain_adv_slide=False, n_domains_slide=None,
@@ -167,7 +171,17 @@ class STOnco_Classifier(nn.Module):
         self.dom_cancer = DomainHead(self.gnn.out_dim, n_domains_cancer, hidden=domain_hidden) \
             if self.use_domain_adv_cancer else None
 
-    def forward(self, x, edge_index, batch=None, edge_weight=None, grl_beta_slide=1.0, grl_beta_cancer=1.0, return_z=False):
+    def forward(
+        self,
+        x,
+        edge_index,
+        batch=None,
+        edge_weight=None,
+        grl_beta_slide=1.0,
+        grl_beta_cancer=1.0,
+        return_z=False,
+        return_h=False,
+    ):
         h = self.gnn(x, edge_index, edge_weight=edge_weight)
         logits, z64 = self.clf(h, return_z=return_z)
         dom_logits_slide = None
@@ -180,4 +194,6 @@ class STOnco_Classifier(nn.Module):
         out = {'logits': logits, 'dom_logits_slide': dom_logits_slide, 'dom_logits_cancer': dom_logits_cancer}
         if return_z:
             out['z64'] = z64
+        if return_h:
+            out['h'] = h
         return out

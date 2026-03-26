@@ -10,7 +10,7 @@ from torch_geometric.data import Data as PyGData
 
 from stonco.core.models import STOnco_Classifier
 from stonco.utils.preprocessing import GraphBuilder, Preprocessor, ImagePreprocessor, build_node_features_early_fusion
-from stonco.utils.utils import load_json, load_model_state_dict
+from stonco.utils.utils import load_json, load_model_state_dict, normalize_gnn_config
 
 
 def _resolve_batch_id(sample_id: str, id2batch: dict) -> str:
@@ -146,7 +146,7 @@ def _iter_samples_from_npz_glob(npz_glob: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Export spot-level 64-d embeddings (z64) from a trained STOnco model.')
+    parser = argparse.ArgumentParser(description='Export spot-level embeddings (h or z64) from a trained STOnco model.')
     parser.add_argument('--artifacts_dir', required=True, help='Training artifacts dir (contains meta.json, model weights, preprocessor).')
     parser.add_argument('--out_csv', default='spot_embeddings.csv', help='Output CSV path.')
     parser.add_argument('--append', action='store_true', help='Append to out_csv if it exists (default: overwrite).')
@@ -155,6 +155,12 @@ def main():
     parser.add_argument('--subset', choices=['all', 'train', 'val'], default='all', help='When using --train_npz, filter by meta.json train/val ids.')
     parser.add_argument('--device', default=None, help='cpu/cuda; default auto.')
     parser.add_argument('--num_threads', type=int, default=None, help='Set torch CPU threads (only affects CPU).')
+    parser.add_argument(
+        '--embed_source',
+        choices=['h', 'z64'],
+        default='h',
+        help='Embedding source for export: h (GNN output) or z64 (classifier latent).',
+    )
     args = parser.parse_args()
 
     mode_count = sum([args.train_npz is not None, args.npz_glob is not None])
@@ -183,13 +189,13 @@ def main():
     cfg.setdefault('gaussian_sigma_factor', 1.0)
     cfg.setdefault('model', 'gatv2')
     cfg.setdefault('heads', 4)
-    cfg.setdefault('hidden', 128)
     cfg.setdefault('num_layers', 3)
     cfg.setdefault('dropout', 0.3)
     cfg.setdefault('clf_hidden', [256, 128, 64])
     cfg.setdefault('use_image_features', False)
     cfg.setdefault('img_use_pca', True)
     cfg.setdefault('img_pca_dim', 256)
+    cfg = normalize_gnn_config(cfg)
 
     pp = Preprocessor.load(artifacts_dir)
     use_image_features = bool(cfg.get('use_image_features', False))
@@ -254,7 +260,7 @@ def main():
             clf_hidden = [int(x) for x in clf_hidden]
             m = STOnco_Classifier(
                 in_dim=in_dim,
-                hidden=int(cfg['hidden']),
+                hidden=cfg['GNN_hidden'],
                 num_layers=int(cfg['num_layers']),
                 dropout=float(cfg['dropout']),
                 model=str(cfg['model']),
@@ -266,21 +272,32 @@ def main():
             model.eval()
 
         with torch.no_grad():
+            need_z = (args.embed_source == 'z64')
+            need_h = (args.embed_source == 'h')
             out = model(
                 g.x,
                 g.edge_index,
                 batch=getattr(g, 'batch', None),
                 edge_weight=getattr(g, 'edge_weight', None),
-                return_z=True,
+                return_z=need_z,
+                return_h=need_h,
             )
             logits = out['logits'].detach().cpu().numpy()
-            z64 = out['z64'].detach().cpu().numpy()
             p_tumor = 1.0 / (1.0 + np.exp(-logits))
+            if args.embed_source == 'z64':
+                emb = out['z64'].detach().cpu().numpy()
+                emb_prefix = 'z64_'
+            else:
+                emb = out['h'].detach().cpu().numpy()
+                emb_prefix = 'h_'
 
-        if z64.ndim != 2 or z64.shape[1] != 64:
-            raise ValueError(f'Expected z64 shape [N,64], got {z64.shape} for sample {sample_id}')
+        if emb.ndim != 2:
+            raise ValueError(f'Expected embedding shape [N,D], got {emb.shape} for sample {sample_id}')
+        n_spots = int(emb.shape[0])
+        emb_dim = int(emb.shape[1])
+        if emb_dim < 2:
+            raise ValueError(f'Embedding dim must be >=2, got {emb_dim} for sample {sample_id}')
 
-        n_spots = int(z64.shape[0])
         if barcodes is not None:
             try:
                 barcodes = np.array(barcodes).astype(str)
@@ -303,9 +320,12 @@ def main():
             'batch_id': [batch_id] * n_spots,
             'cancer_type': [cancer_type] * n_spots,
             'p_tumor': p_tumor,
+            'embed_source': [args.embed_source] * n_spots,
+            'embed_dim': [emb_dim] * n_spots,
         })
-        for j in range(64):
-            df[f'z64_{j}'] = z64[:, j]
+        emb_cols = [f'{emb_prefix}{j}' for j in range(emb_dim)]
+        emb_df = pd.DataFrame(emb, columns=emb_cols)
+        df = pd.concat([df, emb_df], axis=1)
 
         df.to_csv(out_csv, mode='a', header=(not header_written), index=False, float_format='%.6f')
         header_written = True

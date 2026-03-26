@@ -33,7 +33,7 @@ import pandas as pd
 
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from stonco.core.models import STOnco_Classifier
-from stonco.utils.utils import load_model_state_dict, load_json
+from stonco.utils.utils import load_model_state_dict, load_json, normalize_gnn_config
 
 
 def transform_xy(
@@ -283,12 +283,21 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     """可视化单个切片的核心逻辑"""
     # 兼容旧模型：若缺失新字段则给默认
     cfg.setdefault('lap_pe_dim', 16)
+    cfg.setdefault('concat_lap_pe', True)
+    cfg.setdefault('lap_pe_use_gaussian', False)
+    cfg.setdefault('knn_k', 6)
+    cfg.setdefault('gaussian_sigma_factor', 1.0)
+    cfg.setdefault('model', 'gatv2')
+    cfg.setdefault('heads', 4)
+    cfg.setdefault('num_layers', 3)
+    cfg.setdefault('dropout', 0.3)
     cfg.setdefault('edge_attr_dim', 0)
     cfg.setdefault('use_edge_attr', False)
     cfg.setdefault('clf_hidden', [256, 128, 64])
     cfg.setdefault('use_image_features', False)
     cfg.setdefault('img_use_pca', True)
     cfg.setdefault('img_pca_dim', 256)
+    cfg = normalize_gnn_config(cfg)
 
     # 若单切片 npz 无 y，尝试从验证集目录读取 true_label
     if y is None and args.val_root is not None:
@@ -331,7 +340,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     clf_hidden = [int(x) for x in clf_hidden]
     model = STOnco_Classifier(
         in_dim=in_dim,
-        hidden=cfg['hidden'],
+        hidden=cfg['GNN_hidden'],
         num_layers=cfg['num_layers'],
         dropout=cfg['dropout'],
         model=cfg['model'],

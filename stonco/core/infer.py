@@ -1,6 +1,6 @@
 import argparse, os, numpy as np, torch
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
-from stonco.utils.utils import load_json, load_model_state_dict
+from stonco.utils.utils import load_json, load_model_state_dict, normalize_gnn_config
 from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData
 import pandas as pd
@@ -25,13 +25,13 @@ class InferenceEngine:
         self.cfg.setdefault('gaussian_sigma_factor', 1.0)
         self.cfg.setdefault('model', 'gatv2')
         self.cfg.setdefault('heads', 4)
-        self.cfg.setdefault('hidden', 128)
         self.cfg.setdefault('num_layers', 3)
         self.cfg.setdefault('dropout', 0.3)
         self.cfg.setdefault('clf_hidden', [256, 128, 64])
         self.cfg.setdefault('use_image_features', False)
         self.cfg.setdefault('img_use_pca', True)
         self.cfg.setdefault('img_pca_dim', 256)
+        self.cfg = normalize_gnn_config(self.cfg)
 
         self.pp = Preprocessor.load(artifacts_dir)
         self.img_pp = None
@@ -51,7 +51,7 @@ class InferenceEngine:
             clf_hidden = [int(x) for x in clf_hidden]
             m = STOnco_Classifier(
                 in_dim=in_dim,
-                hidden=self.cfg['hidden'],
+                hidden=self.cfg['GNN_hidden'],
                 num_layers=self.cfg['num_layers'],
                 dropout=self.cfg['dropout'],
                 model=self.cfg['model'],

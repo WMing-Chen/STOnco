@@ -14,12 +14,13 @@ def _sample_rows(df: pd.DataFrame, max_points: int | None, seed: int) -> pd.Data
     return df.sample(n=max_points, random_state=int(seed)).reset_index(drop=True)
 
 
-def _get_z64(df: pd.DataFrame) -> np.ndarray:
-    z_cols = [c for c in df.columns if c.startswith('z64_')]
-    if len(z_cols) != 64:
-        raise ValueError(f'Expected 64 columns starting with z64_, got {len(z_cols)}')
-    z_cols = sorted(z_cols, key=lambda x: int(x.split('_')[-1]))
-    return df[z_cols].to_numpy(dtype=float)
+def _get_embedding(df: pd.DataFrame, embed_source: str) -> np.ndarray:
+    prefix = f'{embed_source}_'
+    cols = [c for c in df.columns if c.startswith(prefix)]
+    if len(cols) < 2:
+        raise ValueError(f'Expected >=2 columns starting with {prefix}, got {len(cols)}')
+    cols = sorted(cols, key=lambda x: int(x.split('_')[-1]))
+    return df[cols].to_numpy(dtype=float)
 
 
 def _normalize_category_labels(color_col: str, series: pd.Series) -> pd.Series:
@@ -150,18 +151,24 @@ def _plot_two_panels(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize exported z64 embeddings with UMAP + t-SNE.')
+    parser = argparse.ArgumentParser(description='Visualize exported h/z64 embeddings with UMAP + t-SNE.')
     parser.add_argument('--embeddings_csv', required=True, help='CSV produced by export_spot_embeddings.py')
     parser.add_argument('--out_dir', default=None, help='Output directory for SVGs (default: same as embeddings_csv)')
     parser.add_argument('--max_points', type=int, default=None, help='Optional subsample for speed (e.g. 50000)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for subsampling and DR reproducibility')
     parser.add_argument('--point_size', type=float, default=2.0, help='Scatter point size')
     parser.add_argument('--alpha', type=float, default=0.8, help='Scatter alpha')
+    parser.add_argument(
+        '--embed_source',
+        choices=['h', 'z64'],
+        default='h',
+        help='Which embedding columns to visualize: h_* or z64_*.',
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.embeddings_csv)
     df = _sample_rows(df, args.max_points, args.seed)
-    Z = _get_z64(df)
+    Z = _get_embedding(df, args.embed_source)
 
     from sklearn.preprocessing import StandardScaler
     Zs = StandardScaler().fit_transform(Z)
@@ -183,9 +190,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     plots = [
-        ('tumor_label', 'umap_tsne_by_tumor.svg'),
-        ('batch_id', 'umap_tsne_by_batch.svg'),
-        ('cancer_type', 'umap_tsne_by_cancer.svg'),
+        ('tumor_label', f'umap_tsne_{args.embed_source}_by_tumor.svg'),
+        ('batch_id', f'umap_tsne_{args.embed_source}_by_batch.svg'),
+        ('cancer_type', f'umap_tsne_{args.embed_source}_by_cancer.svg'),
     ]
     for col, fname in plots:
         if col not in df.columns:

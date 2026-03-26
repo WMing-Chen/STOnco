@@ -1,7 +1,7 @@
-import argparse, os, numpy as np, torch, math
+import argparse, os, numpy as np, torch, math, itertools
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from .models import STOnco_Classifier
-from stonco.utils.utils import save_model, save_json, load_json
+from stonco.utils.utils import normalize_gnn_config, save_model, save_json, load_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 import torch.nn.functional as F
 import torch.nn as nn
@@ -224,7 +224,8 @@ def main():
     # 新增：网络结构与优化器超参数
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=None, help='权重衰减')
-    parser.add_argument('--hidden', type=int, default=None, help='隐藏层维度')
+    parser.add_argument('--hidden', type=int, default=None, help='旧版兼容参数：统一隐藏层维度；不要与 --GNN_hidden 同时传入')
+    parser.add_argument('--GNN_hidden', default=None, help='GNN每层隐藏维度；支持单个整数或逗号分隔列表，默认：256,128,64')
     parser.add_argument('--num_layers', type=int, default=None, help='GNN层数')
     parser.add_argument('--dropout', type=float, default=None, help='Dropout比例')
     # 新增：分类头与域头结构
@@ -244,6 +245,15 @@ def main():
     parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='批次域 GRL 目标强度（DANN schedule），默认1.0')
     parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度（DANN schedule），默认0.5')
     parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10')
+    # 新增：MMD 对齐
+    parser.add_argument('--use_mmd', type=int, choices=[0,1], default=None, help='启用/关闭 MMD 对齐（1/0）')
+    parser.add_argument('--mmd_on', choices=['slide', 'cancer', 'both'], default=None, help='MMD 对齐域：slide/cancer/both')
+    parser.add_argument('--lambda_mmd', type=float, default=None, help='MMD 损失权重')
+    parser.add_argument('--mmd_num_kernels', type=int, default=None, help='MMD 多带宽 RBF 的核个数')
+    parser.add_argument('--mmd_kernel_mul', type=float, default=None, help='MMD 多带宽倍率')
+    parser.add_argument('--mmd_sigma', type=float, default=None, help='固定 RBF 带宽；不传则自适应估计')
+    parser.add_argument('--mmd_max_pairs', type=int, default=None, help='每个 batch 最多计算多少个域对')
+    parser.add_argument('--mmd_spots_per_slide', type=int, default=None, help='每张切片最多抽取多少个 spot 参与 MMD；<=0 表示使用全部 spot')
     
     # 新增：癌种分层与K折/LOCO
     parser.add_argument('--stratify_by_cancer', action='store_true', default=True, help='启用癌种分层划分：按比例分配验证集且每癌种保底1张（n=1除外）')
@@ -275,7 +285,7 @@ def main():
 
     args = parser.parse_args()
 
-    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'hidden':128, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
            # 控制项
            'use_pca': False,
            # 方案1：早期融合（默认关闭以保持旧行为）
@@ -298,6 +308,15 @@ def main():
 	           'grl_beta_slide_target': 1.0,
 	           'grl_beta_cancer_target': 0.5,
 	           'grl_beta_gamma': 10.0,
+               # 新增：MMD 默认配置
+               'use_mmd': False,
+               'mmd_on': 'slide',
+               'lambda_mmd': 0.05,
+               'mmd_num_kernels': 5,
+               'mmd_kernel_mul': 2.0,
+               'mmd_sigma': None,
+               'mmd_max_pairs': 8,
+               'mmd_spots_per_slide': 0,
 	           # 新增：HVG控制
 	           'n_hvg': 'all'
 	           }
@@ -352,6 +371,8 @@ def main():
         cfg['weight_decay'] = args.weight_decay
     if args.hidden is not None:
         cfg['hidden'] = args.hidden
+    if args.GNN_hidden is not None:
+        cfg['GNN_hidden'] = args.GNN_hidden
     if args.num_layers is not None:
         cfg['num_layers'] = args.num_layers
     if args.dropout is not None:
@@ -400,6 +421,22 @@ def main():
         cfg['grl_beta_cancer_target'] = float(args.grl_beta_cancer_target)
     if getattr(args, 'grl_beta_gamma', None) is not None:
         cfg['grl_beta_gamma'] = float(args.grl_beta_gamma)
+    if getattr(args, 'use_mmd', None) is not None:
+        cfg['use_mmd'] = bool(args.use_mmd)
+    if getattr(args, 'mmd_on', None) is not None:
+        cfg['mmd_on'] = str(args.mmd_on)
+    if getattr(args, 'lambda_mmd', None) is not None:
+        cfg['lambda_mmd'] = float(args.lambda_mmd)
+    if getattr(args, 'mmd_num_kernels', None) is not None:
+        cfg['mmd_num_kernels'] = int(args.mmd_num_kernels)
+    if getattr(args, 'mmd_kernel_mul', None) is not None:
+        cfg['mmd_kernel_mul'] = float(args.mmd_kernel_mul)
+    if getattr(args, 'mmd_sigma', None) is not None:
+        cfg['mmd_sigma'] = float(args.mmd_sigma)
+    if getattr(args, 'mmd_max_pairs', None) is not None:
+        cfg['mmd_max_pairs'] = int(args.mmd_max_pairs)
+    if getattr(args, 'mmd_spots_per_slide', None) is not None:
+        cfg['mmd_spots_per_slide'] = int(args.mmd_spots_per_slide)
 
     # 默认值填充（新字段）
     if cfg.get('use_domain_adv_slide', None) is None:
@@ -420,6 +457,17 @@ def main():
         cfg['grl_beta_gamma'] = 10.0
     if str(cfg.get('grl_beta_mode', 'dann')) not in {'dann', 'constant'}:
         raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
+    cfg['use_mmd'] = bool(cfg.get('use_mmd', False))
+    cfg['mmd_on'] = str(cfg.get('mmd_on', 'slide')).lower()
+    if cfg['mmd_on'] not in {'slide', 'cancer', 'both'}:
+        raise ValueError(f"cfg['mmd_on'] must be one of slide/cancer/both, got: {cfg['mmd_on']}")
+    cfg['lambda_mmd'] = float(cfg.get('lambda_mmd', 0.05))
+    cfg['mmd_num_kernels'] = int(cfg.get('mmd_num_kernels', 5))
+    cfg['mmd_kernel_mul'] = float(cfg.get('mmd_kernel_mul', 2.0))
+    cfg['mmd_sigma'] = None if cfg.get('mmd_sigma', None) is None else float(cfg['mmd_sigma'])
+    cfg['mmd_max_pairs'] = int(cfg.get('mmd_max_pairs', 8))
+    cfg['mmd_spots_per_slide'] = int(cfg.get('mmd_spots_per_slide', 0))
+    cfg = normalize_gnn_config(cfg)
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
     if args.device is not None:
@@ -676,9 +724,116 @@ def train_and_validate(
         w = w / w.mean().clamp_min(1e-6)
         return w.to(device)
 
+    def _sample_nodes_per_graph(h, dom_nodes, graph_nodes, spots_per_slide):
+        if spots_per_slide is None or int(spots_per_slide) <= 0:
+            return h, dom_nodes
+        if graph_nodes is None:
+            raise ValueError('graph_nodes is required when mmd_spots_per_slide > 0')
+
+        keep_idx = []
+        for gid in sorted(int(v) for v in torch.unique(graph_nodes.detach()).tolist()):
+            idx = torch.where(graph_nodes == gid)[0]
+            if idx.numel() <= int(spots_per_slide):
+                keep_idx.append(idx)
+            else:
+                perm = torch.randperm(idx.numel(), device=idx.device)[:int(spots_per_slide)]
+                keep_idx.append(idx[perm])
+
+        if not keep_idx:
+            return h, dom_nodes
+
+        keep_idx = torch.cat(keep_idx, dim=0)
+        return h[keep_idx], dom_nodes[keep_idx]
+
+    def _pairwise_sq_dists(x, y):
+        return torch.cdist(x, y, p=2).pow(2)
+
+    def _build_sigma_list(x, y, num_kernels=5, kernel_mul=2.0, fixed_sigma=None):
+        if fixed_sigma is not None:
+            base_sigma = torch.tensor(float(fixed_sigma), dtype=x.dtype, device=x.device)
+        else:
+            z = torch.cat([x, y], dim=0)
+            if z.size(0) <= 1:
+                base_sigma = torch.tensor(1.0, dtype=x.dtype, device=x.device)
+            else:
+                sq = _pairwise_sq_dists(z, z)
+                mask = ~torch.eye(sq.size(0), dtype=torch.bool, device=sq.device)
+                vals = sq[mask]
+                if vals.numel() == 0:
+                    base_sigma = torch.tensor(1.0, dtype=x.dtype, device=x.device)
+                else:
+                    base_sigma = torch.sqrt(vals.mean().clamp_min(1e-12))
+
+        center = int(num_kernels) // 2
+        sigma_list = []
+        for i in range(int(num_kernels)):
+            scale = float(kernel_mul) ** (i - center)
+            sigma_list.append((base_sigma * scale).clamp_min(1e-6))
+        return sigma_list
+
+    def _rbf_kernel(x, y, sigma_list):
+        sq = _pairwise_sq_dists(x, y)
+        k = torch.zeros_like(sq)
+        for sigma in sigma_list:
+            gamma = 1.0 / (2.0 * sigma.pow(2).clamp_min(1e-12))
+            k = k + torch.exp(-sq * gamma)
+        return k
+
+    def _mmd2_unbiased(x, y, sigma_list):
+        n = int(x.size(0))
+        m = int(y.size(0))
+        if n < 2 or m < 2:
+            return torch.tensor(0.0, dtype=x.dtype, device=x.device)
+
+        k_xx = _rbf_kernel(x, x, sigma_list)
+        k_yy = _rbf_kernel(y, y, sigma_list)
+        k_xy = _rbf_kernel(x, y, sigma_list)
+
+        sum_xx = (k_xx.sum() - torch.diagonal(k_xx).sum()) / float(n * (n - 1))
+        sum_yy = (k_yy.sum() - torch.diagonal(k_yy).sum()) / float(m * (m - 1))
+        sum_xy = k_xy.mean()
+        mmd2 = sum_xx + sum_yy - 2.0 * sum_xy
+        return torch.clamp(mmd2, min=0.0)
+
+    def _multi_domain_mmd(h, dom_nodes, graph_nodes=None, spots_per_slide=0, num_kernels=5, kernel_mul=2.0, sigma=None, max_pairs=8):
+        if h is None or dom_nodes is None:
+            return torch.tensor(0.0, dtype=torch.float32, device=device)
+        if h.size(0) != dom_nodes.size(0):
+            raise ValueError(f"MMD shape mismatch: h={tuple(h.shape)}, dom_nodes={tuple(dom_nodes.shape)}")
+
+        h, dom_nodes = _sample_nodes_per_graph(h, dom_nodes, graph_nodes, spots_per_slide)
+
+        groups = {}
+        for dom in sorted(int(v) for v in torch.unique(dom_nodes.detach()).tolist()):
+            mask = dom_nodes == dom
+            if int(mask.sum().item()) >= 2:
+                groups[dom] = h[mask]
+
+        pairs = list(itertools.combinations(sorted(groups.keys()), 2))
+        if max_pairs is not None and int(max_pairs) > 0:
+            pairs = pairs[:int(max_pairs)]
+
+        if not pairs:
+            return torch.tensor(0.0, dtype=h.dtype, device=h.device)
+
+        losses = []
+        for da, db in pairs:
+            xa = groups[da]
+            xb = groups[db]
+            sigma_list = _build_sigma_list(
+                xa,
+                xb,
+                num_kernels=num_kernels,
+                kernel_mul=kernel_mul,
+                fixed_sigma=sigma,
+            )
+            losses.append(_mmd2_unbiased(xa, xb, sigma_list))
+
+        return torch.stack(losses).mean()
+
     model = STOnco_Classifier(
         in_dim=in_dim,
-        hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
+        hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
         clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
         domain_hidden=int(cfg.get('dom_hidden', 64)),
         use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
@@ -720,8 +875,11 @@ def train_and_validate(
         total = loss_task
         loss_batch = torch.tensor(0.0, device=device)
         loss_cancer = torch.tensor(0.0, device=device)
+        loss_mmd = torch.tensor(0.0, device=device)
         ce_batch = torch.tensor(float('nan'), device=device)
         ce_cancer = torch.tensor(float('nan'), device=device)
+        raw_mmd_slide = torch.tensor(float('nan'), device=device)
+        raw_mmd_cancer = torch.tensor(float('nan'), device=device)
 
         if out.get('dom_logits_slide', None) is not None and hasattr(batch, 'bat_dom') and hasattr(batch, 'batch'):
             if n_domains_batch is None:
@@ -753,7 +911,61 @@ def train_and_validate(
             loss_dom_cancer = cel_cancer(out['dom_logits_cancer'], dom_nodes)
             loss_cancer = float(cfg.get('lambda_cancer', 1.0)) * loss_dom_cancer
             total = total + loss_cancer
-        return total, loss_task, loss_batch, loss_cancer, ce_batch, ce_cancer
+
+        if bool(cfg.get('use_mmd', False)):
+            h = out.get('h', None)
+            if h is None:
+                raise ValueError("MMD is enabled but model output does not contain 'h'.")
+
+            mmd_on = str(cfg.get('mmd_on', 'slide')).lower()
+            lambda_mmd = float(cfg.get('lambda_mmd', 0.05))
+            num_kernels = int(cfg.get('mmd_num_kernels', 5))
+            kernel_mul = float(cfg.get('mmd_kernel_mul', 2.0))
+            sigma = cfg.get('mmd_sigma', None)
+            max_pairs = int(cfg.get('mmd_max_pairs', 8))
+            spots_per_slide = int(cfg.get('mmd_spots_per_slide', 0))
+
+            if mmd_on in {'slide', 'both'} and hasattr(batch, 'bat_dom') and hasattr(batch, 'batch'):
+                dom_nodes_slide = batch.bat_dom[batch.batch]
+                raw_mmd_slide = _multi_domain_mmd(
+                    h,
+                    dom_nodes_slide,
+                    graph_nodes=getattr(batch, 'batch', None),
+                    spots_per_slide=spots_per_slide,
+                    num_kernels=num_kernels,
+                    kernel_mul=kernel_mul,
+                    sigma=sigma,
+                    max_pairs=max_pairs,
+                )
+                loss_mmd = loss_mmd + lambda_mmd * raw_mmd_slide
+
+            if mmd_on in {'cancer', 'both'} and hasattr(batch, 'cancer_dom') and hasattr(batch, 'batch'):
+                dom_nodes_cancer = batch.cancer_dom[batch.batch]
+                raw_mmd_cancer = _multi_domain_mmd(
+                    h,
+                    dom_nodes_cancer,
+                    graph_nodes=getattr(batch, 'batch', None),
+                    spots_per_slide=spots_per_slide,
+                    num_kernels=num_kernels,
+                    kernel_mul=kernel_mul,
+                    sigma=sigma,
+                    max_pairs=max_pairs,
+                )
+                loss_mmd = loss_mmd + lambda_mmd * raw_mmd_cancer
+
+            total = total + loss_mmd
+
+        return (
+            total,
+            loss_task,
+            loss_batch,
+            loss_cancer,
+            loss_mmd,
+            ce_batch,
+            ce_cancer,
+            raw_mmd_slide,
+            raw_mmd_cancer,
+        )
 
     best = {'auroc': -1, 'accuracy': -1, 'state': None, 'epoch': -1, 'macro_f1': float('nan'), 'auprc': float('nan')}
     last_epoch = 0
@@ -771,6 +983,9 @@ def train_and_validate(
         'avg_cancer_domain_loss': [],
         'avg_batch_domain_ce': [],
         'avg_cancer_domain_ce': [],
+        'avg_mmd_loss': [],
+        'avg_mmd_raw_slide': [],
+        'avg_mmd_raw_cancer': [],
         'train_batch_domain_acc': [],
         'train_cancer_domain_acc': [],
         'var_risk': [],
@@ -794,6 +1009,11 @@ def train_and_validate(
         tot_cancer = 0.0
         tot_batch_ce = 0.0
         tot_cancer_ce = 0.0
+        tot_mmd = 0.0
+        tot_mmd_raw_slide = 0.0
+        tot_mmd_raw_cancer = 0.0
+        cnt_mmd_slide = 0
+        cnt_mmd_cancer = 0
         batch_losses = []
         num_batches = 0
         train_correct = 0
@@ -820,6 +1040,7 @@ def train_and_validate(
                 edge_weight=getattr(batch, 'edge_weight', None),
                 grl_beta_slide=grl_beta_slide,
                 grl_beta_cancer=grl_beta_cancer,
+                return_h=bool(cfg.get('use_mmd', False)),
             )
             global_step += 1
 
@@ -836,7 +1057,17 @@ def train_and_validate(
                     dom_cancer_correct += int((pred == tgt).sum().item())
                     dom_cancer_total += int(tgt.numel())
 
-            loss_total, loss_task, loss_batch, loss_cancer, ce_batch, ce_cancer = _compute_losses(out, batch)
+            (
+                loss_total,
+                loss_task,
+                loss_batch,
+                loss_cancer,
+                loss_mmd,
+                ce_batch,
+                ce_cancer,
+                raw_mmd_slide,
+                raw_mmd_cancer,
+            ) = _compute_losses(out, batch)
             loss_total.backward()
             opt.step()
 
@@ -844,10 +1075,17 @@ def train_and_validate(
             tot_task += float(loss_task.item())
             tot_batch += float(loss_batch.item())
             tot_cancer += float(loss_cancer.item())
+            tot_mmd += float(loss_mmd.item())
             if torch.isfinite(ce_batch):
                 tot_batch_ce += float(ce_batch.item())
             if torch.isfinite(ce_cancer):
                 tot_cancer_ce += float(ce_cancer.item())
+            if torch.isfinite(raw_mmd_slide):
+                tot_mmd_raw_slide += float(raw_mmd_slide.item())
+                cnt_mmd_slide += 1
+            if torch.isfinite(raw_mmd_cancer):
+                tot_mmd_raw_cancer += float(raw_mmd_cancer.item())
+                cnt_mmd_cancer += 1
             batch_losses.append(float(loss_total.item()))
             num_batches += 1
 
@@ -863,8 +1101,11 @@ def train_and_validate(
         avg_task = tot_task / max(1, num_batches)
         avg_batch = tot_batch / max(1, num_batches)
         avg_cancer = tot_cancer / max(1, num_batches)
+        avg_mmd = tot_mmd / max(1, num_batches)
         avg_batch_ce = (tot_batch_ce / max(1, num_batches)) if cfg.get('use_domain_adv_slide', False) else float('nan')
         avg_cancer_ce = (tot_cancer_ce / max(1, num_batches)) if cfg.get('use_domain_adv_cancer', False) else float('nan')
+        avg_mmd_raw_slide = (tot_mmd_raw_slide / cnt_mmd_slide) if cnt_mmd_slide > 0 else float('nan')
+        avg_mmd_raw_cancer = (tot_mmd_raw_cancer / cnt_mmd_cancer) if cnt_mmd_cancer > 0 else float('nan')
         train_batch_domain_acc = float(dom_slide_correct / dom_slide_total) if dom_slide_total > 0 else float('nan')
         train_cancer_domain_acc = float(dom_cancer_correct / dom_cancer_total) if dom_cancer_total > 0 else float('nan')
         var_risk = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
@@ -876,6 +1117,9 @@ def train_and_validate(
         hist['avg_cancer_domain_loss'].append(avg_cancer)
         hist['avg_batch_domain_ce'].append(avg_batch_ce)
         hist['avg_cancer_domain_ce'].append(avg_cancer_ce)
+        hist['avg_mmd_loss'].append(avg_mmd)
+        hist['avg_mmd_raw_slide'].append(avg_mmd_raw_slide)
+        hist['avg_mmd_raw_cancer'].append(avg_mmd_raw_cancer)
         hist['train_batch_domain_acc'].append(train_batch_domain_acc)
         hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
         hist['var_risk'].append(var_risk)
@@ -946,6 +1190,7 @@ def train_and_validate(
             try:
                 epoch_iter.set_postfix(
                     train_loss=f'{avg_total:.3f}',
+                    mmd=f'{avg_mmd:.3f}',
                     val_acc=f'{val_accuracy:.3f}'
                 )
             except Exception:
@@ -991,6 +1236,9 @@ def _save_loss_components_csv(hist, out_dir):
         'avg_batch_domain_ce': hist.get('avg_batch_domain_ce', [float('nan')] * n_epochs),
         'avg_cancer_domain_loss': hist.get('avg_cancer_domain_loss', [float('nan')] * n_epochs),
         'avg_batch_domain_loss': hist.get('avg_batch_domain_loss', [float('nan')] * n_epochs),
+        'avg_mmd_loss': hist.get('avg_mmd_loss', [float('nan')] * n_epochs),
+        'avg_mmd_raw_slide': hist.get('avg_mmd_raw_slide', [float('nan')] * n_epochs),
+        'avg_mmd_raw_cancer': hist.get('avg_mmd_raw_cancer', [float('nan')] * n_epochs),
         'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
         'train_cancer_domain_acc': hist.get('train_cancer_domain_acc', [float('nan')] * n_epochs),
         'train_accuracy': hist.get('train_accuracy', [float('nan')] * n_epochs),
@@ -1046,20 +1294,25 @@ def _plot_train_metrics(hist, out_dir):
         ax.spines['top'].set_visible(True)
         ax.spines['right'].set_visible(True)
 
-    # 1) 训练损失图（2x3）
-    fig1, axes1 = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
+    # 1) 训练损失图（3x3）
+    fig1, axes1 = plt.subplots(3, 3, figsize=(16, 10), sharex=True)
     metrics_train = [
         ('avg_total_loss', 'avg_total_loss'),
         ('avg_task_loss', 'avg_task_loss'),
+        ('avg_mmd_loss', 'avg_mmd_loss'),
         ('var_risk', 'Var_risk'),
         ('avg_cancer_domain_loss', 'avg_cancer_domain_loss'),
         ('avg_batch_domain_loss', 'avg_batch_domain_loss'),
+        ('avg_mmd_raw_slide', 'avg_mmd_raw_slide'),
+        ('avg_mmd_raw_cancer', 'avg_mmd_raw_cancer'),
         ('train_accuracy', 'train_accuracy'),
     ]
     for ax, (key, title) in zip(axes1.flatten(), metrics_train):
         values = hist.get(key, [float('nan')] * n_epochs)
         _plot_neurips(ax, values, title)
     for ax in axes1[0]:
+        ax.tick_params(labelbottom=True)
+    for ax in axes1[1]:
         ax.tick_params(labelbottom=True)
     fig1.tight_layout()
     out_train_svg = os.path.join(out_dir, 'train_loss.svg')
@@ -1265,7 +1518,7 @@ def run_single_training(args, cfg, device):
     # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
     model = STOnco_Classifier(
         in_dim=in_dim,
-        hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
+        hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
         clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
         domain_hidden=int(cfg.get('dom_hidden', 64)),
         use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
@@ -1581,7 +1834,7 @@ def run_kfold_training(args, cfg, device):
         # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
         model = STOnco_Classifier(
             in_dim=in_dim,
-            hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
+            hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
             clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
             domain_hidden=int(cfg.get('dom_hidden', 64)),
             use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
@@ -1967,7 +2220,7 @@ def run_loco_training(args, cfg, device):
         # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
         model = STOnco_Classifier(
             in_dim=in_dim,
-            hidden=cfg['hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
+            hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
             clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
             domain_hidden=int(cfg.get('dom_hidden', 64)),
             use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,

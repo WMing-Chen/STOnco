@@ -148,7 +148,7 @@ def _build_X_for_union(expr: pd.DataFrame, union_genes: List[str]) -> np.ndarray
     return X
 
 
-def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_col: str) -> None:
+def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_col: str, use_image_features: bool = True) -> None:
     train_dir = os.path.abspath(train_dir)
     subdirs = sorted([p for p in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, p))])
     if not subdirs:
@@ -170,7 +170,9 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         slide_path = os.path.join(train_dir, sd)
         coord_csv = _find_unique_file_by_suffix(slide_path, 'coordinates.csv', kind='coordinates', sample_id=sd)
         exp_csv = _find_unique_file_by_suffix(slide_path, 'exp.csv', kind='expression', sample_id=sd)
-        img_csv = _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
+        img_csv = None
+        if use_image_features:
+            img_csv = _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
 
         bc_exp, genes, expr = _read_expression(exp_csv)
         bc_coord, xy, y = _read_coords(coord_csv, x_col=x_col, y_col=y_col, label_col=label_col)
@@ -186,24 +188,25 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         xy_aligned = xy[keep_mask]
         y_aligned = y[keep_mask] if y is not None else None
 
-        _, img_feature_names, img_df = _read_image_features(img_csv)
-        if img_feature_names_ref is None:
-            img_feature_names_ref = img_feature_names
-        elif img_feature_names != img_feature_names_ref:
-            raise ValueError(
-                f"Image feature names/order mismatch across slides. sample_id={sd}. "
-                f"Expected first 5={img_feature_names_ref[:5]}, got first 5={img_feature_names[:5]}"
-            )
-        img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
-        row_has_any_nan = img_aligned.isna().any(axis=1)
-        img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
-        missing_count = int((img_mask == 0).sum())
-        if missing_count > 0:
-            print(
-                f"Warning: sample_id={sd} missing image features for {missing_count} / {len(img_mask)} spots "
-                f"(filled with zeros, img_mask=0)"
-            )
-        X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
+        if use_image_features:
+            _, img_feature_names, img_df = _read_image_features(img_csv)
+            if img_feature_names_ref is None:
+                img_feature_names_ref = img_feature_names
+            elif img_feature_names != img_feature_names_ref:
+                raise ValueError(
+                    f"Image feature names/order mismatch across slides. sample_id={sd}. "
+                    f"Expected first 5={img_feature_names_ref[:5]}, got first 5={img_feature_names[:5]}"
+                )
+            img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
+            row_has_any_nan = img_aligned.isna().any(axis=1)
+            img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
+            missing_count = int((img_mask == 0).sum())
+            if missing_count > 0:
+                print(
+                    f"Warning: sample_id={sd} missing image features for {missing_count} / {len(img_mask)} spots "
+                    f"(filled with zeros, img_mask=0)"
+                )
+            X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
 
         slide_exprs.append(expr_aligned)
         slide_barcodes.append(expr_aligned.index)
@@ -215,8 +218,9 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         slide_ys.append(y_aligned.astype(int))
         slide_ids.append(sd)
         slide_barcodes_aligned.append(pd.Index(barcodes_used))
-        slide_X_imgs.append(X_img)
-        slide_img_masks.append(img_mask.astype(np.uint8))
+        if use_image_features:
+            slide_X_imgs.append(X_img)
+            slide_img_masks.append(img_mask.astype(np.uint8))
 
     union_genes = _union_gene_order(slide_genes)
 
@@ -231,25 +235,25 @@ def build_train_npz(train_dir: str, out_npz: str, x_col: str, y_col: str, label_
         ys.append(y.astype(np.int64))
         barcodes_arrays.append(np.array(barcodes.astype(str), dtype='U64'))
 
-    if img_feature_names_ref is None:
-        raise RuntimeError('No image features loaded. This should not happen.')
-
-    np.savez_compressed(
-        out_npz,
-        Xs=np.array(Xs, dtype=object),
-        ys=np.array(ys, dtype=object),
-        xys=np.array(xys, dtype=object),
-        slide_ids=np.array(slide_ids, dtype=object),
-        gene_names=np.array(union_genes, dtype=object),
-        barcodes=np.array(barcodes_arrays, dtype=object),
-        X_imgs=np.array(slide_X_imgs, dtype=object),
-        img_masks=np.array(slide_img_masks, dtype=object),
-        img_feature_names=np.array(img_feature_names_ref, dtype=object),
-    )
+    save_dict = {
+        'Xs': np.array(Xs, dtype=object),
+        'ys': np.array(ys, dtype=object),
+        'xys': np.array(xys, dtype=object),
+        'slide_ids': np.array(slide_ids, dtype=object),
+        'gene_names': np.array(union_genes, dtype=object),
+        'barcodes': np.array(barcodes_arrays, dtype=object),
+    }
+    if use_image_features:
+        if img_feature_names_ref is None:
+            raise RuntimeError('No image features loaded while use_image_features=1.')
+        save_dict['X_imgs'] = np.array(slide_X_imgs, dtype=object)
+        save_dict['img_masks'] = np.array(slide_img_masks, dtype=object)
+        save_dict['img_feature_names'] = np.array(img_feature_names_ref, dtype=object)
+    np.savez_compressed(out_npz, **save_dict)
     print(f"Saved training NPZ to: {out_npz}")
 
 
-def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_col: str, label_col: str | None = None, sample_id: str | None = None) -> None:
+def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_col: str, label_col: str | None = None, sample_id: str | None = None, use_image_features: bool = True) -> None:
     bc_exp, genes, expr = _read_expression(exp_csv)
     bc_coord, xy, y = _read_coords(coord_csv, x_col=x_col, y_col=y_col, label_col=label_col)
 
@@ -270,18 +274,19 @@ def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_c
     if sample_id is None:
         sample_id = Path(coord_csv).parent.name
 
-    img_csv = _find_unique_file_by_suffix(Path(coord_csv).parent.as_posix(), 'image_features.csv', kind='image_features', sample_id=sample_id)
-    _, img_feature_names, img_df = _read_image_features(img_csv)
-    img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
-    row_has_any_nan = img_aligned.isna().any(axis=1)
-    img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
-    missing_count = int((img_mask == 0).sum())
-    if missing_count > 0:
-        print(
-            f"Warning: sample_id={sample_id} missing image features for {missing_count} / {len(img_mask)} spots "
-            f"(filled with zeros, img_mask=0)"
-        )
-    X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
+    if use_image_features:
+        img_csv = _find_unique_file_by_suffix(Path(coord_csv).parent.as_posix(), 'image_features.csv', kind='image_features', sample_id=sample_id)
+        _, img_feature_names, img_df = _read_image_features(img_csv)
+        img_aligned = img_df.reindex(pd.Index(barcodes_used, dtype=str))
+        row_has_any_nan = img_aligned.isna().any(axis=1)
+        img_mask = (~row_has_any_nan).astype(np.uint8).to_numpy()
+        missing_count = int((img_mask == 0).sum())
+        if missing_count > 0:
+            print(
+                f"Warning: sample_id={sample_id} missing image features for {missing_count} / {len(img_mask)} spots "
+                f"(filled with zeros, img_mask=0)"
+            )
+        X_img = img_aligned.fillna(0.0).to_numpy(dtype=np.float32)
 
     # Keep original gene order as in CSV
     X = expr_aligned.to_numpy(dtype=float)
@@ -291,10 +296,11 @@ def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_c
         'gene_names': np.array(genes, dtype=object),
         'barcodes': barcodes_aligned,
         'sample_id': sample_id,
-        'X_img': X_img.astype(np.float32),
-        'img_mask': img_mask.astype(np.uint8),
-        'img_feature_names': np.array(img_feature_names, dtype=object),
     }
+    if use_image_features:
+        save_dict['X_img'] = X_img.astype(np.float32)
+        save_dict['img_mask'] = img_mask.astype(np.uint8)
+        save_dict['img_feature_names'] = np.array(img_feature_names, dtype=object)
     if y_aligned is not None:
         save_dict['y'] = y_aligned.astype(np.int64)
     
@@ -302,7 +308,7 @@ def build_single_npz(exp_csv: str, coord_csv: str, out_npz: str, x_col: str, y_c
     print(f"Saved single-sample NPZ to: {out_npz} (sample_id: {sample_id}, spots: {len(barcodes_aligned)})")
 
 
-def build_val_npz(val_dir: str, out_dir: str, x_col: str, y_col: str, label_col: str) -> None:
+def build_val_npz(val_dir: str, out_dir: str, x_col: str, y_col: str, label_col: str, use_image_features: bool = True) -> None:
     """Build individual NPZ files for each validation slide."""
     val_dir = os.path.abspath(val_dir)
     out_dir = os.path.abspath(out_dir)
@@ -318,15 +324,16 @@ def build_val_npz(val_dir: str, out_dir: str, x_col: str, y_col: str, label_col:
         try:
             coord_csv = _find_unique_file_by_suffix(slide_path, 'coordinates.csv', kind='coordinates', sample_id=sd)
             exp_csv = _find_unique_file_by_suffix(slide_path, 'exp.csv', kind='expression', sample_id=sd)
-            _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
+            if use_image_features:
+                _find_unique_file_by_suffix(slide_path, 'image_features.csv', kind='image_features', sample_id=sd)
         except Exception as e:
             print(f"Warning: {e}. Skipping.")
             continue
         out_npz = os.path.join(out_dir, f"{sd}.npz")
         
         try:
-            build_single_npz(exp_csv, coord_csv, out_npz, x_col=x_col, y_col=y_col, 
-                            label_col=label_col, sample_id=sd)
+            build_single_npz(exp_csv, coord_csv, out_npz, x_col=x_col, y_col=y_col,
+                            label_col=label_col, sample_id=sd, use_image_features=use_image_features)
         except Exception as e:
             print(f"Error processing {sd}: {e}")
             continue
@@ -343,6 +350,7 @@ def main():
     p_train.add_argument('--out_npz', default='train_data.npz', help='Output NPZ path')
     p_train.add_argument('--xy_cols', nargs=2, default=['row', 'col'], metavar=('X_COL', 'Y_COL'), help="Column names in coordinates.csv to use as x/y (default: row col)")
     p_train.add_argument('--label_col', default='true_label', help="Label column in coordinates.csv (default: true_label, values 0/1)")
+    p_train.add_argument('--use_image_features', type=int, choices=[0, 1], default=1, help='Whether to include image features (1/0, default: 1)')
 
     p_single = sub.add_parser('build-single-npz', help='Create a single-sample NPZ from exp.csv + coordinates.csv')
     p_single.add_argument('--exp_csv', required=True, help='Path to *_exp.csv (first column Barcode)')
@@ -351,25 +359,35 @@ def main():
     p_single.add_argument('--xy_cols', nargs=2, default=['row', 'col'], metavar=('X_COL', 'Y_COL'), help="Column names in coordinates.csv to use as x/y (default: row col)")
     p_single.add_argument('--label_col', default=None, help="Label column in coordinates.csv (optional)")
     p_single.add_argument('--sample_id', default=None, help="Sample ID (default: infer from parent directory)")
+    p_single.add_argument('--use_image_features', type=int, choices=[0, 1], default=1, help='Whether to include image features (1/0, default: 1)')
     
     p_val = sub.add_parser('build-val-npz', help='Build individual NPZ files for validation slides')
     p_val.add_argument('--val_dir', required=True, help='Directory containing validation slide subfolders')
     p_val.add_argument('--out_dir', required=True, help='Output directory for NPZ files')
     p_val.add_argument('--xy_cols', nargs=2, default=['row', 'col'], metavar=('X_COL', 'Y_COL'), help="Column names in coordinates.csv to use as x/y (default: row col)")
     p_val.add_argument('--label_col', default='true_label', help="Label column in coordinates.csv (default: true_label)")
+    p_val.add_argument('--use_image_features', type=int, choices=[0, 1], default=1, help='Whether to include image features (1/0, default: 1)')
 
     args = parser.parse_args()
 
     if args.cmd == 'build-train-npz':
         x_col, y_col = args.xy_cols
-        build_train_npz(args.train_dir, args.out_npz, x_col=x_col, y_col=y_col, label_col=args.label_col)
+        build_train_npz(
+            args.train_dir, args.out_npz, x_col=x_col, y_col=y_col, label_col=args.label_col,
+            use_image_features=bool(args.use_image_features)
+        )
     elif args.cmd == 'build-single-npz':
         x_col, y_col = args.xy_cols
-        build_single_npz(args.exp_csv, args.coord_csv, args.out_npz, x_col=x_col, y_col=y_col, 
-                        label_col=args.label_col, sample_id=args.sample_id)
+        build_single_npz(
+            args.exp_csv, args.coord_csv, args.out_npz, x_col=x_col, y_col=y_col,
+            label_col=args.label_col, sample_id=args.sample_id, use_image_features=bool(args.use_image_features)
+        )
     elif args.cmd == 'build-val-npz':
         x_col, y_col = args.xy_cols
-        build_val_npz(args.val_dir, args.out_dir, x_col=x_col, y_col=y_col, label_col=args.label_col)
+        build_val_npz(
+            args.val_dir, args.out_dir, x_col=x_col, y_col=y_col, label_col=args.label_col,
+            use_image_features=bool(args.use_image_features)
+        )
     else:
         raise RuntimeError('Unknown command')
 
