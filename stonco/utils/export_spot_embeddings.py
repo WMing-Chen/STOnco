@@ -146,7 +146,7 @@ def _iter_samples_from_npz_glob(npz_glob: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Export spot-level embeddings (h or z64) from a trained STOnco model.')
+    parser = argparse.ArgumentParser(description='Export spot-level embeddings (h or classifier latent) from a trained STOnco model.')
     parser.add_argument('--artifacts_dir', required=True, help='Training artifacts dir (contains meta.json, model weights, preprocessor).')
     parser.add_argument('--out_csv', default='spot_embeddings.csv', help='Output CSV path.')
     parser.add_argument('--append', action='store_true', help='Append to out_csv if it exists (default: overwrite).')
@@ -157,9 +157,9 @@ def main():
     parser.add_argument('--num_threads', type=int, default=None, help='Set torch CPU threads (only affects CPU).')
     parser.add_argument(
         '--embed_source',
-        choices=['h', 'z64'],
+        choices=['h', 'z_clf', 'z64'],
         default='h',
-        help='Embedding source for export: h (GNN output) or z64 (classifier latent).',
+        help='Embedding source for export: h (GNN output), z_clf (classifier latent), or z64 (legacy alias for 64-dim classifier latent).',
     )
     args = parser.parse_args()
 
@@ -195,6 +195,11 @@ def main():
     cfg.setdefault('use_image_features', False)
     cfg.setdefault('img_use_pca', True)
     cfg.setdefault('img_pca_dim', 256)
+    clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
+    if isinstance(clf_hidden, str):
+        clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+    cfg['clf_hidden'] = [int(x) for x in clf_hidden]
+    cfg.setdefault('clf_latent_dim', int(cfg['clf_hidden'][-1]))
     cfg = normalize_gnn_config(cfg)
 
     pp = Preprocessor.load(artifacts_dir)
@@ -255,9 +260,7 @@ def main():
         if model is None:
             in_dim = int(g.x.shape[1])
             clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
-            if isinstance(clf_hidden, str):
-                clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
-            clf_hidden = [int(x) for x in clf_hidden]
+            cfg['clf_latent_dim'] = int(clf_hidden[-1])
             m = STOnco_Classifier(
                 in_dim=in_dim,
                 hidden=cfg['GNN_hidden'],
@@ -272,7 +275,7 @@ def main():
             model.eval()
 
         with torch.no_grad():
-            need_z = (args.embed_source == 'z64')
+            need_z = (args.embed_source in ('z_clf', 'z64'))
             need_h = (args.embed_source == 'h')
             out = model(
                 g.x,
@@ -284,9 +287,14 @@ def main():
             )
             logits = out['logits'].detach().cpu().numpy()
             p_tumor = 1.0 / (1.0 + np.exp(-logits))
-            if args.embed_source == 'z64':
-                emb = out['z64'].detach().cpu().numpy()
-                emb_prefix = 'z64_'
+            if args.embed_source in ('z_clf', 'z64'):
+                emb = out['z_clf'].detach().cpu().numpy()
+                emb_prefix = 'z_clf_'
+                if args.embed_source == 'z64' and int(emb.shape[1]) != 64:
+                    raise ValueError(
+                        f'--embed_source z64 requires classifier latent dim == 64, got {emb.shape[1]}. '
+                        'Use --embed_source z_clf for dynamically sized classifier embeddings.'
+                    )
             else:
                 emb = out['h'].detach().cpu().numpy()
                 emb_prefix = 'h_'
@@ -320,8 +328,9 @@ def main():
             'batch_id': [batch_id] * n_spots,
             'cancer_type': [cancer_type] * n_spots,
             'p_tumor': p_tumor,
-            'embed_source': [args.embed_source] * n_spots,
+            'embed_source': [('z_clf' if args.embed_source in ('z_clf', 'z64') else 'h')] * n_spots,
             'embed_dim': [emb_dim] * n_spots,
+            'clf_latent_dim': [int(cfg.get('clf_latent_dim', emb_dim))] * n_spots,
         })
         emb_cols = [f'{emb_prefix}{j}' for j in range(emb_dim)]
         emb_df = pd.DataFrame(emb, columns=emb_cols)

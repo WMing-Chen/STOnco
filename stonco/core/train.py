@@ -224,12 +224,20 @@ def main():
     # 新增：网络结构与优化器超参数
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=None, help='权重衰减')
+    parser.add_argument('--lr_scheduler', choices=['none', 'linear', 'cosine', 'warmup_cosine', 'plateau'], default=None, help='学习率调度模式')
+    parser.add_argument('--lr_warmup_epochs', type=int, default=None, help='warmup_cosine 的 warmup epoch 数')
+    parser.add_argument('--min_lr_ratio', type=float, default=None, help='最小学习率比例，min_lr = lr * min_lr_ratio')
+    parser.add_argument('--plateau_metric', choices=['val_accuracy', 'val_avg_total_loss', 'val_macro_f1', 'val_auroc', 'val_auprc'], default=None, help='plateau 模式监控的验证指标')
+    parser.add_argument('--plateau_factor', type=float, default=None, help='plateau 模式学习率衰减倍率')
+    parser.add_argument('--plateau_patience', type=int, default=None, help='plateau 模式耐心值')
+    parser.add_argument('--plateau_threshold', type=float, default=None, help='plateau 模式指标改进阈值')
+    parser.add_argument('--plateau_cooldown', type=int, default=None, help='plateau 模式 cooldown epoch 数')
     parser.add_argument('--hidden', type=int, default=None, help='旧版兼容参数：统一隐藏层维度；不要与 --GNN_hidden 同时传入')
     parser.add_argument('--GNN_hidden', default=None, help='GNN每层隐藏维度；支持单个整数或逗号分隔列表，默认：256,128,64')
     parser.add_argument('--num_layers', type=int, default=None, help='GNN层数')
     parser.add_argument('--dropout', type=float, default=None, help='Dropout比例')
     # 新增：分类头与域头结构
-    parser.add_argument('--clf_hidden', default=None, help='分类头隐藏层维度，逗号分隔，必须以64结尾（默认：256,128,64）')
+    parser.add_argument('--clf_hidden', default=None, help='分类头隐藏层维度，逗号分隔的正整数列表（默认：256,128,64）')
     parser.add_argument('--dom_hidden', type=int, default=None, help='域头隐藏层维度（默认：64）')
     
     # 新增：设备控制
@@ -240,11 +248,15 @@ def main():
     parser.add_argument('--use_domain_adv_cancer', type=int, choices=[0,1], default=None, help='启用/关闭癌种域对抗（1/0）')
     parser.add_argument('--lambda_slide', type=float, default=None, help='批次域对抗损失权重')
     parser.add_argument('--lambda_cancer', type=float, default=None, help='癌种域对抗损失权重')
-    # 新增：GRL beta schedule（默认 DANN-style；可切换 constant）
-    parser.add_argument('--grl_beta_mode', choices=['dann', 'constant'], default=None, help='GRL beta 模式：dann(从0平滑涨到target)/constant(全程恒定=target)')
-    parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='批次域 GRL 目标强度（DANN schedule），默认1.0')
-    parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度（DANN schedule），默认0.5')
-    parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10')
+    # 新增：GRL beta schedule（默认 DANN-style；可切换 constant / linear）
+    parser.add_argument('--grl_beta_mode', choices=['dann', 'constant', 'linear'], default=None, help='GRL beta 模式：dann(支持delay后在剩余训练过程上走完整DANN曲线)/constant(全程恒定=target)/linear(delay后线性升到target)')
+    parser.add_argument('--grl_beta_slide_target', type=float, default=None, help='批次域 GRL 目标强度，默认1.0')
+    parser.add_argument('--grl_beta_cancer_target', type=float, default=None, help='癌种域 GRL 目标强度，默认0.5')
+    parser.add_argument('--grl_beta_gamma', type=float, default=None, help='GRL DANN schedule gamma，默认10；仅在 grl_beta_mode=dann 时生效')
+    parser.add_argument('--grl_beta_slide_delay_epochs', type=int, default=None, help='批次域 GRL delay epoch 数；对 dann 和 linear 生效，默认1')
+    parser.add_argument('--grl_beta_slide_warmup_epochs', type=int, default=None, help='批次域 GRL 线性 warm-up epoch 数；仅对 linear 生效，默认8')
+    parser.add_argument('--grl_beta_cancer_delay_epochs', type=int, default=None, help='癌种域 GRL delay epoch 数；对 dann 和 linear 生效，默认3')
+    parser.add_argument('--grl_beta_cancer_warmup_epochs', type=int, default=None, help='癌种域 GRL 线性 warm-up epoch 数；仅对 linear 生效，默认12')
     # 新增：MMD 对齐
     parser.add_argument('--use_mmd', type=int, choices=[0,1], default=None, help='启用/关闭 MMD 对齐（1/0）')
     parser.add_argument('--mmd_on', choices=['slide', 'cancer', 'both'], default=None, help='MMD 对齐域：slide/cancer/both')
@@ -285,7 +297,7 @@ def main():
 
     args = parser.parse_args()
 
-    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'lr_scheduler':'none', 'lr_warmup_epochs':10, 'min_lr_ratio':0.01, 'plateau_metric':'val_accuracy', 'plateau_factor':0.5, 'plateau_patience':10, 'plateau_threshold':1e-4, 'plateau_cooldown':0, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
            # 控制项
            'use_pca': False,
            # 方案1：早期融合（默认关闭以保持旧行为）
@@ -294,8 +306,9 @@ def main():
            'img_pca_dim': 256,
            'concat_lap_pe': True,
            'lap_pe_use_gaussian': False,
-           # 分类头/域头（保持默认结构：clf 256->128->64，dom hidden=64）
+           # 分类头/域头
            'clf_hidden': [256, 128, 64],
+           'clf_latent_dim': 64,
            'dom_hidden': 64,
            # 新增：双域默认配置（新字段）
            'use_domain_adv_slide': True,   # 默认开启（batch/slide 域）
@@ -308,6 +321,10 @@ def main():
 	           'grl_beta_slide_target': 1.0,
 	           'grl_beta_cancer_target': 0.5,
 	           'grl_beta_gamma': 10.0,
+               'grl_beta_slide_delay_epochs': 1,
+               'grl_beta_slide_warmup_epochs': 8,
+               'grl_beta_cancer_delay_epochs': 3,
+               'grl_beta_cancer_warmup_epochs': 12,
                # 新增：MMD 默认配置
                'use_mmd': False,
                'mmd_on': 'slide',
@@ -369,6 +386,22 @@ def main():
         cfg['lr'] = args.lr
     if args.weight_decay is not None:
         cfg['weight_decay'] = args.weight_decay
+    if getattr(args, 'lr_scheduler', None) is not None:
+        cfg['lr_scheduler'] = str(args.lr_scheduler)
+    if getattr(args, 'lr_warmup_epochs', None) is not None:
+        cfg['lr_warmup_epochs'] = int(args.lr_warmup_epochs)
+    if getattr(args, 'min_lr_ratio', None) is not None:
+        cfg['min_lr_ratio'] = float(args.min_lr_ratio)
+    if getattr(args, 'plateau_metric', None) is not None:
+        cfg['plateau_metric'] = str(args.plateau_metric)
+    if getattr(args, 'plateau_factor', None) is not None:
+        cfg['plateau_factor'] = float(args.plateau_factor)
+    if getattr(args, 'plateau_patience', None) is not None:
+        cfg['plateau_patience'] = int(args.plateau_patience)
+    if getattr(args, 'plateau_threshold', None) is not None:
+        cfg['plateau_threshold'] = float(args.plateau_threshold)
+    if getattr(args, 'plateau_cooldown', None) is not None:
+        cfg['plateau_cooldown'] = int(args.plateau_cooldown)
     if args.hidden is not None:
         cfg['hidden'] = args.hidden
     if args.GNN_hidden is not None:
@@ -382,10 +415,10 @@ def main():
         s = str(args.clf_hidden).strip()
         if s:
             dims = [int(x.strip()) for x in s.split(',') if x.strip() != '']
-            if len(dims) != 3:
-                raise ValueError(f'--clf_hidden must have exactly 3 integers (h1,h2,64), got: {dims}')
-            if int(dims[-1]) != 64:
-                raise ValueError(f'--clf_hidden must end with 64 (to keep z64 compatible), got: {dims}')
+            if not dims:
+                raise ValueError('--clf_hidden must contain at least 1 integer')
+            if any(int(d) <= 0 for d in dims):
+                raise ValueError(f'--clf_hidden must contain only positive integers, got: {dims}')
             cfg['clf_hidden'] = [int(d) for d in dims]
     if getattr(args, 'dom_hidden', None) is not None:
         cfg['dom_hidden'] = int(args.dom_hidden)
@@ -395,12 +428,16 @@ def main():
         dims = cfg['clf_hidden']
         if isinstance(dims, str):
             dims = [int(x.strip()) for x in dims.split(',') if x.strip() != '']
-        if not isinstance(dims, (list, tuple)) or len(dims) != 3:
-            raise ValueError(f"cfg['clf_hidden'] must be a list/tuple of 3 ints (h1,h2,64), got: {dims}")
+        if not isinstance(dims, (list, tuple)) or len(dims) < 1:
+            raise ValueError(f"cfg['clf_hidden'] must be a non-empty list/tuple of positive ints, got: {dims}")
         dims = [int(x) for x in dims]
-        if int(dims[-1]) != 64:
-            raise ValueError(f"cfg['clf_hidden'] must end with 64 (to keep z64 compatible), got: {dims}")
+        if any(int(x) <= 0 for x in dims):
+            raise ValueError(f"cfg['clf_hidden'] must contain only positive ints, got: {dims}")
         cfg['clf_hidden'] = dims
+        cfg['clf_latent_dim'] = int(dims[-1])
+    else:
+        cfg['clf_hidden'] = [256, 128, 64]
+        cfg['clf_latent_dim'] = 64
     if 'dom_hidden' in cfg:
         cfg['dom_hidden'] = int(cfg['dom_hidden'])
 
@@ -421,6 +458,14 @@ def main():
         cfg['grl_beta_cancer_target'] = float(args.grl_beta_cancer_target)
     if getattr(args, 'grl_beta_gamma', None) is not None:
         cfg['grl_beta_gamma'] = float(args.grl_beta_gamma)
+    if getattr(args, 'grl_beta_slide_delay_epochs', None) is not None:
+        cfg['grl_beta_slide_delay_epochs'] = int(args.grl_beta_slide_delay_epochs)
+    if getattr(args, 'grl_beta_slide_warmup_epochs', None) is not None:
+        cfg['grl_beta_slide_warmup_epochs'] = int(args.grl_beta_slide_warmup_epochs)
+    if getattr(args, 'grl_beta_cancer_delay_epochs', None) is not None:
+        cfg['grl_beta_cancer_delay_epochs'] = int(args.grl_beta_cancer_delay_epochs)
+    if getattr(args, 'grl_beta_cancer_warmup_epochs', None) is not None:
+        cfg['grl_beta_cancer_warmup_epochs'] = int(args.grl_beta_cancer_warmup_epochs)
     if getattr(args, 'use_mmd', None) is not None:
         cfg['use_mmd'] = bool(args.use_mmd)
     if getattr(args, 'mmd_on', None) is not None:
@@ -455,8 +500,28 @@ def main():
         cfg['grl_beta_cancer_target'] = 0.5
     if cfg.get('grl_beta_gamma', None) is None:
         cfg['grl_beta_gamma'] = 10.0
-    if str(cfg.get('grl_beta_mode', 'dann')) not in {'dann', 'constant'}:
-        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
+    if cfg.get('grl_beta_slide_delay_epochs', None) is None:
+        cfg['grl_beta_slide_delay_epochs'] = 1
+    if cfg.get('grl_beta_slide_warmup_epochs', None) is None:
+        cfg['grl_beta_slide_warmup_epochs'] = 8
+    if cfg.get('grl_beta_cancer_delay_epochs', None) is None:
+        cfg['grl_beta_cancer_delay_epochs'] = 3
+    if cfg.get('grl_beta_cancer_warmup_epochs', None) is None:
+        cfg['grl_beta_cancer_warmup_epochs'] = 12
+    if str(cfg.get('grl_beta_mode', 'dann')) not in {'dann', 'constant', 'linear'}:
+        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann', 'constant' or 'linear', got: {cfg.get('grl_beta_mode')}")
+    for key in (
+        'grl_beta_slide_delay_epochs',
+        'grl_beta_slide_warmup_epochs',
+        'grl_beta_cancer_delay_epochs',
+        'grl_beta_cancer_warmup_epochs',
+    ):
+        value = cfg.get(key, 0)
+        if isinstance(value, bool):
+            raise ValueError(f"cfg['{key}'] must be an integer epoch count, got bool: {value}")
+        if isinstance(value, float) and not float(value).is_integer():
+            raise ValueError(f"cfg['{key}'] must be an integer epoch count, got: {value}")
+        cfg[key] = int(value)
     cfg['use_mmd'] = bool(cfg.get('use_mmd', False))
     cfg['mmd_on'] = str(cfg.get('mmd_on', 'slide')).lower()
     if cfg['mmd_on'] not in {'slide', 'cancer', 'both'}:
@@ -467,6 +532,36 @@ def main():
     cfg['mmd_sigma'] = None if cfg.get('mmd_sigma', None) is None else float(cfg['mmd_sigma'])
     cfg['mmd_max_pairs'] = int(cfg.get('mmd_max_pairs', 8))
     cfg['mmd_spots_per_slide'] = int(cfg.get('mmd_spots_per_slide', 0))
+    cfg['lr_scheduler'] = str(cfg.get('lr_scheduler', 'none')).lower()
+    if cfg['lr_scheduler'] not in {'none', 'linear', 'cosine', 'warmup_cosine', 'plateau'}:
+        raise ValueError(f"cfg['lr_scheduler'] must be one of none/linear/cosine/warmup_cosine/plateau, got: {cfg['lr_scheduler']}")
+    if float(cfg.get('lr', 0.0)) <= 0:
+        raise ValueError(f"cfg['lr'] must be > 0, got: {cfg.get('lr')}")
+    cfg['min_lr_ratio'] = float(cfg.get('min_lr_ratio', 0.01))
+    if not (0.0 < cfg['min_lr_ratio'] <= 1.0):
+        raise ValueError(f"cfg['min_lr_ratio'] must be in (0, 1], got: {cfg['min_lr_ratio']}")
+    for key, default_value in (('lr_warmup_epochs', 10), ('plateau_patience', 10), ('plateau_cooldown', 0)):
+        value = cfg.get(key, default_value)
+        if value is None:
+            value = default_value
+        if isinstance(value, bool):
+            raise ValueError(f"cfg['{key}'] must be an integer, got bool: {value}")
+        if isinstance(value, float) and not float(value).is_integer():
+            raise ValueError(f"cfg['{key}'] must be an integer, got: {value}")
+        cfg[key] = int(value)
+    cfg['plateau_metric'] = str(cfg.get('plateau_metric', 'val_accuracy'))
+    if cfg['plateau_metric'] not in {'val_accuracy', 'val_avg_total_loss', 'val_macro_f1', 'val_auroc', 'val_auprc'}:
+        raise ValueError(f"cfg['plateau_metric'] must be one of val_accuracy/val_avg_total_loss/val_macro_f1/val_auroc/val_auprc, got: {cfg['plateau_metric']}")
+    cfg['plateau_factor'] = float(cfg.get('plateau_factor', 0.5))
+    if not (0.0 < cfg['plateau_factor'] < 1.0):
+        raise ValueError(f"cfg['plateau_factor'] must be in (0, 1), got: {cfg['plateau_factor']}")
+    cfg['plateau_threshold'] = float(cfg.get('plateau_threshold', 1e-4))
+    if cfg['plateau_threshold'] < 0:
+        raise ValueError(f"cfg['plateau_threshold'] must be >= 0, got: {cfg['plateau_threshold']}")
+    if cfg['plateau_patience'] < 0:
+        raise ValueError(f"cfg['plateau_patience'] must be >= 0, got: {cfg['plateau_patience']}")
+    if cfg['plateau_cooldown'] < 0:
+        raise ValueError(f"cfg['plateau_cooldown'] must be >= 0, got: {cfg['plateau_cooldown']}")
     cfg = normalize_gnn_config(cfg)
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
@@ -698,15 +793,44 @@ def train_and_validate(
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
     """
+    def _epochs_to_steps(value_epochs, steps_per_epoch):
+        value_epochs = int(value_epochs)
+        if value_epochs < 0:
+            raise ValueError(f'epoch count must be >= 0, got: {value_epochs}')
+        return int(value_epochs) * int(steps_per_epoch)
+
     def _dann_beta(p, beta_target, gamma):
         p = float(p)
         beta_target = float(beta_target)
         gamma = float(gamma)
         return beta_target * (2.0 / (1.0 + math.exp(-gamma * p)) - 1.0)
 
+    def _dann_beta_with_delay(global_step, total_steps, beta_target, gamma, delay_steps):
+        global_step = int(global_step)
+        total_steps = int(total_steps)
+        delay_steps = int(delay_steps)
+        if global_step < delay_steps:
+            return 0.0
+        rem_steps = max(total_steps - delay_steps, 1)
+        p = min(max(float(global_step - delay_steps) / float(rem_steps), 0.0), 1.0)
+        return _dann_beta(p, beta_target, gamma)
+
+    def _linear_warmup_beta(global_step, beta_target, delay_steps, warmup_steps):
+        global_step = int(global_step)
+        delay_steps = int(delay_steps)
+        warmup_steps = int(warmup_steps)
+        beta_target = float(beta_target)
+        if global_step < delay_steps:
+            return 0.0
+        if warmup_steps <= 0:
+            return beta_target
+        step_eff = global_step - delay_steps
+        progress = min(max(float(step_eff) / float(warmup_steps), 0.0), 1.0)
+        return beta_target * progress
+
     grl_mode = str(cfg.get('grl_beta_mode', 'dann'))
-    if grl_mode not in {'dann', 'constant'}:
-        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann' or 'constant', got: {cfg.get('grl_beta_mode')}")
+    if grl_mode not in {'dann', 'constant', 'linear'}:
+        raise ValueError(f"cfg['grl_beta_mode'] must be 'dann', 'constant' or 'linear', got: {cfg.get('grl_beta_mode')}")
 
     def _make_graph_frequency_weights(graph_labels, k, device):
         k = int(k)
@@ -831,6 +955,56 @@ def train_and_validate(
 
         return torch.stack(losses).mean()
 
+    def _normalize_int_cfg(name, value, default_value):
+        if value is None:
+            return int(default_value)
+        if isinstance(value, bool):
+            raise ValueError(f"cfg['{name}'] must be an integer, got bool: {value}")
+        if isinstance(value, float) and not float(value).is_integer():
+            raise ValueError(f"cfg['{name}'] must be an integer, got: {value}")
+        return int(value)
+
+    def _plateau_mode_from_metric(metric_name):
+        if metric_name == 'val_avg_total_loss':
+            return 'min'
+        return 'max'
+
+    def _build_step_lr_scheduler(optimizer, scheduler_mode, total_steps, warmup_steps, min_lr_ratio):
+        if int(total_steps) <= 0:
+            return None
+
+        warmup_steps = max(0, int(warmup_steps))
+        eps = 1e-8
+
+        def _lr_scale(step_idx):
+            completed_steps = max(0, int(step_idx) + 1)
+            if scheduler_mode == 'linear':
+                progress = min(max(float(completed_steps) / float(max(int(total_steps), 1)), 0.0), 1.0)
+                return 1.0 - (1.0 - float(min_lr_ratio)) * progress
+            if scheduler_mode == 'cosine':
+                progress = min(max(float(completed_steps) / float(max(int(total_steps), 1)), 0.0), 1.0)
+                return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * 0.5 * (1.0 + math.cos(math.pi * progress))
+            if scheduler_mode == 'warmup_cosine':
+                if warmup_steps <= 0:
+                    progress = min(max(float(completed_steps) / float(max(int(total_steps), 1)), 0.0), 1.0)
+                    return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * 0.5 * (1.0 + math.cos(math.pi * progress))
+                if warmup_steps >= int(total_steps):
+                    progress = min(max(float(completed_steps) / float(max(int(total_steps), 1)), 0.0), 1.0)
+                    return max(eps, progress)
+                if completed_steps <= warmup_steps:
+                    progress = min(max(float(completed_steps) / float(max(warmup_steps, 1)), 0.0), 1.0)
+                    return max(eps, progress)
+                decay_steps = max(int(total_steps) - warmup_steps, 1)
+                decay_progress = min(max(float(completed_steps - warmup_steps) / float(decay_steps), 0.0), 1.0)
+                return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+            return 1.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_scale)
+        if scheduler_mode == 'warmup_cosine' and warmup_steps > 0:
+            for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
+                group['lr'] = float(base_lr) * eps
+        return scheduler
+
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
@@ -843,8 +1017,39 @@ def train_and_validate(
     opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     bce = nn.BCEWithLogitsLoss()
 
+    lr_scheduler_name = str(cfg.get('lr_scheduler', 'none')).lower()
+    if lr_scheduler_name not in {'none', 'linear', 'cosine', 'warmup_cosine', 'plateau'}:
+        raise ValueError(f"cfg['lr_scheduler'] must be one of none/linear/cosine/warmup_cosine/plateau, got: {cfg.get('lr_scheduler')}")
+    base_lr = float(cfg.get('lr', 0.0))
+    if base_lr <= 0:
+        raise ValueError(f"cfg['lr'] must be > 0, got: {cfg.get('lr')}")
+    min_lr_ratio = float(cfg.get('min_lr_ratio', 0.01))
+    if not (0.0 < min_lr_ratio <= 1.0):
+        raise ValueError(f"cfg['min_lr_ratio'] must be in (0, 1], got: {min_lr_ratio}")
+    lr_warmup_epochs = _normalize_int_cfg('lr_warmup_epochs', cfg.get('lr_warmup_epochs', 10), 10)
+    plateau_metric = str(cfg.get('plateau_metric', 'val_accuracy'))
+    if plateau_metric not in {'val_accuracy', 'val_avg_total_loss', 'val_macro_f1', 'val_auroc', 'val_auprc'}:
+        raise ValueError(f"cfg['plateau_metric'] must be one of val_accuracy/val_avg_total_loss/val_macro_f1/val_auroc/val_auprc, got: {plateau_metric}")
+    plateau_factor = float(cfg.get('plateau_factor', 0.5))
+    if not (0.0 < plateau_factor < 1.0):
+        raise ValueError(f"cfg['plateau_factor'] must be in (0, 1), got: {plateau_factor}")
+    plateau_patience = _normalize_int_cfg('plateau_patience', cfg.get('plateau_patience', 10), 10)
+    plateau_cooldown = _normalize_int_cfg('plateau_cooldown', cfg.get('plateau_cooldown', 0), 0)
+    plateau_threshold = float(cfg.get('plateau_threshold', 1e-4))
+    if plateau_patience < 0:
+        raise ValueError(f"cfg['plateau_patience'] must be >= 0, got: {plateau_patience}")
+    if plateau_cooldown < 0:
+        raise ValueError(f"cfg['plateau_cooldown'] must be >= 0, got: {plateau_cooldown}")
+    if plateau_threshold < 0:
+        raise ValueError(f"cfg['plateau_threshold'] must be >= 0, got: {plateau_threshold}")
+
     train_loader = PyGDataLoader(train_graphs, batch_size=cfg['batch_size_graphs'], shuffle=True, num_workers=num_workers)
-    val_loader = PyGDataLoader(val_graphs, batch_size=1, shuffle=False, num_workers=max(0, min(num_workers, 2)))
+    val_loader = PyGDataLoader(
+        val_graphs,
+        batch_size=cfg['batch_size_graphs'],
+        shuffle=False,
+        num_workers=max(0, min(num_workers, 2)),
+    )
     extra_val_graphs = list(external_val_graphs) if external_val_graphs else []
 
     # domain class weights (graph-frequency, sqrt inverse freq; clamp + mean-normalize)
@@ -988,18 +1193,66 @@ def train_and_validate(
         'avg_mmd_raw_cancer': [],
         'train_batch_domain_acc': [],
         'train_cancer_domain_acc': [],
-        'var_risk': [],
+        # 2026-04 update: rename the former "var_risk" metric to
+        # "batch_loss_variance" to match its actual definition.
+        'batch_loss_variance': [],
         'train_accuracy': [],
+        'val_avg_total_loss': [],
+        'val_avg_task_loss': [],
+        'val_avg_batch_domain_loss': [],
+        'val_avg_cancer_domain_loss': [],
+        'val_avg_batch_domain_ce': [],
+        'val_avg_cancer_domain_ce': [],
+        'val_avg_mmd_loss': [],
+        'val_avg_mmd_raw_slide': [],
+        'val_avg_mmd_raw_cancer': [],
+        'val_batch_loss_variance': [],
         'val_accuracy': [],
         'val_macro_f1': [],
         'val_auroc': [],
         'val_auprc': [],
+        'lr': [],
     }
 
     epoch_iter = range(1, cfg['epochs'] + 1)
     if progress_desc:
         epoch_iter = tqdm(epoch_iter, desc=progress_desc, leave=progress_leave)
-    total_steps = int(cfg['epochs']) * max(1, len(train_loader))
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = int(cfg['epochs']) * steps_per_epoch
+    lr_warmup_steps = _epochs_to_steps(max(0, lr_warmup_epochs), steps_per_epoch)
+    lr_scheduler = None
+    if lr_scheduler_name in {'linear', 'cosine', 'warmup_cosine'}:
+        lr_scheduler = _build_step_lr_scheduler(
+            opt,
+            scheduler_mode=lr_scheduler_name,
+            total_steps=total_steps,
+            warmup_steps=lr_warmup_steps,
+            min_lr_ratio=min_lr_ratio,
+        )
+        if lr_scheduler is None:
+            print(f"[Warn] lr_scheduler='{lr_scheduler_name}' skipped because total_steps={total_steps}. Falling back to fixed lr.")
+    elif lr_scheduler_name == 'plateau':
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode=_plateau_mode_from_metric(plateau_metric),
+            factor=plateau_factor,
+            patience=plateau_patience,
+            threshold=plateau_threshold,
+            cooldown=plateau_cooldown,
+            min_lr=base_lr * min_lr_ratio,
+        )
+        if early_stop_enabled:
+            recommended_patience = max(plateau_patience + plateau_cooldown + 3, 2 * max(plateau_patience, 1))
+            print(
+                f"[Warn] lr_scheduler='plateau' is enabled together with early stopping "
+                f"(early_patience={early_patience}, plateau_patience={plateau_patience}, plateau_cooldown={plateau_cooldown}). "
+                f"These controls may compete. Recommend disabling early stopping (--early_patience 0), "
+                f"or increasing early_patience to at least {recommended_patience}."
+            )
+    slide_delay_steps = _epochs_to_steps(cfg.get('grl_beta_slide_delay_epochs', 1), steps_per_epoch)
+    slide_warmup_steps = _epochs_to_steps(cfg.get('grl_beta_slide_warmup_epochs', 8), steps_per_epoch)
+    cancer_delay_steps = _epochs_to_steps(cfg.get('grl_beta_cancer_delay_epochs', 3), steps_per_epoch)
+    cancer_warmup_steps = _epochs_to_steps(cfg.get('grl_beta_cancer_warmup_epochs', 12), steps_per_epoch)
     global_step = 0
     for epoch in epoch_iter:
         model.train()
@@ -1028,11 +1281,35 @@ def train_and_validate(
             if grl_mode == 'constant':
                 grl_beta_slide = float(cfg.get('grl_beta_slide_target', 1.0))
                 grl_beta_cancer = float(cfg.get('grl_beta_cancer_target', 0.5))
-            else:
-                p = float(global_step) / float(total_steps) if total_steps > 0 else 0.0
+            elif grl_mode == 'dann':
                 beta_gamma = float(cfg.get('grl_beta_gamma', 10.0))
-                grl_beta_slide = _dann_beta(p, float(cfg.get('grl_beta_slide_target', 1.0)), beta_gamma)
-                grl_beta_cancer = _dann_beta(p, float(cfg.get('grl_beta_cancer_target', 0.5)), beta_gamma)
+                grl_beta_slide = _dann_beta_with_delay(
+                    global_step,
+                    total_steps,
+                    float(cfg.get('grl_beta_slide_target', 1.0)),
+                    beta_gamma,
+                    slide_delay_steps,
+                )
+                grl_beta_cancer = _dann_beta_with_delay(
+                    global_step,
+                    total_steps,
+                    float(cfg.get('grl_beta_cancer_target', 0.5)),
+                    beta_gamma,
+                    cancer_delay_steps,
+                )
+            else:
+                grl_beta_slide = _linear_warmup_beta(
+                    global_step,
+                    float(cfg.get('grl_beta_slide_target', 1.0)),
+                    slide_delay_steps,
+                    slide_warmup_steps,
+                )
+                grl_beta_cancer = _linear_warmup_beta(
+                    global_step,
+                    float(cfg.get('grl_beta_cancer_target', 0.5)),
+                    cancer_delay_steps,
+                    cancer_warmup_steps,
+                )
             out = model(
                 batch.x,
                 batch.edge_index,
@@ -1070,6 +1347,8 @@ def train_and_validate(
             ) = _compute_losses(out, batch)
             loss_total.backward()
             opt.step()
+            if lr_scheduler is not None and lr_scheduler_name in {'linear', 'cosine', 'warmup_cosine'}:
+                lr_scheduler.step()
 
             tot_total += float(loss_total.item())
             tot_task += float(loss_task.item())
@@ -1108,7 +1387,8 @@ def train_and_validate(
         avg_mmd_raw_cancer = (tot_mmd_raw_cancer / cnt_mmd_cancer) if cnt_mmd_cancer > 0 else float('nan')
         train_batch_domain_acc = float(dom_slide_correct / dom_slide_total) if dom_slide_total > 0 else float('nan')
         train_cancer_domain_acc = float(dom_cancer_correct / dom_cancer_total) if dom_cancer_total > 0 else float('nan')
-        var_risk = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
+        # batch_loss_variance is the per-epoch variance of mini-batch total loss.
+        batch_loss_variance = float(np.mean([(v - avg_total) ** 2 for v in batch_losses])) if batch_losses else float('nan')
         train_accuracy = float(train_correct / train_total) if train_total > 0 else float('nan')
 
         hist['avg_total_loss'].append(avg_total)
@@ -1122,7 +1402,7 @@ def train_and_validate(
         hist['avg_mmd_raw_cancer'].append(avg_mmd_raw_cancer)
         hist['train_batch_domain_acc'].append(train_batch_domain_acc)
         hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
-        hist['var_risk'].append(var_risk)
+        hist['batch_loss_variance'].append(batch_loss_variance)
         hist['train_accuracy'].append(train_accuracy)
 
         # 验证（内部 + 外部）
@@ -1130,6 +1410,19 @@ def train_and_validate(
         val_logits_list = []
         val_y_list = []
         per_slide_acc = []
+        val_tot_total = 0.0
+        val_tot_task = 0.0
+        val_tot_batch = 0.0
+        val_tot_cancer = 0.0
+        val_tot_batch_ce = 0.0
+        val_tot_cancer_ce = 0.0
+        val_tot_mmd = 0.0
+        val_tot_mmd_raw_slide = 0.0
+        val_tot_mmd_raw_cancer = 0.0
+        val_cnt_mmd_slide = 0
+        val_cnt_mmd_cancer = 0
+        val_num_batches = 0
+        val_batch_losses = []
         with torch.no_grad():
             for vb in val_loader:
                 vb = vb.to(device)
@@ -1138,12 +1431,41 @@ def train_and_validate(
                     vb.edge_index,
                     batch=getattr(vb, 'batch', None),
                     edge_weight=getattr(vb, 'edge_weight', None),
+                    return_h=bool(cfg.get('use_mmd', False)),
                 )
+                (
+                    val_loss_total,
+                    val_loss_task,
+                    val_loss_batch,
+                    val_loss_cancer,
+                    val_loss_mmd,
+                    val_ce_batch,
+                    val_ce_cancer,
+                    val_raw_mmd_slide,
+                    val_raw_mmd_cancer,
+                ) = _compute_losses(out_v, vb)
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
                 val_y_list.append(vb.y.cpu())
                 m_slide = eval_logits(logits_v, vb.y)
                 per_slide_acc.append(m_slide.get('accuracy', float('nan')))
+                val_tot_total += float(val_loss_total.item())
+                val_tot_task += float(val_loss_task.item())
+                val_tot_batch += float(val_loss_batch.item())
+                val_tot_cancer += float(val_loss_cancer.item())
+                val_tot_mmd += float(val_loss_mmd.item())
+                if torch.isfinite(val_ce_batch):
+                    val_tot_batch_ce += float(val_ce_batch.item())
+                if torch.isfinite(val_ce_cancer):
+                    val_tot_cancer_ce += float(val_ce_cancer.item())
+                if torch.isfinite(val_raw_mmd_slide):
+                    val_tot_mmd_raw_slide += float(val_raw_mmd_slide.item())
+                    val_cnt_mmd_slide += 1
+                if torch.isfinite(val_raw_mmd_cancer):
+                    val_tot_mmd_raw_cancer += float(val_raw_mmd_cancer.item())
+                    val_cnt_mmd_cancer += 1
+                val_batch_losses.append(float(val_loss_total.item()))
+                val_num_batches += 1
 
             for g in extra_val_graphs:
                 vg = g.to(device)
@@ -1152,12 +1474,41 @@ def train_and_validate(
                     vg.edge_index,
                     batch=getattr(vg, 'batch', None),
                     edge_weight=getattr(vg, 'edge_weight', None),
+                    return_h=bool(cfg.get('use_mmd', False)),
                 )
+                (
+                    val_loss_total,
+                    val_loss_task,
+                    val_loss_batch,
+                    val_loss_cancer,
+                    val_loss_mmd,
+                    val_ce_batch,
+                    val_ce_cancer,
+                    val_raw_mmd_slide,
+                    val_raw_mmd_cancer,
+                ) = _compute_losses(out_v, vg)
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
                 val_y_list.append(vg.y.cpu())
                 m_slide = eval_logits(logits_v, vg.y)
                 per_slide_acc.append(m_slide.get('accuracy', float('nan')))
+                val_tot_total += float(val_loss_total.item())
+                val_tot_task += float(val_loss_task.item())
+                val_tot_batch += float(val_loss_batch.item())
+                val_tot_cancer += float(val_loss_cancer.item())
+                val_tot_mmd += float(val_loss_mmd.item())
+                if torch.isfinite(val_ce_batch):
+                    val_tot_batch_ce += float(val_ce_batch.item())
+                if torch.isfinite(val_ce_cancer):
+                    val_tot_cancer_ce += float(val_ce_cancer.item())
+                if torch.isfinite(val_raw_mmd_slide):
+                    val_tot_mmd_raw_slide += float(val_raw_mmd_slide.item())
+                    val_cnt_mmd_slide += 1
+                if torch.isfinite(val_raw_mmd_cancer):
+                    val_tot_mmd_raw_cancer += float(val_raw_mmd_cancer.item())
+                    val_cnt_mmd_cancer += 1
+                val_batch_losses.append(float(val_loss_total.item()))
+                val_num_batches += 1
 
         if val_logits_list and val_y_list:
             val_logits = torch.cat(val_logits_list, dim=0)
@@ -1166,7 +1517,27 @@ def train_and_validate(
         else:
             m = {'auroc': float('nan'), 'auprc': float('nan'), 'accuracy': float('nan'), 'macro_f1': float('nan')}
 
+        val_avg_total = val_tot_total / max(1, val_num_batches)
+        val_avg_task = val_tot_task / max(1, val_num_batches)
+        val_avg_batch = val_tot_batch / max(1, val_num_batches)
+        val_avg_cancer = val_tot_cancer / max(1, val_num_batches)
+        val_avg_mmd = val_tot_mmd / max(1, val_num_batches)
+        val_avg_batch_ce = (val_tot_batch_ce / max(1, val_num_batches)) if cfg.get('use_domain_adv_slide', False) else float('nan')
+        val_avg_cancer_ce = (val_tot_cancer_ce / max(1, val_num_batches)) if cfg.get('use_domain_adv_cancer', False) else float('nan')
+        val_avg_mmd_raw_slide = (val_tot_mmd_raw_slide / val_cnt_mmd_slide) if val_cnt_mmd_slide > 0 else float('nan')
+        val_avg_mmd_raw_cancer = (val_tot_mmd_raw_cancer / val_cnt_mmd_cancer) if val_cnt_mmd_cancer > 0 else float('nan')
+        val_batch_loss_variance = float(np.mean([(v - val_avg_total) ** 2 for v in val_batch_losses])) if val_batch_losses else float('nan')
         val_accuracy = float(np.nanmean(per_slide_acc)) if per_slide_acc else float('nan')
+        hist['val_avg_total_loss'].append(val_avg_total)
+        hist['val_avg_task_loss'].append(val_avg_task)
+        hist['val_avg_batch_domain_loss'].append(val_avg_batch)
+        hist['val_avg_cancer_domain_loss'].append(val_avg_cancer)
+        hist['val_avg_batch_domain_ce'].append(val_avg_batch_ce)
+        hist['val_avg_cancer_domain_ce'].append(val_avg_cancer_ce)
+        hist['val_avg_mmd_loss'].append(val_avg_mmd)
+        hist['val_avg_mmd_raw_slide'].append(val_avg_mmd_raw_slide)
+        hist['val_avg_mmd_raw_cancer'].append(val_avg_mmd_raw_cancer)
+        hist['val_batch_loss_variance'].append(val_batch_loss_variance)
         hist['val_accuracy'].append(val_accuracy)
         hist['val_macro_f1'].append(m.get('macro_f1', float('nan')))
         hist['val_auroc'].append(m.get('auroc', float('nan')))
@@ -1178,6 +1549,24 @@ def train_and_validate(
             'auroc': m.get('auroc', float('nan')),
             'auprc': m.get('auprc', float('nan')),
         }
+        plateau_metrics = {
+            'val_accuracy': val_accuracy,
+            'val_avg_total_loss': val_avg_total,
+            'val_macro_f1': m.get('macro_f1', float('nan')),
+            'val_auroc': m.get('auroc', float('nan')),
+            'val_auprc': m.get('auprc', float('nan')),
+        }
+        if lr_scheduler is not None and lr_scheduler_name == 'plateau':
+            monitored_metric = plateau_metrics.get(plateau_metric, float('nan'))
+            if np.isfinite(monitored_metric):
+                lr_scheduler.step(float(monitored_metric))
+            else:
+                print(
+                    f"[Warn] Skip ReduceLROnPlateau.step at epoch {epoch} because "
+                    f"{plateau_metric} is not finite: {monitored_metric}"
+                )
+        current_lr = float(opt.param_groups[0]['lr']) if opt.param_groups else float('nan')
+        hist['lr'].append(current_lr)
         last_epoch = int(epoch)
         last_metrics = dict(metrics)
         if report_cb is not None:
@@ -1191,7 +1580,8 @@ def train_and_validate(
                 epoch_iter.set_postfix(
                     train_loss=f'{avg_total:.3f}',
                     mmd=f'{avg_mmd:.3f}',
-                    val_acc=f'{val_accuracy:.3f}'
+                    val_acc=f'{val_accuracy:.3f}',
+                    lr=f'{current_lr:.2e}'
                 )
             except Exception:
                 pass
@@ -1229,9 +1619,10 @@ def _save_loss_components_csv(hist, out_dir):
         return None
     df = pd.DataFrame({
         'epoch': range(1, n_epochs + 1),
+        'lr': hist.get('lr', [float('nan')] * n_epochs),
         'avg_total_loss': hist.get('avg_total_loss', [float('nan')] * n_epochs),
         'avg_task_loss': hist.get('avg_task_loss', [float('nan')] * n_epochs),
-        'Var_risk': hist.get('var_risk', [float('nan')] * n_epochs),
+        'batch_loss_variance': hist.get('batch_loss_variance', [float('nan')] * n_epochs),
         'avg_cancer_domain_ce': hist.get('avg_cancer_domain_ce', [float('nan')] * n_epochs),
         'avg_batch_domain_ce': hist.get('avg_batch_domain_ce', [float('nan')] * n_epochs),
         'avg_cancer_domain_loss': hist.get('avg_cancer_domain_loss', [float('nan')] * n_epochs),
@@ -1242,6 +1633,16 @@ def _save_loss_components_csv(hist, out_dir):
         'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
         'train_cancer_domain_acc': hist.get('train_cancer_domain_acc', [float('nan')] * n_epochs),
         'train_accuracy': hist.get('train_accuracy', [float('nan')] * n_epochs),
+        'val_avg_total_loss': hist.get('val_avg_total_loss', [float('nan')] * n_epochs),
+        'val_avg_task_loss': hist.get('val_avg_task_loss', [float('nan')] * n_epochs),
+        'val_batch_loss_variance': hist.get('val_batch_loss_variance', [float('nan')] * n_epochs),
+        'val_avg_cancer_domain_ce': hist.get('val_avg_cancer_domain_ce', [float('nan')] * n_epochs),
+        'val_avg_batch_domain_ce': hist.get('val_avg_batch_domain_ce', [float('nan')] * n_epochs),
+        'val_avg_cancer_domain_loss': hist.get('val_avg_cancer_domain_loss', [float('nan')] * n_epochs),
+        'val_avg_batch_domain_loss': hist.get('val_avg_batch_domain_loss', [float('nan')] * n_epochs),
+        'val_avg_mmd_loss': hist.get('val_avg_mmd_loss', [float('nan')] * n_epochs),
+        'val_avg_mmd_raw_slide': hist.get('val_avg_mmd_raw_slide', [float('nan')] * n_epochs),
+        'val_avg_mmd_raw_cancer': hist.get('val_avg_mmd_raw_cancer', [float('nan')] * n_epochs),
         'val_accuracy': hist.get('val_accuracy', [float('nan')] * n_epochs),
         'val_macro_f1': hist.get('val_macro_f1', [float('nan')] * n_epochs),
         'val_auroc': hist.get('val_auroc', [float('nan')] * n_epochs),
@@ -1255,22 +1656,23 @@ def _save_loss_components_csv(hist, out_dir):
 def _plot_train_metrics(hist, out_dir):
     n_epochs = len(hist.get('avg_total_loss', []))
     if n_epochs == 0:
-        return None, None
+        return None, None, None, None
     epochs = list(range(1, n_epochs + 1))
-    line_color = '#1f3a5f'
+    train_color = '#1f3a5f'
+    val_color = '#d97757'
     do_smooth = n_epochs > 100
     smooth_window = 10
     raw_alpha = 0.35
     raw_lw = 0.6
     smooth_lw = 1.4
 
-    def _plot_neurips(ax, values, title):
+    def _draw_series(ax, values, color, label=None):
         series = pd.Series(values, dtype='float64')
         if do_smooth:
             ax.plot(
                 epochs,
                 series.values,
-                color=line_color,
+                color=color,
                 linewidth=raw_lw,
                 alpha=raw_alpha,
             )
@@ -1278,29 +1680,46 @@ def _plot_train_metrics(hist, out_dir):
             ax.plot(
                 epochs,
                 smooth.values,
-                color=line_color,
+                color=color,
                 linewidth=smooth_lw,
+                label=label,
             )
         else:
             ax.plot(
                 epochs,
                 series.values,
-                color=line_color,
+                color=color,
                 linewidth=smooth_lw,
+                label=label,
             )
 
+    def _plot_neurips(ax, values, title, val_values=None):
+        _draw_series(ax, values, train_color, label='train' if val_values is not None else None)
+        if val_values is not None:
+            _draw_series(ax, val_values, val_color, label='val')
         ax.set_title(title)
         ax.set_xlabel('Epoch')
         ax.spines['top'].set_visible(True)
         ax.spines['right'].set_visible(True)
+        if val_values is not None:
+            ax.legend(loc='best', fontsize=8, frameon=False)
 
-    # 1) 训练损失图（3x3）
+    # 1) 学习率曲线
+    fig_lr, ax_lr = plt.subplots(1, 1, figsize=(8, 4.5), sharex=True)
+    lr_values = hist.get('lr', [float('nan')] * n_epochs)
+    _plot_neurips(ax_lr, lr_values, 'lr')
+    fig_lr.tight_layout()
+    out_lr_svg = os.path.join(out_dir, 'lr.svg')
+    fig_lr.savefig(out_lr_svg, format='svg', dpi=150)
+    plt.close(fig_lr)
+
+    # 2) 训练损失图（3x3）
     fig1, axes1 = plt.subplots(3, 3, figsize=(16, 10), sharex=True)
     metrics_train = [
         ('avg_total_loss', 'avg_total_loss'),
         ('avg_task_loss', 'avg_task_loss'),
         ('avg_mmd_loss', 'avg_mmd_loss'),
-        ('var_risk', 'Var_risk'),
+        ('batch_loss_variance', 'batch_loss_variance'),
         ('avg_cancer_domain_loss', 'avg_cancer_domain_loss'),
         ('avg_batch_domain_loss', 'avg_batch_domain_loss'),
         ('avg_mmd_raw_slide', 'avg_mmd_raw_slide'),
@@ -1319,6 +1738,32 @@ def _plot_train_metrics(hist, out_dir):
     fig1.savefig(out_train_svg, format='svg', dpi=150)
     plt.close(fig1)
 
+    # 3) 训练/验证损失对照图（3x3）
+    fig_mid, axes_mid = plt.subplots(3, 3, figsize=(16, 10), sharex=True)
+    metrics_train_val = [
+        ('avg_total_loss', 'val_avg_total_loss', 'avg_total_loss'),
+        ('avg_task_loss', 'val_avg_task_loss', 'avg_task_loss'),
+        ('avg_mmd_loss', 'val_avg_mmd_loss', 'avg_mmd_loss'),
+        ('batch_loss_variance', 'val_batch_loss_variance', 'batch_loss_variance'),
+        ('avg_cancer_domain_loss', 'val_avg_cancer_domain_loss', 'avg_cancer_domain_loss'),
+        ('avg_batch_domain_loss', 'val_avg_batch_domain_loss', 'avg_batch_domain_loss'),
+        ('avg_mmd_raw_slide', 'val_avg_mmd_raw_slide', 'avg_mmd_raw_slide'),
+        ('avg_mmd_raw_cancer', 'val_avg_mmd_raw_cancer', 'avg_mmd_raw_cancer'),
+        ('train_accuracy', 'val_accuracy', 'accuracy'),
+    ]
+    for ax, (train_key, val_key, title) in zip(axes_mid.flatten(), metrics_train_val):
+        train_values = hist.get(train_key, [float('nan')] * n_epochs)
+        val_values = hist.get(val_key, [float('nan')] * n_epochs)
+        _plot_neurips(ax, train_values, title, val_values=val_values)
+    for ax in axes_mid[0]:
+        ax.tick_params(labelbottom=True)
+    for ax in axes_mid[1]:
+        ax.tick_params(labelbottom=True)
+    fig_mid.tight_layout()
+    out_train_val_loss_svg = os.path.join(out_dir, 'train_val_loss.svg')
+    fig_mid.savefig(out_train_val_loss_svg, format='svg', dpi=150)
+    plt.close(fig_mid)
+
     # 2) 验证指标图（2x2）
     fig2, axes2 = plt.subplots(2, 2, figsize=(10, 7), sharex=True)
     metrics_val = [
@@ -1336,7 +1781,15 @@ def _plot_train_metrics(hist, out_dir):
     out_val_svg = os.path.join(out_dir, 'train_val_metrics.svg')
     fig2.savefig(out_val_svg, format='svg', dpi=150)
     plt.close(fig2)
-    return out_train_svg, out_val_svg
+    return out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg
+
+
+def _count_seen_domains(graphs):
+    batch_seen = {int(g.bat_dom.item()) for g in graphs if hasattr(g, 'bat_dom')}
+    cancer_seen = {int(g.cancer_dom.item()) for g in graphs if hasattr(g, 'cancer_dom')}
+    n_batch = len(batch_seen) if batch_seen else None
+    n_cancer = len(cancer_seen) if cancer_seen else None
+    return n_batch, n_cancer
 
 
 def _plot_domain_diagnostics(
@@ -1425,7 +1878,7 @@ def _plot_domain_diagnostics(
     else:
         ax1.plot(epochs, batch_ce.values, linewidth=smooth_lw, color=line_color, label='CE')
     if n_domains_batch is not None and int(n_domains_batch) > 0:
-        ax1.axhline(float(np.log(int(n_domains_batch))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (random guess, log({int(n_domains_batch)}))')
+        ax1.axhline(float(np.log(int(n_domains_batch))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (train, log({int(n_domains_batch)}))')
     ax1.set_title('Batch Domain CE')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Cross-Entropy (unweighted)')
@@ -1442,7 +1895,7 @@ def _plot_domain_diagnostics(
     else:
         ax2.plot(epochs, batch_acc.values, linewidth=smooth_lw, color=line_color, label='Accuracy')
     if n_domains_batch is not None and int(n_domains_batch) > 0:
-        ax2.axhline(1.0 / float(int(n_domains_batch)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (random, 1/{int(n_domains_batch)})')
+        ax2.axhline(1.0 / float(int(n_domains_batch)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (train, 1/{int(n_domains_batch)})')
     ax2.set_title('Batch Domain Accuracy')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Accuracy')
@@ -1459,7 +1912,7 @@ def _plot_domain_diagnostics(
     else:
         ax3.plot(epochs, cancer_ce.values, linewidth=smooth_lw, color=line_color, label='CE')
     if n_domains_cancer is not None and int(n_domains_cancer) > 0:
-        ax3.axhline(float(np.log(int(n_domains_cancer))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (random guess, log({int(n_domains_cancer)}))')
+        ax3.axhline(float(np.log(int(n_domains_cancer))), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance (train, log({int(n_domains_cancer)}))')
     ax3.set_title('Cancer Domain CE')
     ax3.set_xlabel('Epoch')
     ax3.set_ylabel('Cross-Entropy (unweighted)')
@@ -1476,7 +1929,7 @@ def _plot_domain_diagnostics(
     else:
         ax4.plot(epochs, cancer_acc.values, linewidth=smooth_lw, color=line_color, label='Accuracy')
     if n_domains_cancer is not None and int(n_domains_cancer) > 0:
-        ax4.axhline(1.0 / float(int(n_domains_cancer)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (random, 1/{int(n_domains_cancer)})')
+        ax4.axhline(1.0 / float(int(n_domains_cancer)), color=line_color, linestyle='--', linewidth=chance_lw, label=f'Chance accuracy (train, 1/{int(n_domains_cancer)})')
     ax4.set_title('Cancer Domain Accuracy')
     ax4.set_xlabel('Epoch')
     ax4.set_ylabel('Accuracy')
@@ -1497,6 +1950,7 @@ def run_single_training(args, cfg, device):
     """原始的单次训练逻辑（现支持双域对抗）"""
     
     train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer = prepare_graphs(args, cfg, save_preprocessor_dir=args.artifacts_dir)
+    train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
 
     external_val_graphs = _build_external_val_graphs(args, cfg, args.artifacts_dir)
 
@@ -1567,16 +2021,20 @@ def run_single_training(args, cfg, device):
     try:
         os.makedirs(args.artifacts_dir, exist_ok=True)
         if getattr(args, 'save_train_curves', 1):
-            out_train_svg, out_val_svg = _plot_train_metrics(hist, args.artifacts_dir)
+            out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg = _plot_train_metrics(hist, args.artifacts_dir)
+            if out_lr_svg:
+                print('Saved learning-rate figure to', out_lr_svg)
             if out_train_svg:
                 print('Saved training loss figure to', out_train_svg)
+            if out_train_val_loss_svg:
+                print('Saved training/validation loss figure to', out_train_val_loss_svg)
             if out_val_svg:
                 print('Saved validation metrics figure to', out_val_svg)
             out_dom_svg = _plot_domain_diagnostics(
                 hist,
                 args.artifacts_dir,
-                n_domains_batch=n_domains_batch,
-                n_domains_cancer=n_domains_cancer,
+                n_domains_batch=train_seen_n_domains_batch,
+                n_domains_cancer=train_seen_n_domains_cancer,
                 lambda_slide=cfg.get('lambda_slide', 0.0),
                 lambda_cancer=cfg.get('lambda_cancer', 0.0),
             )
@@ -1801,19 +2259,24 @@ def run_kfold_training(args, cfg, device):
             progress_leave=False,
             capture_last_state=bool(getattr(args, 'save_last', False)),
         )
+        train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
 
         if getattr(args, 'save_train_curves', 1):
             try:
-                out_train_svg, out_val_svg = _plot_train_metrics(hist, fold_dir)
+                out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg = _plot_train_metrics(hist, fold_dir)
+                if out_lr_svg:
+                    print(f'[KFold] Saved learning-rate figure to {out_lr_svg}')
                 if out_train_svg:
                     print(f'[KFold] Saved training loss figure to {out_train_svg}')
+                if out_train_val_loss_svg:
+                    print(f'[KFold] Saved training/validation loss figure to {out_train_val_loss_svg}')
                 if out_val_svg:
                     print(f'[KFold] Saved validation metrics figure to {out_val_svg}')
                 out_dom_svg = _plot_domain_diagnostics(
                     hist,
                     fold_dir,
-                    n_domains_batch=n_domains_batch,
-                    n_domains_cancer=n_domains_cancer,
+                    n_domains_batch=train_seen_n_domains_batch,
+                    n_domains_cancer=train_seen_n_domains_cancer,
                     lambda_slide=cfg.get('lambda_slide', 0.0),
                     lambda_cancer=cfg.get('lambda_cancer', 0.0),
                 )
@@ -2187,19 +2650,24 @@ def run_loco_training(args, cfg, device):
             progress_leave=False,
             capture_last_state=bool(getattr(args, 'save_last', False)),
         )
+        train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
 
         if getattr(args, 'save_train_curves', 1):
             try:
-                out_train_svg, out_val_svg = _plot_train_metrics(hist, loco_dir)
+                out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg = _plot_train_metrics(hist, loco_dir)
+                if out_lr_svg:
+                    print(f'[LOCO] Saved learning-rate figure to {out_lr_svg}')
                 if out_train_svg:
                     print(f'[LOCO] Saved training loss figure to {out_train_svg}')
+                if out_train_val_loss_svg:
+                    print(f'[LOCO] Saved training/validation loss figure to {out_train_val_loss_svg}')
                 if out_val_svg:
                     print(f'[LOCO] Saved validation metrics figure to {out_val_svg}')
                 out_dom_svg = _plot_domain_diagnostics(
                     hist,
                     loco_dir,
-                    n_domains_batch=n_domains_batch,
-                    n_domains_cancer=n_domains_cancer,
+                    n_domains_batch=train_seen_n_domains_batch,
+                    n_domains_cancer=train_seen_n_domains_cancer,
                     lambda_slide=cfg.get('lambda_slide', 0.0),
                     lambda_cancer=cfg.get('lambda_cancer', 0.0),
                 )

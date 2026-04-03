@@ -11,14 +11,34 @@ def _sample_rows(df: pd.DataFrame, max_points: int | None, seed: int) -> pd.Data
     max_points = int(max_points)
     if max_points <= 0 or len(df) <= max_points:
         return df
-    return df.sample(n=max_points, random_state=int(seed)).reset_index(drop=True)
+    if 'sample_id' not in df.columns:
+        return df.sample(n=max_points, random_state=int(seed)).reset_index(drop=True)
+
+    # Keep roughly the same sampling fraction for every sample_id instead of
+    # letting large samples dominate the subsample.
+    sample_frac = float(max_points) / float(len(df))
+    parts = []
+    for _, group in df.groupby('sample_id', sort=True):
+        n_keep = int(np.ceil(len(group) * sample_frac))
+        n_keep = min(len(group), max(1, n_keep))
+        if n_keep >= len(group):
+            parts.append(group)
+        else:
+            parts.append(group.sample(n=n_keep, random_state=int(seed)))
+    return pd.concat(parts, axis=0).reset_index(drop=True)
 
 
 def _get_embedding(df: pd.DataFrame, embed_source: str) -> np.ndarray:
-    prefix = f'{embed_source}_'
-    cols = [c for c in df.columns if c.startswith(prefix)]
+    prefixes = [f'{embed_source}_']
+    if embed_source == 'z_clf':
+        prefixes.append('z64_')
+    cols = []
+    for prefix in prefixes:
+        cols = [c for c in df.columns if c.startswith(prefix)]
+        if cols:
+            break
     if len(cols) < 2:
-        raise ValueError(f'Expected >=2 columns starting with {prefix}, got {len(cols)}')
+        raise ValueError(f'Expected >=2 embedding columns for source {embed_source}, got {len(cols)}')
     cols = sorted(cols, key=lambda x: int(x.split('_')[-1]))
     return df[cols].to_numpy(dtype=float)
 
@@ -151,7 +171,7 @@ def _plot_two_panels(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize exported h/z64 embeddings with UMAP + t-SNE.')
+    parser = argparse.ArgumentParser(description='Visualize exported h/classifier-latent embeddings with UMAP + t-SNE.')
     parser.add_argument('--embeddings_csv', required=True, help='CSV produced by export_spot_embeddings.py')
     parser.add_argument('--out_dir', default=None, help='Output directory for SVGs (default: same as embeddings_csv)')
     parser.add_argument('--max_points', type=int, default=None, help='Optional subsample for speed (e.g. 50000)')
@@ -160,9 +180,9 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.8, help='Scatter alpha')
     parser.add_argument(
         '--embed_source',
-        choices=['h', 'z64'],
+        choices=['h', 'z_clf', 'z64'],
         default='h',
-        help='Which embedding columns to visualize: h_* or z64_*.',
+        help='Which embedding columns to visualize: h_*, z_clf_*; z64 is kept as a legacy option.',
     )
     args = parser.parse_args()
 

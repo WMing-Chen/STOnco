@@ -31,6 +31,11 @@ class InferenceEngine:
         self.cfg.setdefault('use_image_features', False)
         self.cfg.setdefault('img_use_pca', True)
         self.cfg.setdefault('img_pca_dim', 256)
+        clf_hidden = self.cfg.get('clf_hidden', [256, 128, 64])
+        if isinstance(clf_hidden, str):
+            clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+        self.cfg['clf_hidden'] = [int(x) for x in clf_hidden]
+        self.cfg.setdefault('clf_latent_dim', int(self.cfg['clf_hidden'][-1]))
         self.cfg = normalize_gnn_config(self.cfg)
 
         self.pp = Preprocessor.load(artifacts_dir)
@@ -49,6 +54,7 @@ class InferenceEngine:
             if isinstance(clf_hidden, str):
                 clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
             clf_hidden = [int(x) for x in clf_hidden]
+            self.cfg['clf_latent_dim'] = int(clf_hidden[-1])
             m = STOnco_Classifier(
                 in_dim=in_dim,
                 hidden=self.cfg['GNN_hidden'],

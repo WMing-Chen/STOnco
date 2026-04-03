@@ -94,41 +94,35 @@ class ClassifierHead(nn.Module):
         if hidden_dims is None:
             hidden_dims = (256, 128, 64)
         hidden_dims = tuple(int(x) for x in hidden_dims)
-        if len(hidden_dims) != 3:
-            raise ValueError(f'clf_hidden must have exactly 3 integers (h1,h2,64), got {hidden_dims}')
-        if int(hidden_dims[-1]) != 64:
-            raise ValueError(f'clf_hidden must end with 64 (to keep z64 compatible), got {hidden_dims}')
+        if len(hidden_dims) < 1:
+            raise ValueError(f'clf_hidden must contain at least 1 integer, got {hidden_dims}')
+        if any(int(h) <= 0 for h in hidden_dims):
+            raise ValueError(f'clf_hidden must contain only positive integers, got {hidden_dims}')
 
-        h1, h2, h3 = (int(hidden_dims[0]), int(hidden_dims[1]), int(hidden_dims[2]))
-
-        self.fc1 = nn.Linear(in_dim, h1)
-        self.bn1 = nn.BatchNorm1d(h1)
-        self.fc2 = nn.Linear(h1, h2)
-        self.bn2 = nn.BatchNorm1d(h2)
-        self.fc3 = nn.Linear(h2, h3)
-        self.bn3 = nn.BatchNorm1d(h3)
-        self.fc4 = nn.Linear(h3, 1)
+        self.hidden_dims = hidden_dims
+        self.hidden_layers = nn.ModuleList()
+        self.hidden_bns = nn.ModuleList()
+        dim_prev = int(in_dim)
+        for hidden_dim in self.hidden_dims:
+            hidden_dim = int(hidden_dim)
+            self.hidden_layers.append(nn.Linear(dim_prev, hidden_dim))
+            self.hidden_bns.append(nn.BatchNorm1d(hidden_dim))
+            dim_prev = hidden_dim
+        self.fc_out = nn.Linear(dim_prev, 1)
         self.drop = nn.Dropout(float(dropout))
+        self.latent_dim = int(self.hidden_dims[-1])
 
     def forward(self, h, return_z=False):
-        x = self.fc1(h)
-        x = self.bn1(x)
-        x = F.relu(x)
-        x = self.drop(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.relu(x)
-        x = self.drop(x)
-
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = F.relu(x)
-        z64 = self.drop(x)
-
-        logits = self.fc4(z64).squeeze(-1)
+        x = h
+        for fc, bn in zip(self.hidden_layers, self.hidden_bns):
+            x = fc(x)
+            x = bn(x)
+            x = F.relu(x)
+            x = self.drop(x)
+        z_clf = x
+        logits = self.fc_out(z_clf).squeeze(-1)
         if return_z:
-            return logits, z64
+            return logits, z_clf
         return logits, None
 
 class DomainHead(nn.Module):
@@ -183,7 +177,7 @@ class STOnco_Classifier(nn.Module):
         return_h=False,
     ):
         h = self.gnn(x, edge_index, edge_weight=edge_weight)
-        logits, z64 = self.clf(h, return_z=return_z)
+        logits, z_clf = self.clf(h, return_z=return_z)
         dom_logits_slide = None
         dom_logits_cancer = None
         if (self.dom_slide is not None) or (self.dom_cancer is not None):
@@ -193,7 +187,9 @@ class STOnco_Classifier(nn.Module):
                 dom_logits_cancer = self.dom_cancer(grad_reverse(h, grl_beta_cancer))
         out = {'logits': logits, 'dom_logits_slide': dom_logits_slide, 'dom_logits_cancer': dom_logits_cancer}
         if return_z:
-            out['z64'] = z64
+            out['z_clf'] = z_clf
+            if int(z_clf.shape[1]) == 64:
+                out['z64'] = z_clf
         if return_h:
             out['h'] = h
         return out

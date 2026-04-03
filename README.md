@@ -91,7 +91,7 @@ When `--use_image_features 1`, training also saves the image preprocessor artifa
 If `--img_use_pca 1`, training requires the number of valid image spots (where `img_mask==1`) to be at least `--img_pca_dim`.
 
 Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics. The `meta.json` now records `train_ids`, `val_ids`, and `metrics` for reproducibility. You can control validation splitting with `--val_ratio` (default 0.2) or disable stratification via `--no_stratify_by_cancer`.
-You can also adjust the classifier/domain-head widths via `--clf_hidden` (must end with 64) and `--dom_hidden` (one hidden layer for both domain heads); values are saved into `meta.json` to keep inference consistent.
+You can also adjust the classifier/domain-head widths via `--clf_hidden` (comma-separated positive integers, variable depth) and `--dom_hidden` (one hidden layer for both domain heads); values are saved into `meta.json` to keep inference consistent.
 If you want the final saved `model.pt` to be the last epoch (instead of best-by-validation), use `--save_last` (only overwrites `model.pt` when training actually reaches `--epochs`; you can disable early stopping with `--early_patience 0`). When enabled, the best checkpoint is also saved as `model_best.pt`, and `meta.json` includes `last_epoch/last_metrics/saved_checkpoint`.
 Disable early stopping:
 
@@ -170,7 +170,7 @@ python -m stonco.utils.visualize_prediction \
     --out_svg visualization.svg
 ```
 
-### 5. Export Spot Embeddings (z64) + UMAP/t-SNE
+### 5. Export Spot Embeddings (h / z_clf) + UMAP/t-SNE
 
 Export 64-d spot embeddings from the trained model:
 
@@ -228,7 +228,7 @@ STOnco/
 │       ├── prepare_data.py   # Data preprocessing
 │       ├── evaluate_models.py # Model evaluation
 │       ├── visualize_prediction.py # Visualization
-│       ├── export_spot_embeddings.py # Export z64 embeddings
+│       ├── export_spot_embeddings.py # Export h / z_clf embeddings
 │       ├── visualize_umap_tsne.py # UMAP + t-SNE visualization
 │       └── ...
 ├── examples/                 # Example scripts and tutorials

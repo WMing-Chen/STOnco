@@ -297,6 +297,11 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     cfg.setdefault('use_image_features', False)
     cfg.setdefault('img_use_pca', True)
     cfg.setdefault('img_pca_dim', 256)
+    clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
+    if isinstance(clf_hidden, str):
+        clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
+    cfg['clf_hidden'] = [int(x) for x in clf_hidden]
+    cfg.setdefault('clf_latent_dim', int(cfg['clf_hidden'][-1]))
     cfg = normalize_gnn_config(cfg)
 
     # 若单切片 npz 无 y，尝试从验证集目录读取 true_label
@@ -335,9 +340,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     in_dim = data_g.x.shape[1]
     clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
-    if isinstance(clf_hidden, str):
-        clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
-    clf_hidden = [int(x) for x in clf_hidden]
+    cfg['clf_latent_dim'] = int(clf_hidden[-1])
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['GNN_hidden'],
