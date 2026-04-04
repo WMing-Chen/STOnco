@@ -116,10 +116,9 @@ def _iter_samples_from_train_npz(train_npz: str, subset: str, meta: dict):
         }
 
 
-def _iter_samples_from_npz_glob(npz_glob: str):
-    files = sorted(glob.glob(npz_glob))
+def _iter_samples_from_npz_files(files: list[str], source_desc: str):
     if not files:
-        raise FileNotFoundError(f'No NPZ files found matching: {npz_glob}')
+        raise FileNotFoundError(f'No NPZ files found for: {source_desc}')
     for path in files:
         d = np.load(path, allow_pickle=True)
         keys = set(d.files)
@@ -145,14 +144,25 @@ def _iter_samples_from_npz_glob(npz_glob: str):
         }
 
 
+def _iter_samples_from_npz_glob(npz_glob: str):
+    files = sorted(glob.glob(npz_glob))
+    yield from _iter_samples_from_npz_files(files, npz_glob)
+
+
+def _iter_samples_from_npz_paths(npz_paths: list[str]):
+    files = [os.path.abspath(path) for path in npz_paths]
+    yield from _iter_samples_from_npz_files(files, ', '.join(files))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Export spot-level embeddings (h or classifier latent) from a trained STOnco model.')
     parser.add_argument('--artifacts_dir', required=True, help='Training artifacts dir (contains meta.json, model weights, preprocessor).')
     parser.add_argument('--out_csv', default='spot_embeddings.csv', help='Output CSV path.')
     parser.add_argument('--append', action='store_true', help='Append to out_csv if it exists (default: overwrite).')
     parser.add_argument('--train_npz', default=None, help='Multi-slide NPZ with Xs/xys/ys/slide_ids/gene_names (and optional barcodes).')
-    parser.add_argument('--npz_glob', default=None, help='Glob for single-slide NPZ files with X/xy/gene_names (optional y/sample_id/barcodes).')
-    parser.add_argument('--subset', choices=['all', 'train', 'val'], default='all', help='When using --train_npz, filter by meta.json train/val ids.')
+    parser.add_argument('--npz', action='append', default=None, help='Single-slide NPZ path. Can be repeated.')
+    parser.add_argument('--npz_glob', action='append', default=None, help='Glob for single-slide NPZ files with X/xy/gene_names (optional y/sample_id/barcodes). Can be repeated.')
+    parser.add_argument('--subset', choices=['all', 'train', 'val'], default='all', help='When using --train_npz, filter by meta.json train/val ids. Ignored for --npz/--npz_glob.')
     parser.add_argument('--device', default=None, help='cpu/cuda; default auto.')
     parser.add_argument('--num_threads', type=int, default=None, help='Set torch CPU threads (only affects CPU).')
     parser.add_argument(
@@ -163,9 +173,13 @@ def main():
     )
     args = parser.parse_args()
 
-    mode_count = sum([args.train_npz is not None, args.npz_glob is not None])
-    if mode_count != 1:
-        raise ValueError('Please specify exactly one of --train_npz or --npz_glob')
+    has_any_input = any([
+        args.train_npz is not None,
+        bool(args.npz),
+        bool(args.npz_glob),
+    ])
+    if not has_any_input:
+        raise ValueError('Please provide at least one input source: --train_npz and/or --npz and/or --npz_glob')
 
     if args.device is not None:
         device = torch.device(args.device)
@@ -213,13 +227,6 @@ def main():
             raise ValueError('use_image_features=1 but artifacts_dir/img_feature_names.txt is missing or empty.')
     id2batch, id2type = _load_domain_maps()
 
-    if args.train_npz is not None:
-        sample_iter = _iter_samples_from_train_npz(args.train_npz, args.subset, meta)
-    else:
-        if args.subset != 'all':
-            print('[Warn] --subset is only supported with --train_npz; ignored.')
-        sample_iter = _iter_samples_from_npz_glob(args.npz_glob)
-
     model = None
     out_csv = os.path.abspath(args.out_csv)
     os.makedirs(os.path.dirname(out_csv) or '.', exist_ok=True)
@@ -230,115 +237,128 @@ def main():
 
     header_written = bool(args.append and os.path.exists(out_csv) and os.path.getsize(out_csv) > 0)
 
-    for sample in sample_iter:
-        sample_id = str(sample['sample_id'])
-        X = sample['X']
-        xy = sample['xy']
-        y = sample.get('y', None)
-        gene_names = list(sample['gene_names'])
-        barcodes = sample.get('barcodes', None)
+    input_iters = []
+    if args.train_npz is not None:
+        input_iters.append(_iter_samples_from_train_npz(args.train_npz, args.subset, meta))
+    elif args.subset != 'all':
+        print('[Warn] --subset is only supported with --train_npz; ignored.')
 
-        Xp_gene = pp.transform(X, gene_names)
-        if use_image_features:
-            X_img = sample.get('X_img', None)
-            img_mask = sample.get('img_mask', None)
-            has_img_arrays = X_img is not None and img_mask is not None
-            if has_img_arrays:
-                img_feature_names = sample.get('img_feature_names', None)
-                if img_feature_names is None:
-                    raise ValueError(f"Sample {sample_id} contains X_img but missing img_feature_names")
-                if expected_img_feature_names is not None and list(img_feature_names) != expected_img_feature_names:
-                    raise ValueError(f'img_feature_names mismatch for sample {sample_id}')
+    if args.npz:
+        input_iters.append(_iter_samples_from_npz_paths(args.npz))
+    if args.npz_glob:
+        for npz_glob in args.npz_glob:
+            input_iters.append(_iter_samples_from_npz_glob(npz_glob))
+
+    for sample_iter in input_iters:
+        for sample in sample_iter:
+            sample_id = str(sample['sample_id'])
+            X = sample['X']
+            xy = sample['xy']
+            y = sample.get('y', None)
+            gene_names = list(sample['gene_names'])
+            barcodes = sample.get('barcodes', None)
+
+            Xp_gene = pp.transform(X, gene_names)
+            if use_image_features:
+                X_img = sample.get('X_img', None)
+                img_mask = sample.get('img_mask', None)
+                has_img_arrays = X_img is not None and img_mask is not None
+                if has_img_arrays:
+                    img_feature_names = sample.get('img_feature_names', None)
+                    if img_feature_names is None:
+                        raise ValueError(f"Sample {sample_id} contains X_img but missing img_feature_names")
+                    if expected_img_feature_names is not None and list(img_feature_names) != expected_img_feature_names:
+                        raise ValueError(f'img_feature_names mismatch for sample {sample_id}')
+                else:
+                    X_img = np.zeros((X.shape[0], int(img_pp.scaler.mean_.shape[0])), dtype=np.float32)
+                    img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
+                Xp_img = img_pp.transform(X_img, img_mask)
+                g = _assemble_pyg(Xp_gene, xy, cfg, Xp_img=Xp_img, img_mask=img_mask).to(device)
             else:
-                X_img = np.zeros((X.shape[0], int(img_pp.scaler.mean_.shape[0])), dtype=np.float32)
-                img_mask = np.zeros((X.shape[0],), dtype=np.uint8)
-            Xp_img = img_pp.transform(X_img, img_mask)
-            g = _assemble_pyg(Xp_gene, xy, cfg, Xp_img=Xp_img, img_mask=img_mask).to(device)
-        else:
-            g = _assemble_pyg(Xp_gene, xy, cfg).to(device)
+                g = _assemble_pyg(Xp_gene, xy, cfg).to(device)
 
-        if model is None:
-            in_dim = int(g.x.shape[1])
-            clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
-            cfg['clf_latent_dim'] = int(clf_hidden[-1])
-            m = STOnco_Classifier(
-                in_dim=in_dim,
-                hidden=cfg['GNN_hidden'],
-                num_layers=int(cfg['num_layers']),
-                dropout=float(cfg['dropout']),
-                model=str(cfg['model']),
-                heads=int(cfg.get('heads', 4)),
-                clf_hidden=clf_hidden,
-            )
-            _ = m.load_state_dict(load_model_state_dict(artifacts_dir, map_location=device), strict=False)
-            model = m.to(device)
-            model.eval()
+            if model is None:
+                in_dim = int(g.x.shape[1])
+                clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
+                cfg['clf_latent_dim'] = int(clf_hidden[-1])
+                m = STOnco_Classifier(
+                    in_dim=in_dim,
+                    hidden=cfg['GNN_hidden'],
+                    num_layers=int(cfg['num_layers']),
+                    dropout=float(cfg['dropout']),
+                    model=str(cfg['model']),
+                    heads=int(cfg.get('heads', 4)),
+                    clf_hidden=clf_hidden,
+                )
+                _ = m.load_state_dict(load_model_state_dict(artifacts_dir, map_location=device), strict=False)
+                model = m.to(device)
+                model.eval()
 
-        with torch.no_grad():
-            need_z = (args.embed_source in ('z_clf', 'z64'))
-            need_h = (args.embed_source == 'h')
-            out = model(
-                g.x,
-                g.edge_index,
-                batch=getattr(g, 'batch', None),
-                edge_weight=getattr(g, 'edge_weight', None),
-                return_z=need_z,
-                return_h=need_h,
-            )
-            logits = out['logits'].detach().cpu().numpy()
-            p_tumor = 1.0 / (1.0 + np.exp(-logits))
-            if args.embed_source in ('z_clf', 'z64'):
-                emb = out['z_clf'].detach().cpu().numpy()
-                emb_prefix = 'z_clf_'
-                if args.embed_source == 'z64' and int(emb.shape[1]) != 64:
-                    raise ValueError(
-                        f'--embed_source z64 requires classifier latent dim == 64, got {emb.shape[1]}. '
-                        'Use --embed_source z_clf for dynamically sized classifier embeddings.'
-                    )
-            else:
-                emb = out['h'].detach().cpu().numpy()
-                emb_prefix = 'h_'
+            with torch.no_grad():
+                need_z = (args.embed_source in ('z_clf', 'z64'))
+                need_h = (args.embed_source == 'h')
+                out = model(
+                    g.x,
+                    g.edge_index,
+                    batch=getattr(g, 'batch', None),
+                    edge_weight=getattr(g, 'edge_weight', None),
+                    return_z=need_z,
+                    return_h=need_h,
+                )
+                logits = out['logits'].detach().cpu().numpy()
+                p_tumor = 1.0 / (1.0 + np.exp(-logits))
+                if args.embed_source in ('z_clf', 'z64'):
+                    emb = out['z_clf'].detach().cpu().numpy()
+                    emb_prefix = 'z_clf_'
+                    if args.embed_source == 'z64' and int(emb.shape[1]) != 64:
+                        raise ValueError(
+                            f'--embed_source z64 requires classifier latent dim == 64, got {emb.shape[1]}. '
+                            'Use --embed_source z_clf for dynamically sized classifier embeddings.'
+                        )
+                else:
+                    emb = out['h'].detach().cpu().numpy()
+                    emb_prefix = 'h_'
 
-        if emb.ndim != 2:
-            raise ValueError(f'Expected embedding shape [N,D], got {emb.shape} for sample {sample_id}')
-        n_spots = int(emb.shape[0])
-        emb_dim = int(emb.shape[1])
-        if emb_dim < 2:
-            raise ValueError(f'Embedding dim must be >=2, got {emb_dim} for sample {sample_id}')
+            if emb.ndim != 2:
+                raise ValueError(f'Expected embedding shape [N,D], got {emb.shape} for sample {sample_id}')
+            n_spots = int(emb.shape[0])
+            emb_dim = int(emb.shape[1])
+            if emb_dim < 2:
+                raise ValueError(f'Embedding dim must be >=2, got {emb_dim} for sample {sample_id}')
 
-        if barcodes is not None:
-            try:
-                barcodes = np.array(barcodes).astype(str)
-                if barcodes.shape[0] != n_spots:
+            if barcodes is not None:
+                try:
+                    barcodes = np.array(barcodes).astype(str)
+                    if barcodes.shape[0] != n_spots:
+                        barcodes = None
+                except Exception:
                     barcodes = None
-            except Exception:
-                barcodes = None
-        spot_id = barcodes if barcodes is not None else np.array([f'{sample_id}:{i}' for i in range(n_spots)], dtype=object)
+            spot_id = barcodes if barcodes is not None else np.array([f'{sample_id}:{i}' for i in range(n_spots)], dtype=object)
 
-        batch_id = _resolve_batch_id(sample_id, id2batch)
-        cancer_type = _resolve_cancer_type(sample_id, id2type)
+            batch_id = _resolve_batch_id(sample_id, id2batch)
+            cancer_type = _resolve_cancer_type(sample_id, id2type)
 
-        df = pd.DataFrame({
-            'spot_id': spot_id,
-            'sample_id': [sample_id] * n_spots,
-            'spot_idx': np.arange(n_spots, dtype=int),
-            'x': np.asarray(xy)[:, 0],
-            'y': np.asarray(xy)[:, 1],
-            'tumor_label': (np.asarray(y).astype(int) if y is not None else np.full(n_spots, np.nan)),
-            'batch_id': [batch_id] * n_spots,
-            'cancer_type': [cancer_type] * n_spots,
-            'p_tumor': p_tumor,
-            'embed_source': [('z_clf' if args.embed_source in ('z_clf', 'z64') else 'h')] * n_spots,
-            'embed_dim': [emb_dim] * n_spots,
-            'clf_latent_dim': [int(cfg.get('clf_latent_dim', emb_dim))] * n_spots,
-        })
-        emb_cols = [f'{emb_prefix}{j}' for j in range(emb_dim)]
-        emb_df = pd.DataFrame(emb, columns=emb_cols)
-        df = pd.concat([df, emb_df], axis=1)
+            df = pd.DataFrame({
+                'spot_id': spot_id,
+                'sample_id': [sample_id] * n_spots,
+                'spot_idx': np.arange(n_spots, dtype=int),
+                'x': np.asarray(xy)[:, 0],
+                'y': np.asarray(xy)[:, 1],
+                'tumor_label': (np.asarray(y).astype(int) if y is not None else np.full(n_spots, np.nan)),
+                'batch_id': [batch_id] * n_spots,
+                'cancer_type': [cancer_type] * n_spots,
+                'p_tumor': p_tumor,
+                'embed_source': [('z_clf' if args.embed_source in ('z_clf', 'z64') else 'h')] * n_spots,
+                'embed_dim': [emb_dim] * n_spots,
+                'clf_latent_dim': [int(cfg.get('clf_latent_dim', emb_dim))] * n_spots,
+            })
+            emb_cols = [f'{emb_prefix}{j}' for j in range(emb_dim)]
+            emb_df = pd.DataFrame(emb, columns=emb_cols)
+            df = pd.concat([df, emb_df], axis=1)
 
-        df.to_csv(out_csv, mode='a', header=(not header_written), index=False, float_format='%.6f')
-        header_written = True
-        print(f'[OK] {sample_id}: spots={n_spots}')
+            df.to_csv(out_csv, mode='a', header=(not header_written), index=False, float_format='%.6f')
+            header_written = True
+            print(f'[OK] {sample_id}: spots={n_spots}')
 
     print('Saved spot embeddings to', out_csv)
 

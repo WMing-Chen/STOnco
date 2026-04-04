@@ -1,5 +1,44 @@
 # Update Log
 
+## 2026-04-03 17:57:32 CST
+
+- 更新内容：`visualize_umap_tsne.py` 新增可选参数 `--color_cols`，允许按任意指定 metadata 列生成 UMAP + t-SNE 着色图，同时默认行为保持不变。
+- 代码影响：
+  - `visualize_umap_tsne.py` 新增参数：
+    - `--color_cols`
+  - 不传 `--color_cols` 时，仍默认生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的三张图
+  - 传入 `--color_cols col1 col2 ...` 时，会改为按给定列列表逐列生成 SVG
+  - 输出文件名改为基于列名自动生成并做安全字符清洗，例如 `umap_tsne_h_by_sample_id.svg`
+- 涉及文件：
+  - `stonco/utils/visualize_umap_tsne.py`
+  - `docs/Tutorial.md`
+  - `../../STOnco.md`
+- 说明：
+  - 该参数只控制“按哪几列上色”，不改变 UMAP/t-SNE 所使用的 embedding 来源；embedding 选择仍由 `--embed_source` 控制
+  - 若指定列在 CSV 中不存在，会打印 warning 并跳过该列
+  - 已完成目标文件语法检查：`python -m compileall stonco/utils/visualize_umap_tsne.py`
+
+## 2026-04-03 17:47:19 CST
+
+- 更新内容：`export_spot_embeddings.py` 的输入模式从“二选一”改为“可组合”，现在支持在同一条命令中混合导出 `--train_npz`、重复 `--npz_glob`，以及新增的可重复 `--npz` 单文件输入。
+- 代码影响：
+  - `export_spot_embeddings.py` 新增参数：
+    - `--npz`
+  - `--npz_glob` 改为可重复传入多次
+  - 输入校验从“必须且仅能选择一个 `--train_npz` 或 `--npz_glob`”改为“至少提供一个输入源：`--train_npz` 和/或 `--npz` 和/或 `--npz_glob`”
+  - 新增单文件/多文件共用的 NPZ 迭代逻辑，支持按输入顺序将多个来源的样本连续写入同一个 `out_csv`
+  - `--subset` 语义保持不变，但现在只对 `--train_npz` 生效；对 `--npz` / `--npz_glob` 会忽略
+  - 因此可以直接用一条命令完成“训练集子集 + 指定外部验证切片”联合导出，不再需要先导出再 `--append`
+- 涉及文件：
+  - `stonco/utils/export_spot_embeddings.py`
+  - `docs/Tutorial.md`
+  - `../../STOnco.md`
+- 说明：
+  - 新增的 `--npz` 适合少量指定切片，例如 `BRCA1.npz`、`BRCA4.npz`
+  - `--npz_glob` 仍适合目录级批量输入，例如 `val_npz/*.npz`
+  - 当前导出 CSV 仍不会自动新增 `split=train/val/external` 列；合并后可按 `tumor_label`、`batch_id`、`cancer_type` 上色，但不能直接按来源上色
+  - 已完成目标文件语法检查：`python -m compileall stonco/utils/export_spot_embeddings.py`
+
 ## 2026-04-01 16:20:00 CST
 
 - 更新内容：`train.py` 新增多模式学习率调度，支持 `none / linear / cosine / warmup_cosine / plateau`，并把学习率记录同步写入训练历史、`loss_components.csv` 和训练曲线图。

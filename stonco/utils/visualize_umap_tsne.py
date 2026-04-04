@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -7,7 +8,9 @@ import pandas as pd
 
 def _sample_rows(df: pd.DataFrame, max_points: int | None, seed: int) -> pd.DataFrame:
     if max_points is None:
-        return df
+        if 'sample_id' not in df.columns:
+            return df
+        max_points = 500 * int(df['sample_id'].astype(str).nunique())
     max_points = int(max_points)
     if max_points <= 0 or len(df) <= max_points:
         return df
@@ -41,6 +44,11 @@ def _get_embedding(df: pd.DataFrame, embed_source: str) -> np.ndarray:
         raise ValueError(f'Expected >=2 embedding columns for source {embed_source}, got {len(cols)}')
     cols = sorted(cols, key=lambda x: int(x.split('_')[-1]))
     return df[cols].to_numpy(dtype=float)
+
+
+def _sanitize_name(text: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', str(text).strip())
+    return safe.strip('_') or 'column'
 
 
 def _normalize_category_labels(color_col: str, series: pd.Series) -> pd.Series:
@@ -184,6 +192,12 @@ def main():
         default='h',
         help='Which embedding columns to visualize: h_*, z_clf_*; z64 is kept as a legacy option.',
     )
+    parser.add_argument(
+        '--color_cols',
+        nargs='+',
+        default=None,
+        help='Optional metadata columns used for coloring. Default: tumor_label batch_id cancer_type',
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.embeddings_csv)
@@ -209,11 +223,8 @@ def main():
     out_dir = args.out_dir or (os.path.dirname(os.path.abspath(args.embeddings_csv)) or '.')
     os.makedirs(out_dir, exist_ok=True)
 
-    plots = [
-        ('tumor_label', f'umap_tsne_{args.embed_source}_by_tumor.svg'),
-        ('batch_id', f'umap_tsne_{args.embed_source}_by_batch.svg'),
-        ('cancer_type', f'umap_tsne_{args.embed_source}_by_cancer.svg'),
-    ]
+    color_cols = args.color_cols or ['tumor_label', 'batch_id', 'cancer_type']
+    plots = [(col, f'umap_tsne_{args.embed_source}_by_{_sanitize_name(col)}.svg') for col in color_cols]
     for col, fname in plots:
         if col not in df.columns:
             print(f'[Warn] Missing column {col} in embeddings CSV, skip.')

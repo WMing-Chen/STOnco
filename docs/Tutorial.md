@@ -147,10 +147,12 @@ python -m stonco.utils.visualize_umap_tsne \
   --out_dir $ARTIFACTS/embedding_plots \
   --max_points 50000 \
   --seed 42 \
+  --color_cols sample_id tumor_label batch_id \
   --embed_source h
 ```
 
 默认参数要点：
+- `visualize_umap_tsne.py` 默认仍会生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的图；若传 `--color_cols ...`，则改为按指定列生成
 - prepare_data：`--xy_cols row col`、`--label_col true_label` 为默认；build-single-npz 若不传 `--sample_id`，将用坐标文件上一级目录名。
 - 训练（train.py）：
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
@@ -817,13 +819,22 @@ python -m stonco.utils.visualize_prediction \
 
 ### 9.1 导出 embedding（CSV）
 
-输入二选一：
+输入可组合：
 - 一组单切片 NPZ（推荐用于 val_npz/external_val）：
 ```bash
 python -m stonco.utils.export_spot_embeddings \
   --artifacts_dir /path/to/artifacts \
   --npz_glob '/path/to/val_npz/*.npz' \
   --out_csv /path/to/artifacts/spot_embeddings_val_npz.csv \
+  --embed_source h
+```
+- 若只想加几个指定切片，也可以重复传 `--npz`：
+```bash
+python -m stonco.utils.export_spot_embeddings \
+  --artifacts_dir /path/to/artifacts \
+  --npz /path/to/val_npz/BRCA1.npz \
+  --npz /path/to/val_npz/BRCA4.npz \
+  --out_csv /path/to/artifacts/spot_embeddings_specific_val.csv \
   --embed_source h
 ```
 - 一个多切片训练 NPZ（可用 `--subset train|val|all` 按 meta.json 的 train/val ids 过滤）：
@@ -835,12 +846,24 @@ python -m stonco.utils.export_spot_embeddings \
   --out_csv /path/to/artifacts/spot_embeddings_train_npz_val.csv \
   --embed_source h
 ```
+- 训练集和外部验证集也可以放在同一条命令里：
+```bash
+python -m stonco.utils.export_spot_embeddings \
+  --artifacts_dir /path/to/artifacts \
+  --train_npz /path/to/train_data.npz \
+  --subset train \
+  --npz_glob '/path/to/val_npz/*.npz' \
+  --out_csv /path/to/artifacts/spot_embeddings_train_plus_val.csv \
+  --embed_source h
+```
 
 说明：
 - `--embed_source {h,z_clf,z64}`：
   - `h`：导出 `h_*` 列，维度随 backbone 结构变化，默认使用这个模式
   - `z_clf`：导出 `z_clf_*` 列，维度由训练产物自动识别
   - `z64`：旧兼容别名；仅当分类头 latent 维度为 64 时可用
+- 至少提供一个输入源：`--train_npz` 和/或 `--npz` 和/或 `--npz_glob`
+- `--subset` 只对 `--train_npz` 生效，对 `--npz/--npz_glob` 会忽略
 - 导出 CSV 会额外写入 `embed_source`、`embed_dim` 与 `clf_latent_dim` 三列，便于后续区分来源和维度
 - 若 `meta.json:cfg.use_image_features=1`，导出 embedding 时会加载图像预处理器（`img_scaler.joblib` + 可选 `img_pca.joblib`），并按 `x=[Xp_gene, Xp_img, img_mask, (LapPE)]` 构图。
 - 输入 NPZ 若包含 `X_img/img_mask`（或训练 NPZ 的 `X_imgs/img_masks`），必须同时提供 `img_feature_names` 且与训练产物一致；否则直接报错。若缺失 image keys，则自动兜底为 `X_img=0, img_mask=0`。

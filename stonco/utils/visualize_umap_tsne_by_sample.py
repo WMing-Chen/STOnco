@@ -194,7 +194,7 @@ def main():
     parser.add_argument('--legend_fontsize', type=int, default=12, help='Legend fontsize')
     parser.add_argument('--sample_frac', type=float, default=None, help='Per-sample sampling fraction, e.g. 0.2')
     parser.add_argument('--min_points_per_sample', type=int, default=0, help='Minimum sampled spots for each sample_id')
-    parser.add_argument('--max_points_per_sample', type=int, default=None, help='Maximum sampled spots for each sample_id')
+    parser.add_argument('--max_points_per_sample', type=int, default=500, help='Maximum sampled spots for each sample_id')
     parser.add_argument('--highlight_cancer', default=None, help='Highlight only this cancer_type by sample_id; all other spots are shown in gray.')
     parser.add_argument('--background_color', default='#c8c8c8', help='Color for non-highlighted spots.')
     parser.add_argument('--background_alpha', type=float, default=0.20, help='Alpha for non-highlighted spots.')
