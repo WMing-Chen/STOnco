@@ -5,45 +5,12 @@ import re
 import numpy as np
 import pandas as pd
 
-
-def _sample_rows(df: pd.DataFrame, max_points: int | None, seed: int) -> pd.DataFrame:
-    if max_points is None:
-        if 'sample_id' not in df.columns:
-            return df
-        max_points = 500 * int(df['sample_id'].astype(str).nunique())
-    max_points = int(max_points)
-    if max_points <= 0 or len(df) <= max_points:
-        return df
-    if 'sample_id' not in df.columns:
-        return df.sample(n=max_points, random_state=int(seed)).reset_index(drop=True)
-
-    # Keep roughly the same sampling fraction for every sample_id instead of
-    # letting large samples dominate the subsample.
-    sample_frac = float(max_points) / float(len(df))
-    parts = []
-    for _, group in df.groupby('sample_id', sort=True):
-        n_keep = int(np.ceil(len(group) * sample_frac))
-        n_keep = min(len(group), max(1, n_keep))
-        if n_keep >= len(group):
-            parts.append(group)
-        else:
-            parts.append(group.sample(n=n_keep, random_state=int(seed)))
-    return pd.concat(parts, axis=0).reset_index(drop=True)
-
-
-def _get_embedding(df: pd.DataFrame, embed_source: str) -> np.ndarray:
-    prefixes = [f'{embed_source}_']
-    if embed_source == 'z_clf':
-        prefixes.append('z64_')
-    cols = []
-    for prefix in prefixes:
-        cols = [c for c in df.columns if c.startswith(prefix)]
-        if cols:
-            break
-    if len(cols) < 2:
-        raise ValueError(f'Expected >=2 embedding columns for source {embed_source}, got {len(cols)}')
-    cols = sorted(cols, key=lambda x: int(x.split('_')[-1]))
-    return df[cols].to_numpy(dtype=float)
+from stonco.utils.embedding_analysis import (
+    attach_reduction_columns,
+    compute_reductions,
+    get_embedding_matrix,
+    sample_rows,
+)
 
 
 def _sanitize_name(text: str) -> str:
@@ -178,11 +145,16 @@ def _plot_two_panels(
     return out_svg
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Visualize exported h/classifier-latent embeddings with UMAP + t-SNE.')
     parser.add_argument('--embeddings_csv', required=True, help='CSV produced by export_spot_embeddings.py')
     parser.add_argument('--out_dir', default=None, help='Output directory for SVGs (default: same as embeddings_csv)')
-    parser.add_argument('--max_points', type=int, default=None, help='Optional subsample for speed (e.g. 50000)')
+    parser.add_argument(
+        '--max_points',
+        type=int,
+        default=None,
+        help='Optional subsample for speed. If unset and sample_id exists, defaults to 500 points per sample.',
+    )
     parser.add_argument('--seed', type=int, default=42, help='Random seed for subsampling and DR reproducibility')
     parser.add_argument('--point_size', type=float, default=2.0, help='Scatter point size')
     parser.add_argument('--alpha', type=float, default=0.8, help='Scatter alpha')
@@ -198,27 +170,30 @@ def main():
         default=None,
         help='Optional metadata columns used for coloring. Default: tumor_label batch_id cancer_type',
     )
-    args = parser.parse_args()
+    parser.add_argument('--out_coords_csv', default=None, help='Optional CSV path to save sampled rows with UMAP/t-SNE coordinates.')
+    parser.add_argument('--umap_n_neighbors', type=int, default=15, help='UMAP n_neighbors parameter')
+    parser.add_argument('--umap_min_dist', type=float, default=0.1, help='UMAP min_dist parameter')
+    parser.add_argument('--tsne_perplexity', type=float, default=None, help='Optional t-SNE perplexity override')
+    return parser
 
+
+def run_visualization(args: argparse.Namespace) -> dict[str, object]:
     df = pd.read_csv(args.embeddings_csv)
-    df = _sample_rows(df, args.max_points, args.seed)
-    Z = _get_embedding(df, args.embed_source)
-
-    from sklearn.preprocessing import StandardScaler
-    Zs = StandardScaler().fit_transform(Z)
-
-    # UMAP
-    import umap
-    umap_xy = umap.UMAP(n_components=2, random_state=int(args.seed)).fit_transform(Zs)
-
-    # t-SNE
-    from sklearn.manifold import TSNE
-    tsne_xy = TSNE(
-        n_components=2,
-        random_state=int(args.seed),
-        init='pca',
-        learning_rate='auto',
-    ).fit_transform(Zs)
+    if args.max_points is None and 'sample_id' in df.columns:
+        args.max_points = 500 * int(df['sample_id'].astype(str).nunique())
+    df = sample_rows(df, args.max_points, args.seed)
+    Z = get_embedding_matrix(df, args.embed_source)
+    reductions = compute_reductions(
+        Z,
+        seed=args.seed,
+        umap_n_neighbors=args.umap_n_neighbors,
+        umap_min_dist=args.umap_min_dist,
+        tsne_perplexity=args.tsne_perplexity,
+        run_umap=True,
+        run_tsne=True,
+    )
+    umap_xy = reductions['umap']
+    tsne_xy = reductions['tsne']
 
     out_dir = args.out_dir or (os.path.dirname(os.path.abspath(args.embeddings_csv)) or '.')
     os.makedirs(out_dir, exist_ok=True)
@@ -242,6 +217,26 @@ def main():
             alpha=args.alpha,
         )
         print('Saved', out_svg)
+
+    out_coords_csv = args.out_coords_csv
+    if out_coords_csv:
+        out_coords_csv = os.path.abspath(out_coords_csv)
+        os.makedirs(os.path.dirname(out_coords_csv) or '.', exist_ok=True)
+        coords_df = attach_reduction_columns(df, reductions)
+        coords_df.to_csv(out_coords_csv, index=False, float_format='%.6f')
+        print('Saved', out_coords_csv)
+
+    return {
+        'out_dir': out_dir,
+        'out_coords_csv': out_coords_csv,
+        'n_points': int(len(df)),
+    }
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    run_visualization(args)
 
 
 if __name__ == '__main__':

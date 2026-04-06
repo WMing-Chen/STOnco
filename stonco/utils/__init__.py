@@ -26,6 +26,9 @@ _SUBMODULES = {
     'plot_roc',
     'extract_best_config',
     'export_spot_embeddings',
+    'embedding_analysis',
+    'evaluate_embedding_mixing',
+    'run_embedding_analysis_pipeline',
     'visualize_umap_tsne',
 }
 

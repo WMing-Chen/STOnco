@@ -2,7 +2,6 @@ import json
 import numbers
 import os
 import joblib
-import torch
 
 DEFAULT_GNN_HIDDEN = (256, 128, 64)
 
@@ -92,10 +91,14 @@ def normalize_gnn_config(cfg, default_gnn_hidden=DEFAULT_GNN_HIDDEN):
     return cfg
 
 def save_model(model, path, filename='model.pt'):
+    import torch
+
     os.makedirs(path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(path, filename))
 
 def load_model_state_dict(path, map_location='cpu'):
+    import torch
+
     return torch.load(os.path.join(path, 'model.pt'), map_location=map_location)
 
 def save_json(obj, path):

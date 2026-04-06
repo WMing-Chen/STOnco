@@ -5,11 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-from torch_geometric.data import Data as PyGData
 
-from stonco.core.models import STOnco_Classifier
-from stonco.utils.preprocessing import GraphBuilder, Preprocessor, ImagePreprocessor, build_node_features_early_fusion
 from stonco.utils.utils import load_json, load_model_state_dict, normalize_gnn_config
 
 
@@ -40,7 +36,12 @@ def _load_domain_maps():
     return id2batch, id2type
 
 
-def _assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.ndarray | None = None, img_mask: np.ndarray | None = None) -> PyGData:
+def _assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.ndarray | None = None, img_mask: np.ndarray | None = None):
+    import torch
+    from torch_geometric.data import Data as PyGData
+
+    from stonco.utils.preprocessing import GraphBuilder, build_node_features_early_fusion
+
     gb = GraphBuilder(knn_k=int(cfg['knn_k']), gaussian_sigma_factor=float(cfg['gaussian_sigma_factor']))
     edge_index, edge_weight, _ = gb.build_knn(xy)
     if cfg.get('lap_pe_dim', 0) and int(cfg.get('lap_pe_dim', 0)) > 0:
@@ -154,7 +155,7 @@ def _iter_samples_from_npz_paths(npz_paths: list[str]):
     yield from _iter_samples_from_npz_files(files, ', '.join(files))
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Export spot-level embeddings (h or classifier latent) from a trained STOnco model.')
     parser.add_argument('--artifacts_dir', required=True, help='Training artifacts dir (contains meta.json, model weights, preprocessor).')
     parser.add_argument('--out_csv', default='spot_embeddings.csv', help='Output CSV path.')
@@ -171,7 +172,14 @@ def main():
         default='h',
         help='Embedding source for export: h (GNN output), z_clf (classifier latent), or z64 (legacy alias for 64-dim classifier latent).',
     )
-    args = parser.parse_args()
+    return parser
+
+
+def run_export(args: argparse.Namespace) -> str:
+    from stonco.utils.preprocessing import ImagePreprocessor, Preprocessor
+    import torch
+
+    from stonco.core.models import STOnco_Classifier
 
     has_any_input = any([
         args.train_npz is not None,
@@ -361,6 +369,13 @@ def main():
             print(f'[OK] {sample_id}: spots={n_spots}')
 
     print('Saved spot embeddings to', out_csv)
+    return out_csv
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    run_export(args)
 
 
 if __name__ == '__main__':
