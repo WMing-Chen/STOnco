@@ -1,5 +1,26 @@
 # Update Log
 
+## 2026-04-15 22:30:00 CST
+
+- 更新内容：训练流程新增 generated-support Wasserstein barycenter（WB）对齐，用于以连续可学习的 barycenter support 替代/升级当前基于 MMD 的多癌种 latent 对齐。
+- 代码影响：
+  - 新增 `stonco/core/wb_potentials.py`，包含 `GeneratedSupportMap`、single/dual potential bank 与 `GeneratedSupportWBLoss`
+  - `stonco/core/train.py` 新增 `--use_wb_align`、`--wb_loss_type`、`--lambda_wb`、`--wb_anchor_weight`、`--wb_spots_per_graph`、`--wb_support_size`、`--wb_eval_loss`、`--best_metric` 等参数
+  - WB 第一版采用 direct-`h` 训练约束：分类 head 仍使用 `h`，训练阶段由 `b=T_phi(h)` 生成 continuous barycenter support，不新增推理时 embedding
+  - 支持两种 loss：`euclidean_pairwise` 与 `dual_potential`；均采用 BaryIR-style 交替更新，先更新 potentials，再更新 STOnco 主模型与 support map
+  - `prepare_graphs()`、KFold、LOCO 路径均改为在 `use_domain_adv_cancer or use_wb_align` 时返回 `n_domains_cancer`，保证关闭 cancer GRL 但启用 WB 时仍能建立 potential bank
+  - `loss_components.csv` 新增 WB 诊断列，并在启用 WB 时额外保存 `wb_train_loss.svg`
+  - 训练 artifacts 额外保存 `wb_support_map_last.pt`、`wb_potentials_last.pt` 与 `wb_config.json`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `stonco/core/wb_potentials.py`
+  - `docs/PLAN_continuous_dual_potential_WB_STOnco.md`
+  - `docs/Tutorial.md`
+- 说明：
+  - 默认推荐 `--use_mmd 0 --use_wb_align 1 --wb_loss_type euclidean_pairwise` 作为低计算量 WB-only 起点
+  - `dual_potential` 更贴近正规 dual-potential WB objective，但计算量更高，建议降低 `wb_spots_per_graph` 与 `wb_support_size`
+  - 已在 `hpc_gpu01` 的 `stonco` 环境完成 smoke test：`euclidean_pairwise` 与 `dual_potential` 均能完成训练、保存模型、WB artifacts、`loss_components.csv` 和 `wb_train_loss.svg`
+
 ## 2026-04-10 16:23:02 CST
 
 - 更新内容：训练流程新增 `--save_epoch_checkpoints` 参数，可在常规最优/最后一轮之外额外保留指定 epoch 的模型结果。

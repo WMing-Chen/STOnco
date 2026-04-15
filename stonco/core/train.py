@@ -1,6 +1,7 @@
 import argparse, os, numpy as np, torch, math, itertools, shutil
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from .models import STOnco_Classifier
+from .wb_potentials import GeneratedSupportMap, GeneratedSupportWBLoss
 from .sampler import (
     CancerBalancedBatchSampler,
     build_training_subgraphs,
@@ -200,6 +201,8 @@ def _save_extra_epoch_checkpoints(
                 if save_train_curves:
                     _plot_train_metrics(hist_epoch, epoch_dir)
                     _plot_domain_diagnostics(hist_epoch, epoch_dir, **domain_plot_kwargs)
+                    if bool(cfg.get('use_wb_align', False)):
+                        _plot_wb_train_metrics(hist_epoch, epoch_dir)
                 if save_loss_components:
                     _save_loss_components_csv(hist_epoch, epoch_dir)
 
@@ -411,6 +414,35 @@ def main():
     parser.add_argument('--mmd_sigma', type=float, default=None, help='固定 RBF 带宽；不传则自适应估计')
     parser.add_argument('--mmd_max_pairs', type=int, default=None, help='每个 batch 最多计算多少个域对')
     parser.add_argument('--mmd_spots_per_slide', type=int, default=None, help='每张切片最多抽取多少个 spot 参与 MMD；<=0 表示使用全部 spot')
+
+    # 新增：generated-support Wasserstein barycenter 对齐
+    parser.add_argument('--use_wb_align', type=int, choices=[0, 1], default=None, help='启用/关闭 generated-support WB 对齐（1/0）')
+    parser.add_argument('--wb_loss_type', choices=['dual_potential', 'euclidean_pairwise'], default=None, help='WB loss 类型')
+    parser.add_argument('--wb_support_mode', choices=['generated_support'], default=None, help='WB support 生成方式；第一版仅支持 generated_support')
+    parser.add_argument('--lambda_wb', type=float, default=None, help='WB loss 最大权重')
+    parser.add_argument('--wb_warmup_epochs', type=int, default=None, help='WB loss 开始前 warmup epoch 数')
+    parser.add_argument('--wb_ramp_epochs', type=int, default=None, help='WB loss 从0 ramp到lambda_wb的 epoch 数')
+    parser.add_argument('--wb_support_hidden', type=int, default=None, help='GeneratedSupportMap hidden 维度')
+    parser.add_argument('--wb_support_dropout', type=float, default=None, help='GeneratedSupportMap dropout')
+    parser.add_argument('--wb_anchor_weight', type=float, default=None, help='h-b anchor loss 在 WB 模块内的相对权重')
+    parser.add_argument('--wb_potential_hidden', type=int, default=None, help='WB potential MLP hidden 维度')
+    parser.add_argument('--wb_potential_lr', type=float, default=None, help='WB potential optimizer 学习率')
+    parser.add_argument('--wb_pot_every_n_steps', type=int, default=None, help='每多少个 main step 更新一次 potentials')
+    parser.add_argument('--wb_spots_per_graph', type=int, default=None, help='每张 graph/slide 最多抽取多少 spot 参与 WB；<=0 表示不限制')
+    parser.add_argument('--wb_spots_per_cancer', type=int, default=None, help='每个 cancer 最多抽取多少 spot 参与 WB；<=0 表示关闭二级cap')
+    parser.add_argument('--wb_support_size', type=int, default=None, help='dual_potential support-side b 子采样数量；<=0 表示使用全部 selected b')
+    parser.add_argument('--wb_min_cancers', type=int, default=None, help='计算 WB loss 所需最少 active cancer 数')
+    parser.add_argument('--wb_min_spots', type=int, default=None, help='每个 active cancer 所需最少 spot 数')
+    parser.add_argument('--wb_regularizer', choices=['entropy', 'l2'], default=None, help='dual_potential regularizer')
+    parser.add_argument('--wb_epsilon', type=float, default=None, help='dual_potential regularizer epsilon')
+    parser.add_argument('--wb_label_balanced_sampling', type=int, choices=[0, 1], default=None, help='WB 内部是否启用 label-balanced spot sampling')
+    parser.add_argument('--wb_state_direction', type=int, choices=[0, 1], default=None, help='是否启用 tumor-normal shared state direction 约束')
+    parser.add_argument('--wb_state_direction_weight', type=float, default=None, help='state direction loss 在 raw WB loss 中的权重')
+    parser.add_argument('--wb_eval_loss', type=int, choices=[0, 1], default=None, help='验证阶段是否计算 WB diagnostics/loss')
+    parser.add_argument('--wb_euclid_pairwise_weight', type=float, default=None, help='euclidean_pairwise 分布项权重')
+    parser.add_argument('--wb_potential_weight', type=float, default=None, help='euclidean_pairwise potential main 项权重')
+    parser.add_argument('--wb_potential_constraint_weight', type=float, default=None, help='potential update 零均值约束权重')
+    parser.add_argument('--best_metric', choices=['val_macro_f1', 'val_auprc', 'val_accuracy', 'val_auroc', 'val_avg_total_loss'], default=None, help='最佳 checkpoint 选择指标')
     
     # 新增：癌种分层与K折/LOCO
     parser.add_argument('--stratify_by_cancer', action='store_true', default=True, help='启用癌种分层划分：按比例分配验证集且每癌种保底1张（n=1除外）')
@@ -489,19 +521,50 @@ def main():
                'mmd_sigma': None,
                'mmd_max_pairs': 8,
                'mmd_spots_per_slide': 0,
+               # 新增：generated-support Wasserstein barycenter 默认配置
+               'use_wb_align': False,
+               'wb_loss_type': 'euclidean_pairwise',
+               'wb_support_mode': 'generated_support',
+               'lambda_wb': 0.01,
+               'wb_warmup_epochs': 10,
+               'wb_ramp_epochs': 20,
+               'wb_support_hidden': 128,
+               'wb_support_dropout': 0.0,
+               'wb_anchor_weight': 0.5,
+               'wb_potential_hidden': 128,
+               'wb_potential_lr': 1e-4,
+               'wb_pot_every_n_steps': 1,
+               'wb_spots_per_graph': 64,
+               'wb_spots_per_cancer': 0,
+               'wb_support_size': 128,
+               'wb_min_cancers': 2,
+               'wb_min_spots': 2,
+               'wb_regularizer': 'l2',
+               'wb_epsilon': 0.1,
+               'wb_label_balanced_sampling': False,
+               'wb_state_direction': False,
+               'wb_state_direction_weight': 0.1,
+               'wb_eval_loss': False,
+               'wb_euclid_pairwise_weight': 1.0,
+               'wb_potential_weight': 1.0,
+               'wb_potential_constraint_weight': 0.01,
+               'best_metric': 'val_macro_f1',
 	           # 新增：HVG控制
 	           'n_hvg': 'all'
 	           }
 
     # 先从JSON加载作为基准配置（若提供）
+    cfg_json_keys = set()
     if args.config_json is not None:
         try:
             with open(args.config_json, 'r', encoding='utf-8') as f:
                 cfg_json = json.load(f)
             if isinstance(cfg_json, dict):
                 if 'cfg' in cfg_json and isinstance(cfg_json['cfg'], dict):
+                    cfg_json_keys = set(cfg_json['cfg'].keys())
                     cfg.update(cfg_json['cfg'])
                 else:
+                    cfg_json_keys = set(cfg_json.keys())
                     cfg.update(cfg_json)
                 print(f"Loaded config from {args.config_json}")
             else:
@@ -651,6 +714,60 @@ def main():
         cfg['mmd_max_pairs'] = int(args.mmd_max_pairs)
     if getattr(args, 'mmd_spots_per_slide', None) is not None:
         cfg['mmd_spots_per_slide'] = int(args.mmd_spots_per_slide)
+    if getattr(args, 'use_wb_align', None) is not None:
+        cfg['use_wb_align'] = bool(args.use_wb_align)
+    if getattr(args, 'wb_loss_type', None) is not None:
+        cfg['wb_loss_type'] = str(args.wb_loss_type)
+    if getattr(args, 'wb_support_mode', None) is not None:
+        cfg['wb_support_mode'] = str(args.wb_support_mode)
+    if getattr(args, 'lambda_wb', None) is not None:
+        cfg['lambda_wb'] = float(args.lambda_wb)
+    if getattr(args, 'wb_warmup_epochs', None) is not None:
+        cfg['wb_warmup_epochs'] = int(args.wb_warmup_epochs)
+    if getattr(args, 'wb_ramp_epochs', None) is not None:
+        cfg['wb_ramp_epochs'] = int(args.wb_ramp_epochs)
+    if getattr(args, 'wb_support_hidden', None) is not None:
+        cfg['wb_support_hidden'] = int(args.wb_support_hidden)
+    if getattr(args, 'wb_support_dropout', None) is not None:
+        cfg['wb_support_dropout'] = float(args.wb_support_dropout)
+    if getattr(args, 'wb_anchor_weight', None) is not None:
+        cfg['wb_anchor_weight'] = float(args.wb_anchor_weight)
+    if getattr(args, 'wb_potential_hidden', None) is not None:
+        cfg['wb_potential_hidden'] = int(args.wb_potential_hidden)
+    if getattr(args, 'wb_potential_lr', None) is not None:
+        cfg['wb_potential_lr'] = float(args.wb_potential_lr)
+    if getattr(args, 'wb_pot_every_n_steps', None) is not None:
+        cfg['wb_pot_every_n_steps'] = int(args.wb_pot_every_n_steps)
+    if getattr(args, 'wb_spots_per_graph', None) is not None:
+        cfg['wb_spots_per_graph'] = int(args.wb_spots_per_graph)
+    if getattr(args, 'wb_spots_per_cancer', None) is not None:
+        cfg['wb_spots_per_cancer'] = int(args.wb_spots_per_cancer)
+    if getattr(args, 'wb_support_size', None) is not None:
+        cfg['wb_support_size'] = int(args.wb_support_size)
+    if getattr(args, 'wb_min_cancers', None) is not None:
+        cfg['wb_min_cancers'] = int(args.wb_min_cancers)
+    if getattr(args, 'wb_min_spots', None) is not None:
+        cfg['wb_min_spots'] = int(args.wb_min_spots)
+    if getattr(args, 'wb_regularizer', None) is not None:
+        cfg['wb_regularizer'] = str(args.wb_regularizer)
+    if getattr(args, 'wb_epsilon', None) is not None:
+        cfg['wb_epsilon'] = float(args.wb_epsilon)
+    if getattr(args, 'wb_label_balanced_sampling', None) is not None:
+        cfg['wb_label_balanced_sampling'] = bool(args.wb_label_balanced_sampling)
+    if getattr(args, 'wb_state_direction', None) is not None:
+        cfg['wb_state_direction'] = bool(args.wb_state_direction)
+    if getattr(args, 'wb_state_direction_weight', None) is not None:
+        cfg['wb_state_direction_weight'] = float(args.wb_state_direction_weight)
+    if getattr(args, 'wb_eval_loss', None) is not None:
+        cfg['wb_eval_loss'] = bool(args.wb_eval_loss)
+    if getattr(args, 'wb_euclid_pairwise_weight', None) is not None:
+        cfg['wb_euclid_pairwise_weight'] = float(args.wb_euclid_pairwise_weight)
+    if getattr(args, 'wb_potential_weight', None) is not None:
+        cfg['wb_potential_weight'] = float(args.wb_potential_weight)
+    if getattr(args, 'wb_potential_constraint_weight', None) is not None:
+        cfg['wb_potential_constraint_weight'] = float(args.wb_potential_constraint_weight)
+    if getattr(args, 'best_metric', None) is not None:
+        cfg['best_metric'] = str(args.best_metric)
 
     # 默认值填充（新字段）
     if cfg.get('use_domain_adv_slide', None) is None:
@@ -701,6 +818,63 @@ def main():
     cfg['mmd_sigma'] = None if cfg.get('mmd_sigma', None) is None else float(cfg['mmd_sigma'])
     cfg['mmd_max_pairs'] = int(cfg.get('mmd_max_pairs', 8))
     cfg['mmd_spots_per_slide'] = int(cfg.get('mmd_spots_per_slide', 0))
+    cfg['use_wb_align'] = bool(cfg.get('use_wb_align', False))
+    cfg['wb_loss_type'] = str(cfg.get('wb_loss_type', 'euclidean_pairwise')).lower()
+    if cfg['wb_loss_type'] not in {'dual_potential', 'euclidean_pairwise'}:
+        raise ValueError(f"cfg['wb_loss_type'] must be dual_potential or euclidean_pairwise, got: {cfg['wb_loss_type']}")
+    cfg['wb_support_mode'] = str(cfg.get('wb_support_mode', 'generated_support')).lower()
+    if cfg['wb_support_mode'] != 'generated_support':
+        raise ValueError("First WB implementation only supports cfg['wb_support_mode']='generated_support'")
+    cfg['lambda_wb'] = float(cfg.get('lambda_wb', 0.01))
+    cfg['wb_warmup_epochs'] = int(cfg.get('wb_warmup_epochs', 10))
+    cfg['wb_ramp_epochs'] = int(cfg.get('wb_ramp_epochs', 20))
+    cfg['wb_support_hidden'] = int(cfg.get('wb_support_hidden', 128))
+    cfg['wb_support_dropout'] = float(cfg.get('wb_support_dropout', 0.0))
+    cfg['wb_anchor_weight'] = float(cfg.get('wb_anchor_weight', 0.5))
+    cfg['wb_potential_hidden'] = int(cfg.get('wb_potential_hidden', 128))
+    cfg['wb_potential_lr'] = float(cfg.get('wb_potential_lr', 1e-4))
+    cfg['wb_pot_every_n_steps'] = max(1, int(cfg.get('wb_pot_every_n_steps', 1)))
+    cfg['wb_spots_per_graph'] = int(cfg.get('wb_spots_per_graph', 64))
+    cfg['wb_spots_per_cancer'] = int(cfg.get('wb_spots_per_cancer', 0))
+    cfg['wb_support_size'] = int(cfg.get('wb_support_size', 128))
+    cfg['wb_min_cancers'] = max(1, int(cfg.get('wb_min_cancers', 2)))
+    cfg['wb_min_spots'] = max(1, int(cfg.get('wb_min_spots', 2)))
+    cfg['wb_regularizer'] = str(cfg.get('wb_regularizer', 'l2')).lower()
+    if cfg['wb_regularizer'] not in {'l2', 'entropy'}:
+        raise ValueError(f"cfg['wb_regularizer'] must be l2 or entropy, got: {cfg['wb_regularizer']}")
+    cfg['wb_epsilon'] = float(cfg.get('wb_epsilon', 0.1))
+    if cfg['wb_epsilon'] <= 0:
+        raise ValueError(f"cfg['wb_epsilon'] must be > 0, got: {cfg['wb_epsilon']}")
+    cfg['wb_label_balanced_sampling'] = bool(cfg.get('wb_label_balanced_sampling', False))
+    cfg['wb_state_direction'] = bool(cfg.get('wb_state_direction', False))
+    cfg['wb_state_direction_weight'] = float(cfg.get('wb_state_direction_weight', 0.1))
+    cfg['wb_eval_loss'] = bool(cfg.get('wb_eval_loss', False))
+    cfg['wb_euclid_pairwise_weight'] = float(cfg.get('wb_euclid_pairwise_weight', 1.0))
+    cfg['wb_potential_weight'] = float(cfg.get('wb_potential_weight', 1.0))
+    cfg['wb_potential_constraint_weight'] = float(cfg.get('wb_potential_constraint_weight', 0.01))
+    cfg['best_metric'] = str(cfg.get('best_metric', 'val_macro_f1')).lower()
+    if cfg['best_metric'] not in {'val_macro_f1', 'val_auprc', 'val_accuracy', 'val_auroc', 'val_avg_total_loss'}:
+        raise ValueError(
+            "cfg['best_metric'] must be one of val_macro_f1/val_auprc/val_accuracy/"
+            f"val_auroc/val_avg_total_loss, got: {cfg['best_metric']}"
+        )
+    if cfg['use_wb_align'] and cfg['use_mmd']:
+        print("[WB] Warning: use_wb_align=1 and use_mmd=1 are both enabled. WB is intended to replace/upgrade MMD; continuing because both were requested.")
+    if cfg['use_wb_align'] and bool(cfg.get('use_domain_adv_cancer', False)):
+        user_set_lambda_cancer = (getattr(args, 'lambda_cancer', None) is not None) or ('lambda_cancer' in cfg_json_keys)
+        if not user_set_lambda_cancer:
+            cfg['lambda_cancer'] = 0.1
+            print("[WB] use_wb_align=1: lambda_cancer was not explicitly set; using weak cancer GRL lambda_cancer=0.1.")
+        elif float(cfg.get('lambda_cancer', 1.0)) > 0.1:
+            print(
+                f"[WB] Warning: lambda_cancer={cfg.get('lambda_cancer')} with WB may over-align cancer information; "
+                "recommended WB experiments use 0.05-0.1."
+            )
+    if cfg['use_wb_align'] and str(cfg.get('sampler_mode', 'random')).lower() != 'cancer_balanced':
+        print(
+            "[WB] Warning: generated-support WB benefits from multi-cancer batches. "
+            "Recommended: --batch_size_graphs 8 --sampler_mode cancer_balanced --sampler_k_cancers 4 --sampler_m_per_cancer 2."
+        )
     if cfg.get('sampler_seed', None) is None:
         cfg['sampler_seed'] = int(getattr(args, 'split_seed', 42))
     cfg['lr_scheduler'] = str(cfg.get('lr_scheduler', 'none')).lower()
@@ -856,7 +1030,7 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     in_dim = pyg_graphs[0].x.shape[1]
 
     n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
-    n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
+    n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
 
     # 默认：启用分层，按比例划分验证集；若未启用分层，则进行简单划分
     if getattr(args, 'stratify_by_cancer', True):
@@ -1186,6 +1360,37 @@ def train_and_validate(
                 group['lr'] = float(base_lr) * eps
         return scheduler
 
+    def _set_requires_grad(module_or_params, enabled):
+        if module_or_params is None:
+            return
+        params = module_or_params.parameters() if hasattr(module_or_params, 'parameters') else module_or_params
+        for p in params:
+            p.requires_grad_(bool(enabled))
+
+    def _wb_lambda_for_step(step_idx):
+        if not bool(cfg.get('use_wb_align', False)):
+            return 0.0
+        lambda_max = float(cfg.get('lambda_wb', 0.01))
+        warmup_steps = _epochs_to_steps(cfg.get('wb_warmup_epochs', 10), steps_per_epoch)
+        ramp_steps = _epochs_to_steps(cfg.get('wb_ramp_epochs', 20), steps_per_epoch)
+        if int(step_idx) < warmup_steps:
+            return 0.0
+        if ramp_steps <= 0:
+            return lambda_max
+        progress = min(max(float(int(step_idx) - warmup_steps) / float(max(ramp_steps, 1)), 0.0), 1.0)
+        return lambda_max * progress
+
+    def _stat_to_float(stats, key, default=float('nan')):
+        value = stats.get(key, default) if isinstance(stats, dict) else default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return float(value.detach().mean().item())
+        try:
+            return float(value)
+        except Exception:
+            return default
+
     model = STOnco_Classifier(
         in_dim=in_dim,
         hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
@@ -1195,7 +1400,48 @@ def train_and_validate(
         use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
     )
     model = model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    use_wb_align = bool(cfg.get('use_wb_align', False))
+    support_map = None
+    wb_module = None
+    opt_pot = None
+    if use_wb_align:
+        if n_domains_cancer is None or int(n_domains_cancer) <= 0:
+            raise ValueError('use_wb_align=1 requires n_domains_cancer; prepare_graphs must return it when WB is enabled.')
+        support_map = GeneratedSupportMap(
+            model.gnn.out_dim,
+            hidden=int(cfg.get('wb_support_hidden', 128)),
+            dropout=float(cfg.get('wb_support_dropout', 0.0)),
+        ).to(device)
+        wb_module = GeneratedSupportWBLoss(
+            n_domains=int(n_domains_cancer),
+            in_dim=model.gnn.out_dim,
+            loss_type=str(cfg.get('wb_loss_type', 'euclidean_pairwise')),
+            potential_hidden=int(cfg.get('wb_potential_hidden', 128)),
+            spots_per_graph=int(cfg.get('wb_spots_per_graph', 64)),
+            spots_per_cancer=int(cfg.get('wb_spots_per_cancer', 0)),
+            support_size=int(cfg.get('wb_support_size', 128)),
+            min_cancers=int(cfg.get('wb_min_cancers', 2)),
+            min_spots=int(cfg.get('wb_min_spots', 2)),
+            regularizer=str(cfg.get('wb_regularizer', 'l2')),
+            epsilon=float(cfg.get('wb_epsilon', 0.1)),
+            label_balanced_sampling=bool(cfg.get('wb_label_balanced_sampling', False)),
+            state_direction=bool(cfg.get('wb_state_direction', False)),
+            state_direction_weight=float(cfg.get('wb_state_direction_weight', 0.1)),
+            euclid_pairwise_weight=float(cfg.get('wb_euclid_pairwise_weight', 1.0)),
+            potential_weight=float(cfg.get('wb_potential_weight', 1.0)),
+            potential_constraint_weight=float(cfg.get('wb_potential_constraint_weight', 0.01)),
+        ).to(device)
+        opt_pot = torch.optim.AdamW(
+            list(wb_module.potential_parameters()),
+            lr=float(cfg.get('wb_potential_lr', 1e-4)),
+            weight_decay=0.0,
+        )
+    main_params = list(model.parameters())
+    if support_map is not None:
+        main_params += list(support_map.parameters())
+    if wb_module is not None:
+        main_params += list(wb_module.main_parameters())
+    opt = torch.optim.AdamW(main_params, lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     bce = nn.BCEWithLogitsLoss()
 
     lr_scheduler_name = str(cfg.get('lr_scheduler', 'none')).lower()
@@ -1414,6 +1660,15 @@ def train_and_validate(
         'avg_mmd_loss': [],
         'avg_mmd_raw_slide': [],
         'avg_mmd_raw_cancer': [],
+        'avg_wb_loss': [],
+        'avg_wb_potential_loss': [],
+        'avg_wb_dual_obj': [],
+        'avg_wb_euclid_pairwise': [],
+        'avg_wb_anchor': [],
+        'avg_wb_state_direction': [],
+        'avg_wb_active_cancers': [],
+        'avg_wb_active_spots': [],
+        'wb_lambda': [],
         'train_batch_domain_acc': [],
         'train_cancer_domain_acc': [],
         # 2026-04 update: rename the former "var_risk" metric to
@@ -1429,6 +1684,11 @@ def train_and_validate(
         'val_avg_mmd_loss': [],
         'val_avg_mmd_raw_slide': [],
         'val_avg_mmd_raw_cancer': [],
+        'val_avg_wb_loss': [],
+        'val_avg_wb_anchor': [],
+        'val_avg_wb_state_direction': [],
+        'val_avg_wb_active_cancers': [],
+        'val_avg_wb_active_spots': [],
         'val_batch_loss_variance': [],
         'val_accuracy': [],
         'val_macro_f1': [],
@@ -1479,6 +1739,10 @@ def train_and_validate(
     global_step = 0
     for epoch in epoch_iter:
         model.train()
+        if support_map is not None:
+            support_map.train()
+        if wb_module is not None:
+            wb_module.train()
         tot_total = 0.0
         tot_task = 0.0
         tot_batch = 0.0
@@ -1490,6 +1754,19 @@ def train_and_validate(
         tot_mmd_raw_cancer = 0.0
         cnt_mmd_slide = 0
         cnt_mmd_cancer = 0
+        tot_wb = 0.0
+        tot_wb_potential = 0.0
+        tot_wb_dual = 0.0
+        tot_wb_euclid = 0.0
+        tot_wb_anchor = 0.0
+        tot_wb_state = 0.0
+        tot_wb_active_cancers = 0.0
+        tot_wb_active_spots = 0.0
+        tot_wb_lambda = 0.0
+        cnt_wb = 0
+        cnt_wb_potential = 0
+        cnt_wb_dual = 0
+        cnt_wb_euclid = 0
         batch_losses = []
         num_batches = 0
         train_correct = 0
@@ -1500,6 +1777,42 @@ def train_and_validate(
         dom_cancer_total = 0
         for batch in train_loader:
             batch = batch.to(device)
+            wb_lambda_t = _wb_lambda_for_step(global_step)
+            if use_wb_align and wb_module is not None and support_map is not None and wb_lambda_t > 0.0:
+                if not hasattr(batch, 'cancer_dom') or not hasattr(batch, 'batch'):
+                    raise ValueError('use_wb_align=1 requires batch.cancer_dom and batch.batch for per-spot cancer labels.')
+                if int(global_step) % int(cfg.get('wb_pot_every_n_steps', 1)) == 0:
+                    _set_requires_grad(model, False)
+                    _set_requires_grad(support_map, False)
+                    _set_requires_grad(wb_module.main_parameters(), False)
+                    _set_requires_grad(wb_module.potential_parameters(), True)
+                    opt_pot.zero_grad()
+                    with torch.no_grad():
+                        h_detached = model.gnn(
+                            batch.x,
+                            batch.edge_index,
+                            edge_weight=getattr(batch, 'edge_weight', None),
+                        )
+                        b_detached = support_map(h_detached).detach()
+                    dom_nodes_wb = batch.cancer_dom[batch.batch]
+                    pot_loss, pot_stats = wb_module.potential_loss(
+                        h=h_detached.detach(),
+                        b=b_detached,
+                        cancer_dom=dom_nodes_wb,
+                        graph_nodes=getattr(batch, 'batch', None),
+                        y=getattr(batch, 'y', None),
+                    )
+                    if bool(pot_stats.get('valid', False)) and pot_loss.requires_grad:
+                        pot_loss.backward()
+                        opt_pot.step()
+                        tot_wb_potential += float(pot_loss.detach().item())
+                        cnt_wb_potential += 1
+
+            _set_requires_grad(model, True)
+            _set_requires_grad(support_map, True)
+            if wb_module is not None:
+                _set_requires_grad(wb_module.main_parameters(), True)
+                _set_requires_grad(wb_module.potential_parameters(), False)
             opt.zero_grad()
             if grl_mode == 'constant':
                 grl_beta_slide = float(cfg.get('grl_beta_slide_target', 1.0))
@@ -1540,7 +1853,7 @@ def train_and_validate(
                 edge_weight=getattr(batch, 'edge_weight', None),
                 grl_beta_slide=grl_beta_slide,
                 grl_beta_cancer=grl_beta_cancer,
-                return_h=bool(cfg.get('use_mmd', False)),
+                return_h=bool(cfg.get('use_mmd', False) or cfg.get('use_wb_align', False)),
             )
             global_step += 1
 
@@ -1568,8 +1881,31 @@ def train_and_validate(
                 raw_mmd_slide,
                 raw_mmd_cancer,
             ) = _compute_losses(out, batch)
+            loss_wb = torch.tensor(0.0, device=device)
+            loss_wb_anchor = torch.tensor(0.0, device=device)
+            wb_stats = {'valid': False}
+            if use_wb_align and wb_module is not None and support_map is not None and wb_lambda_t > 0.0:
+                h = out.get('h', None)
+                if h is None:
+                    raise ValueError("WB is enabled but model output does not contain 'h'.")
+                if not hasattr(batch, 'cancer_dom') or not hasattr(batch, 'batch'):
+                    raise ValueError('use_wb_align=1 requires batch.cancer_dom and batch.batch for per-spot cancer labels.')
+                b_wb = support_map(h)
+                dom_nodes_wb = batch.cancer_dom[batch.batch]
+                loss_wb, loss_wb_anchor, wb_stats = wb_module.model_loss(
+                    h=h,
+                    b=b_wb,
+                    cancer_dom=dom_nodes_wb,
+                    graph_nodes=getattr(batch, 'batch', None),
+                    y=getattr(batch, 'y', None),
+                )
+                loss_total = loss_total + float(wb_lambda_t) * (
+                    loss_wb + float(cfg.get('wb_anchor_weight', 0.5)) * loss_wb_anchor
+                )
             loss_total.backward()
             opt.step()
+            if wb_module is not None:
+                _set_requires_grad(wb_module.potential_parameters(), True)
             if lr_scheduler is not None and lr_scheduler_name in {'linear', 'cosine', 'warmup_cosine'}:
                 lr_scheduler.step()
 
@@ -1588,6 +1924,25 @@ def train_and_validate(
             if torch.isfinite(raw_mmd_cancer):
                 tot_mmd_raw_cancer += float(raw_mmd_cancer.item())
                 cnt_mmd_cancer += 1
+            if use_wb_align:
+                tot_wb_lambda += float(wb_lambda_t)
+                if bool(wb_stats.get('valid', False)):
+                    tot_wb += float(loss_wb.detach().item())
+                    tot_wb_anchor += float(loss_wb_anchor.detach().item())
+                    tot_wb_active_cancers += _stat_to_float(wb_stats, 'wb_active_cancers', default=0.0)
+                    tot_wb_active_spots += _stat_to_float(wb_stats, 'wb_active_spots', default=0.0)
+                    wb_state = _stat_to_float(wb_stats, 'wb_state_direction', default=float('nan'))
+                    if np.isfinite(wb_state):
+                        tot_wb_state += wb_state
+                    wb_dual = _stat_to_float(wb_stats, 'wb_dual_obj', default=float('nan'))
+                    if np.isfinite(wb_dual):
+                        tot_wb_dual += wb_dual
+                        cnt_wb_dual += 1
+                    wb_euclid = _stat_to_float(wb_stats, 'wb_euclid_pairwise', default=float('nan'))
+                    if np.isfinite(wb_euclid):
+                        tot_wb_euclid += wb_euclid
+                        cnt_wb_euclid += 1
+                    cnt_wb += 1
             batch_losses.append(float(loss_total.item()))
             num_batches += 1
 
@@ -1608,6 +1963,21 @@ def train_and_validate(
         avg_cancer_ce = (tot_cancer_ce / max(1, num_batches)) if cfg.get('use_domain_adv_cancer', False) else float('nan')
         avg_mmd_raw_slide = (tot_mmd_raw_slide / cnt_mmd_slide) if cnt_mmd_slide > 0 else float('nan')
         avg_mmd_raw_cancer = (tot_mmd_raw_cancer / cnt_mmd_cancer) if cnt_mmd_cancer > 0 else float('nan')
+        avg_wb = (tot_wb / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_potential = (tot_wb_potential / cnt_wb_potential) if cnt_wb_potential > 0 else float('nan')
+        avg_wb_dual = (tot_wb_dual / cnt_wb_dual) if cnt_wb_dual > 0 else float('nan')
+        avg_wb_euclid = (tot_wb_euclid / cnt_wb_euclid) if cnt_wb_euclid > 0 else float('nan')
+        avg_wb_anchor = (tot_wb_anchor / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_state = (tot_wb_state / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_active_cancers = (tot_wb_active_cancers / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_active_spots = (tot_wb_active_spots / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_lambda = (tot_wb_lambda / max(1, num_batches)) if use_wb_align else float('nan')
+        if use_wb_align and avg_wb_lambda > 0 and cnt_wb == 0:
+            print(
+                f"[WB] Warning: epoch {epoch} produced no valid WB batches. "
+                f"Need at least wb_min_cancers={cfg.get('wb_min_cancers')} and "
+                f"wb_min_spots={cfg.get('wb_min_spots')} per active cancer after spot sampling."
+            )
         train_batch_domain_acc = float(dom_slide_correct / dom_slide_total) if dom_slide_total > 0 else float('nan')
         train_cancer_domain_acc = float(dom_cancer_correct / dom_cancer_total) if dom_cancer_total > 0 else float('nan')
         # batch_loss_variance is the per-epoch variance of mini-batch total loss.
@@ -1623,6 +1993,15 @@ def train_and_validate(
         hist['avg_mmd_loss'].append(avg_mmd)
         hist['avg_mmd_raw_slide'].append(avg_mmd_raw_slide)
         hist['avg_mmd_raw_cancer'].append(avg_mmd_raw_cancer)
+        hist['avg_wb_loss'].append(avg_wb)
+        hist['avg_wb_potential_loss'].append(avg_wb_potential)
+        hist['avg_wb_dual_obj'].append(avg_wb_dual)
+        hist['avg_wb_euclid_pairwise'].append(avg_wb_euclid)
+        hist['avg_wb_anchor'].append(avg_wb_anchor)
+        hist['avg_wb_state_direction'].append(avg_wb_state)
+        hist['avg_wb_active_cancers'].append(avg_wb_active_cancers)
+        hist['avg_wb_active_spots'].append(avg_wb_active_spots)
+        hist['wb_lambda'].append(avg_wb_lambda)
         hist['train_batch_domain_acc'].append(train_batch_domain_acc)
         hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
         hist['batch_loss_variance'].append(batch_loss_variance)
@@ -1630,6 +2009,10 @@ def train_and_validate(
 
         # 验证（内部 + 外部）
         model.eval()
+        if support_map is not None:
+            support_map.eval()
+        if wb_module is not None:
+            wb_module.eval()
         val_logits_list = []
         val_y_list = []
         per_slide_acc = []
@@ -1644,6 +2027,12 @@ def train_and_validate(
         val_tot_mmd_raw_cancer = 0.0
         val_cnt_mmd_slide = 0
         val_cnt_mmd_cancer = 0
+        val_tot_wb = 0.0
+        val_tot_wb_anchor = 0.0
+        val_tot_wb_state = 0.0
+        val_tot_wb_active_cancers = 0.0
+        val_tot_wb_active_spots = 0.0
+        val_cnt_wb = 0
         val_num_batches = 0
         val_batch_losses = []
         with torch.no_grad():
@@ -1654,7 +2043,7 @@ def train_and_validate(
                     vb.edge_index,
                     batch=getattr(vb, 'batch', None),
                     edge_weight=getattr(vb, 'edge_weight', None),
-                    return_h=bool(cfg.get('use_mmd', False)),
+                    return_h=bool(cfg.get('use_mmd', False) or (cfg.get('use_wb_align', False) and cfg.get('wb_eval_loss', False))),
                 )
                 (
                     val_loss_total,
@@ -1667,6 +2056,29 @@ def train_and_validate(
                     val_raw_mmd_slide,
                     val_raw_mmd_cancer,
                 ) = _compute_losses(out_v, vb)
+                if use_wb_align and bool(cfg.get('wb_eval_loss', False)) and wb_module is not None and support_map is not None:
+                    h_v = out_v.get('h', None)
+                    if h_v is not None and hasattr(vb, 'cancer_dom') and hasattr(vb, 'batch'):
+                        b_v = support_map(h_v)
+                        val_loss_wb, val_loss_wb_anchor, val_wb_stats = wb_module.model_loss(
+                            h=h_v,
+                            b=b_v,
+                            cancer_dom=vb.cancer_dom[vb.batch],
+                            graph_nodes=getattr(vb, 'batch', None),
+                            y=getattr(vb, 'y', None),
+                        )
+                        if bool(val_wb_stats.get('valid', False)):
+                            val_loss_total = val_loss_total + float(_wb_lambda_for_step(global_step)) * (
+                                val_loss_wb + float(cfg.get('wb_anchor_weight', 0.5)) * val_loss_wb_anchor
+                            )
+                            val_tot_wb += float(val_loss_wb.detach().item())
+                            val_tot_wb_anchor += float(val_loss_wb_anchor.detach().item())
+                            val_state = _stat_to_float(val_wb_stats, 'wb_state_direction', default=float('nan'))
+                            if np.isfinite(val_state):
+                                val_tot_wb_state += val_state
+                            val_tot_wb_active_cancers += _stat_to_float(val_wb_stats, 'wb_active_cancers', default=0.0)
+                            val_tot_wb_active_spots += _stat_to_float(val_wb_stats, 'wb_active_spots', default=0.0)
+                            val_cnt_wb += 1
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
                 val_y_list.append(vb.y.cpu())
@@ -1697,7 +2109,7 @@ def train_and_validate(
                     vg.edge_index,
                     batch=getattr(vg, 'batch', None),
                     edge_weight=getattr(vg, 'edge_weight', None),
-                    return_h=bool(cfg.get('use_mmd', False)),
+                    return_h=bool(cfg.get('use_mmd', False) or (cfg.get('use_wb_align', False) and cfg.get('wb_eval_loss', False))),
                 )
                 (
                     val_loss_total,
@@ -1710,6 +2122,29 @@ def train_and_validate(
                     val_raw_mmd_slide,
                     val_raw_mmd_cancer,
                 ) = _compute_losses(out_v, vg)
+                if use_wb_align and bool(cfg.get('wb_eval_loss', False)) and wb_module is not None and support_map is not None:
+                    h_v = out_v.get('h', None)
+                    if h_v is not None and hasattr(vg, 'cancer_dom') and hasattr(vg, 'batch'):
+                        b_v = support_map(h_v)
+                        val_loss_wb, val_loss_wb_anchor, val_wb_stats = wb_module.model_loss(
+                            h=h_v,
+                            b=b_v,
+                            cancer_dom=vg.cancer_dom[vg.batch],
+                            graph_nodes=getattr(vg, 'batch', None),
+                            y=getattr(vg, 'y', None),
+                        )
+                        if bool(val_wb_stats.get('valid', False)):
+                            val_loss_total = val_loss_total + float(_wb_lambda_for_step(global_step)) * (
+                                val_loss_wb + float(cfg.get('wb_anchor_weight', 0.5)) * val_loss_wb_anchor
+                            )
+                            val_tot_wb += float(val_loss_wb.detach().item())
+                            val_tot_wb_anchor += float(val_loss_wb_anchor.detach().item())
+                            val_state = _stat_to_float(val_wb_stats, 'wb_state_direction', default=float('nan'))
+                            if np.isfinite(val_state):
+                                val_tot_wb_state += val_state
+                            val_tot_wb_active_cancers += _stat_to_float(val_wb_stats, 'wb_active_cancers', default=0.0)
+                            val_tot_wb_active_spots += _stat_to_float(val_wb_stats, 'wb_active_spots', default=0.0)
+                            val_cnt_wb += 1
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
                 val_y_list.append(vg.y.cpu())
@@ -1749,6 +2184,11 @@ def train_and_validate(
         val_avg_cancer_ce = (val_tot_cancer_ce / max(1, val_num_batches)) if cfg.get('use_domain_adv_cancer', False) else float('nan')
         val_avg_mmd_raw_slide = (val_tot_mmd_raw_slide / val_cnt_mmd_slide) if val_cnt_mmd_slide > 0 else float('nan')
         val_avg_mmd_raw_cancer = (val_tot_mmd_raw_cancer / val_cnt_mmd_cancer) if val_cnt_mmd_cancer > 0 else float('nan')
+        val_avg_wb = (val_tot_wb / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_anchor = (val_tot_wb_anchor / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_state = (val_tot_wb_state / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_active_cancers = (val_tot_wb_active_cancers / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_active_spots = (val_tot_wb_active_spots / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_batch_loss_variance = float(np.mean([(v - val_avg_total) ** 2 for v in val_batch_losses])) if val_batch_losses else float('nan')
         val_accuracy = float(np.nanmean(per_slide_acc)) if per_slide_acc else float('nan')
         hist['val_avg_total_loss'].append(val_avg_total)
@@ -1760,6 +2200,11 @@ def train_and_validate(
         hist['val_avg_mmd_loss'].append(val_avg_mmd)
         hist['val_avg_mmd_raw_slide'].append(val_avg_mmd_raw_slide)
         hist['val_avg_mmd_raw_cancer'].append(val_avg_mmd_raw_cancer)
+        hist['val_avg_wb_loss'].append(val_avg_wb)
+        hist['val_avg_wb_anchor'].append(val_avg_wb_anchor)
+        hist['val_avg_wb_state_direction'].append(val_avg_wb_state)
+        hist['val_avg_wb_active_cancers'].append(val_avg_wb_active_cancers)
+        hist['val_avg_wb_active_spots'].append(val_avg_wb_active_spots)
         hist['val_batch_loss_variance'].append(val_batch_loss_variance)
         hist['val_accuracy'].append(val_accuracy)
         hist['val_macro_f1'].append(m.get('macro_f1', float('nan')))
@@ -1779,6 +2224,8 @@ def train_and_validate(
             'val_auroc': m.get('auroc', float('nan')),
             'val_auprc': m.get('auprc', float('nan')),
         }
+        best_metric_name = str(cfg.get('best_metric', 'val_macro_f1'))
+        best_metric_value = plateau_metrics.get(best_metric_name, float('nan'))
         if lr_scheduler is not None and lr_scheduler_name == 'plateau':
             monitored_metric = plateau_metrics.get(plateau_metric, float('nan'))
             if np.isfinite(monitored_metric):
@@ -1809,13 +2256,26 @@ def train_and_validate(
             except Exception:
                 pass
 
-        improved = val_accuracy > best['accuracy']
+        if best.get('state', None) is None:
+            improved = True
+        elif best_metric_name == 'val_avg_total_loss':
+            prev_best_metric = best.get('best_metric_value', float('inf'))
+            if not np.isfinite(prev_best_metric):
+                prev_best_metric = float('inf')
+            improved = np.isfinite(best_metric_value) and best_metric_value < prev_best_metric
+        else:
+            prev_best_metric = best.get('best_metric_value', -float('inf'))
+            if not np.isfinite(prev_best_metric):
+                prev_best_metric = -float('inf')
+            improved = np.isfinite(best_metric_value) and best_metric_value > prev_best_metric
         if improved:
             best = {
                 'auroc': metrics['auroc'],
                 'accuracy': metrics['accuracy'],
                 'macro_f1': metrics['macro_f1'],
                 'auprc': metrics['auprc'],
+                'best_metric': best_metric_name,
+                'best_metric_value': float(best_metric_value) if np.isfinite(best_metric_value) else float('nan'),
                 'state': copy.deepcopy(model.state_dict()),
                 'epoch': epoch,
             }
@@ -1842,6 +2302,14 @@ def train_and_validate(
     best['epoch_states'] = saved_epoch_states
     if capture_last_state:
         best['last_state'] = copy.deepcopy(model.state_dict())
+    if use_wb_align and support_map is not None and wb_module is not None:
+        best['wb_support_map_last'] = copy.deepcopy(support_map.state_dict())
+        best['wb_potentials_last'] = copy.deepcopy(wb_module.state_dict())
+        best['wb_config'] = {
+            k: cfg.get(k)
+            for k in sorted(cfg.keys())
+            if str(k).startswith('wb_') or str(k) in {'use_wb_align', 'lambda_wb'}
+        }
     return best, hist, best['state']
 
 
@@ -1862,6 +2330,15 @@ def _save_loss_components_csv(hist, out_dir):
         'avg_mmd_loss': hist.get('avg_mmd_loss', [float('nan')] * n_epochs),
         'avg_mmd_raw_slide': hist.get('avg_mmd_raw_slide', [float('nan')] * n_epochs),
         'avg_mmd_raw_cancer': hist.get('avg_mmd_raw_cancer', [float('nan')] * n_epochs),
+        'avg_wb_loss': hist.get('avg_wb_loss', [float('nan')] * n_epochs),
+        'avg_wb_potential_loss': hist.get('avg_wb_potential_loss', [float('nan')] * n_epochs),
+        'avg_wb_dual_obj': hist.get('avg_wb_dual_obj', [float('nan')] * n_epochs),
+        'avg_wb_euclid_pairwise': hist.get('avg_wb_euclid_pairwise', [float('nan')] * n_epochs),
+        'avg_wb_anchor': hist.get('avg_wb_anchor', [float('nan')] * n_epochs),
+        'avg_wb_state_direction': hist.get('avg_wb_state_direction', [float('nan')] * n_epochs),
+        'avg_wb_active_cancers': hist.get('avg_wb_active_cancers', [float('nan')] * n_epochs),
+        'avg_wb_active_spots': hist.get('avg_wb_active_spots', [float('nan')] * n_epochs),
+        'wb_lambda': hist.get('wb_lambda', [float('nan')] * n_epochs),
         'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
         'train_cancer_domain_acc': hist.get('train_cancer_domain_acc', [float('nan')] * n_epochs),
         'train_accuracy': hist.get('train_accuracy', [float('nan')] * n_epochs),
@@ -1875,6 +2352,11 @@ def _save_loss_components_csv(hist, out_dir):
         'val_avg_mmd_loss': hist.get('val_avg_mmd_loss', [float('nan')] * n_epochs),
         'val_avg_mmd_raw_slide': hist.get('val_avg_mmd_raw_slide', [float('nan')] * n_epochs),
         'val_avg_mmd_raw_cancer': hist.get('val_avg_mmd_raw_cancer', [float('nan')] * n_epochs),
+        'val_avg_wb_loss': hist.get('val_avg_wb_loss', [float('nan')] * n_epochs),
+        'val_avg_wb_anchor': hist.get('val_avg_wb_anchor', [float('nan')] * n_epochs),
+        'val_avg_wb_state_direction': hist.get('val_avg_wb_state_direction', [float('nan')] * n_epochs),
+        'val_avg_wb_active_cancers': hist.get('val_avg_wb_active_cancers', [float('nan')] * n_epochs),
+        'val_avg_wb_active_spots': hist.get('val_avg_wb_active_spots', [float('nan')] * n_epochs),
         'val_accuracy': hist.get('val_accuracy', [float('nan')] * n_epochs),
         'val_macro_f1': hist.get('val_macro_f1', [float('nan')] * n_epochs),
         'val_auroc': hist.get('val_auroc', [float('nan')] * n_epochs),
@@ -2016,12 +2498,82 @@ def _plot_train_metrics(hist, out_dir):
     return out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg
 
 
+def _plot_wb_train_metrics(hist, out_dir):
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0 or 'avg_wb_loss' not in hist:
+        return None
+    epochs = list(range(1, n_epochs + 1))
+    line_color = '#1f3a5f'
+    do_smooth = n_epochs > 100
+    smooth_window = 10
+    raw_alpha = 0.35
+    raw_lw = 0.6
+    smooth_lw = 1.4
+
+    def _plot_neurips(ax, values, title):
+        series = pd.Series(values, dtype='float64')
+        if do_smooth:
+            ax.plot(epochs, series.values, color=line_color, linewidth=raw_lw, alpha=raw_alpha)
+            smooth = series.rolling(window=smooth_window, min_periods=1).mean()
+            ax.plot(epochs, smooth.values, color=line_color, linewidth=smooth_lw)
+        else:
+            ax.plot(epochs, series.values, color=line_color, linewidth=smooth_lw)
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
+
+    metrics_wb = [
+        ('avg_total_loss', 'avg_total_loss'),
+        ('avg_task_loss', 'avg_task_loss'),
+        ('avg_wb_loss', 'avg_wb_loss'),
+        ('avg_wb_potential_loss', 'avg_wb_potential_loss'),
+        ('avg_wb_dual_obj', 'avg_wb_dual_obj'),
+        ('avg_wb_euclid_pairwise', 'avg_wb_euclid_pairwise'),
+        ('avg_wb_anchor', 'avg_wb_anchor'),
+        ('avg_wb_state_direction', 'avg_wb_state_direction'),
+        ('wb_lambda', 'wb_lambda'),
+        ('avg_wb_active_cancers', 'avg_wb_active_cancers'),
+        ('avg_wb_active_spots', 'avg_wb_active_spots'),
+    ]
+    fig, axes = plt.subplots(4, 3, figsize=(17, 12), sharex=True)
+    axes_flat = axes.flatten()
+    for ax, (key, title) in zip(axes_flat, metrics_wb):
+        values = hist.get(key, [float('nan')] * n_epochs)
+        _plot_neurips(ax, values, title)
+    for ax in axes_flat[len(metrics_wb):]:
+        ax.axis('off')
+    for row in axes[:-1]:
+        for ax in row:
+            ax.tick_params(labelbottom=True)
+    fig.tight_layout()
+    out_svg = os.path.join(out_dir, 'wb_train_loss.svg')
+    fig.savefig(out_svg, format='svg', dpi=150)
+    plt.close(fig)
+    return out_svg
+
+
 def _count_seen_domains(graphs):
     batch_seen = {int(g.bat_dom.item()) for g in graphs if hasattr(g, 'bat_dom')}
     cancer_seen = {int(g.cancer_dom.item()) for g in graphs if hasattr(g, 'cancer_dom')}
     n_batch = len(batch_seen) if batch_seen else None
     n_cancer = len(cancer_seen) if cancer_seen else None
     return n_batch, n_cancer
+
+
+def _save_wb_artifacts(best, out_dir):
+    if not isinstance(best, dict) or 'wb_support_map_last' not in best or 'wb_potentials_last' not in best:
+        return []
+    os.makedirs(out_dir, exist_ok=True)
+    paths = []
+    support_path = os.path.join(out_dir, 'wb_support_map_last.pt')
+    potentials_path = os.path.join(out_dir, 'wb_potentials_last.pt')
+    config_path = os.path.join(out_dir, 'wb_config.json')
+    torch.save(best['wb_support_map_last'], support_path)
+    torch.save(best['wb_potentials_last'], potentials_path)
+    save_json(dict(best.get('wb_config', {}) or {}), config_path)
+    paths.extend([support_path, potentials_path, config_path])
+    return paths
 
 
 def _plot_domain_diagnostics(
@@ -2228,6 +2780,9 @@ def run_single_training(args, cfg, device):
     else:
         save_model(model, args.artifacts_dir)  # model.pt
         saved_checkpoint = 'best'
+    wb_artifact_paths = _save_wb_artifacts(best, args.artifacts_dir) if bool(cfg.get('use_wb_align', False)) else []
+    for wb_path in wb_artifact_paths:
+        print('Saved WB artifact to', wb_path)
     train_ids = list(getattr(args, '_train_ids', []))
     val_ids = list(getattr(args, '_val_ids', []))
     requested_save_epochs = list(getattr(args, '_save_epoch_checkpoints', []))
@@ -2254,6 +2809,8 @@ def run_single_training(args, cfg, device):
     meta = {
         'cfg': cfg,
         'best_epoch': best['epoch'],
+        'best_metric': best.get('best_metric', cfg.get('best_metric', 'val_macro_f1')),
+        'best_metric_value': best.get('best_metric_value', float('nan')),
         'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
         'completed_full_epochs': bool(completed_full_epochs),
         'saved_checkpoint': saved_checkpoint,
@@ -2296,6 +2853,10 @@ def run_single_training(args, cfg, device):
             )
             if out_dom_svg:
                 print('Saved domain diagnostics figure to', out_dom_svg)
+            if bool(cfg.get('use_wb_align', False)):
+                out_wb_svg = _plot_wb_train_metrics(hist, args.artifacts_dir)
+                if out_wb_svg:
+                    print('Saved WB diagnostics figure to', out_wb_svg)
 
         if getattr(args, 'save_loss_components', 0):
             csv_path = _save_loss_components_csv(hist, args.artifacts_dir)
@@ -2466,7 +3027,7 @@ def run_kfold_training(args, cfg, device):
     in_dim = pyg_graphs[0].x.shape[1]
 
     n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
-    n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
+    n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
 
     # 生成K个fold（按比例 + 保底每癌种1张）
     rng = random.Random(args.split_seed)
@@ -2517,6 +3078,9 @@ def run_kfold_training(args, cfg, device):
             capture_epoch_states=getattr(args, '_save_epoch_checkpoints', []),
         )
         train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
+        if bool(cfg.get('use_wb_align', False)):
+            for wb_path in _save_wb_artifacts(best, fold_dir):
+                print(f'[KFold] Saved WB artifact to {wb_path}')
 
         if getattr(args, 'save_train_curves', 1):
             try:
@@ -2539,6 +3103,10 @@ def run_kfold_training(args, cfg, device):
                 )
                 if out_dom_svg:
                     print(f'[KFold] Saved domain diagnostics figure to {out_dom_svg}')
+                if bool(cfg.get('use_wb_align', False)):
+                    out_wb_svg = _plot_wb_train_metrics(hist, fold_dir)
+                    if out_wb_svg:
+                        print(f'[KFold] Saved WB diagnostics figure to {out_wb_svg}')
             except Exception as e:
                 print(f'[KFold] Warning: failed to save training curves: {e}')
 
@@ -2606,6 +3174,8 @@ def run_kfold_training(args, cfg, device):
         meta = {
             'cfg': cfg,
             'best_epoch': best['epoch'],
+            'best_metric': best.get('best_metric', cfg.get('best_metric', 'val_macro_f1')),
+            'best_metric_value': best.get('best_metric_value', float('nan')),
             'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
             'completed_full_epochs': bool(completed_full_epochs),
             'saved_checkpoint': saved_checkpoint,
@@ -2913,7 +3483,7 @@ def run_loco_training(args, cfg, device):
 
         in_dim = train_graphs[0].x.shape[1]
         n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
-        n_domains_cancer = len(cancer_to_idx) if cfg.get('use_domain_adv_cancer', False) else None
+        n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
 
         external_val_graphs = _build_external_val_graphs(args, cfg, loco_dir)
         best, hist, best_state = train_and_validate(
@@ -2932,6 +3502,9 @@ def run_loco_training(args, cfg, device):
             capture_epoch_states=getattr(args, '_save_epoch_checkpoints', []),
         )
         train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
+        if bool(cfg.get('use_wb_align', False)):
+            for wb_path in _save_wb_artifacts(best, loco_dir):
+                print(f'[LOCO] Saved WB artifact to {wb_path}')
 
         if getattr(args, 'save_train_curves', 1):
             try:
@@ -2954,6 +3527,10 @@ def run_loco_training(args, cfg, device):
                 )
                 if out_dom_svg:
                     print(f'[LOCO] Saved domain diagnostics figure to {out_dom_svg}')
+                if bool(cfg.get('use_wb_align', False)):
+                    out_wb_svg = _plot_wb_train_metrics(hist, loco_dir)
+                    if out_wb_svg:
+                        print(f'[LOCO] Saved WB diagnostics figure to {out_wb_svg}')
             except Exception as e:
                 print(f'[LOCO] Warning: failed to save training curves: {e}')
 
@@ -3017,6 +3594,8 @@ def run_loco_training(args, cfg, device):
             'cfg': cfg,
             'train_npz': str(args.train_npz),
             'best_epoch': best['epoch'],
+            'best_metric': best.get('best_metric', cfg.get('best_metric', 'val_macro_f1')),
+            'best_metric_value': best.get('best_metric_value', float('nan')),
             'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
             'completed_full_epochs': bool(completed_full_epochs),
             'saved_checkpoint': saved_checkpoint,

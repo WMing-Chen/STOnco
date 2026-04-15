@@ -1,6 +1,6 @@
 # STOnco: Visium 空间转录组 GNN 分类与域自适应
 
-本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）与可选的双域对抗（癌种域 + 批次域）。
+本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）、可选的双域对抗（癌种域 + 批次域）、MMD 对齐，以及 generated-support Wasserstein barycenter（WB）多癌种 latent 对齐。
 
 ---
 
@@ -39,8 +39,11 @@
   - `GraphBuilder.lap_pe`：生成 Laplacian 位置编码并可拼接到节点特征。
 - `stonco/core/train.py`
   - `prepare_graphs`：加载训练 NPZ，构图并进行癌种分层/划分。
-  - `train_and_validate`：核心训练循环，支持双域对抗与指标评估。
+  - `train_and_validate`：核心训练循环，支持双域对抗、MMD/WB 对齐与指标评估。
   - `run_single_training` / `run_kfold_training` / `run_loco_training`：三种训练模式入口。
+- `stonco/core/wb_potentials.py`
+  - `GeneratedSupportMap`：训练阶段生成 `b=T_phi(h)` 的 identity-initialized residual map。
+  - `GeneratedSupportWBLoss`：generated-support WB loss helper，支持 `euclidean_pairwise` 与 `dual_potential`。
 - `stonco/core/infer.py`
   - `InferenceEngine`：封装预处理、构图、预测与基因重要性计算。
 - `stonco/core/batch_infer.py`
@@ -212,6 +215,11 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
     - `dann`：支持两路独立 `delay_epochs`；delay 前 `beta=0`，之后在剩余训练过程上重新归一化并走完整 DANN 曲线。核心参数：`--grl_beta_slide_target/--grl_beta_cancer_target/--grl_beta_gamma`（默认 **1.0/0.5/10**）以及 `--grl_beta_slide_delay_epochs/--grl_beta_cancer_delay_epochs`（默认 **1/3**）
     - `constant`：全程恒定 beta=`*_target`（忽略 `--grl_beta_gamma` 与 4 个 `*_epochs`）
     - `linear`：delay 前 `beta=0`，delay 后线性升到 `*_target`；默认 slide 为 **delay=1, warmup=8**，cancer 为 **delay=3, warmup=12**
+  - Wasserstein barycenter 对齐（可选）：
+    - `--use_wb_align 1` 启用 generated-support WB；推荐与 `--use_mmd 0` 搭配作为 MMD 替代实验
+    - `--wb_loss_type euclidean_pairwise` 是低计算量默认起点；`dual_potential` 更贴近正规 dual-potential WB objective，但更慢
+    - WB 仍让分类 head 使用 `h`，训练阶段额外学习 `b=T_phi(h)` 并通过 anchor 把对齐效果传回 `h`
+    - 推荐配合 `--sampler_mode cancer_balanced --sampler_k_cancers 4 --sampler_m_per_cancer 2/3`
   - 外部验证：`--val_sample_dir` 指定外部验证 NPZ 目录（单切片），验证指标会合并计算。
   - Loss 组件：`--save_loss_components 1`（默认开启）会保存 `loss_components.csv` 到 artifacts_dir。
   - 解释性：默认开启，`--explain_method ig`，`--ig_steps 50`；训练结束会保存 `per_gene_saliency.csv` 到 artifacts_dir。
@@ -504,6 +512,30 @@ python -m stonco.core.train \
       - --grl_beta_cancer_delay_epochs（默认 3）
       - --grl_beta_cancer_warmup_epochs（默认 12）
       - 行为：delay 前 `beta=0`，delay 后线性升到 `*_target`
+- Wasserstein barycenter 对齐（可选，作用于 GNN latent `h`）：
+  - `--use_wb_align {0,1}`：启用 generated-support WB 对齐，默认 0
+  - `--wb_loss_type {euclidean_pairwise,dual_potential}`：WB loss 类型；默认 `euclidean_pairwise`
+    - `euclidean_pairwise`：用 generated support 上的两两欧氏距离 / energy-distance surrogate 加 potential critic，计算量较低
+    - `dual_potential`：source-side `f_k(h)` + support-side `g_k(b)` 的 dual-potential WB objective，计算量较高
+  - `--wb_support_mode generated_support`：第一版仅支持 `b=T_phi(h)`；不使用 pooled support、memory bank 或独立 finite atoms
+  - `--lambda_wb`、`--wb_warmup_epochs`、`--wb_ramp_epochs`：WB 总权重与 warmup/ramp 调度
+  - `--wb_anchor_weight`：`h` 与 `b` 的 anchor 权重；anchor 在训练循环中单独加一次，避免 generated support 与分类表征脱耦
+  - `--wb_support_hidden`、`--wb_support_dropout`：`GeneratedSupportMap` 结构参数
+  - `--wb_potential_hidden`、`--wb_potential_lr`、`--wb_pot_every_n_steps`：potential 网络与交替更新频率
+  - `--wb_spots_per_graph`：每张 graph/slide 最多抽取多少 spot 参与 WB，默认 64
+  - `--wb_spots_per_cancer`：每个 cancer 的二级 spot cap，默认 0 表示关闭
+  - `--wb_support_size`：`dual_potential` 中从 selected `b` 再抽取的 support-side 点数，默认 128
+  - `--wb_min_cancers`、`--wb_min_spots`：计算 WB 的最少 active cancer 数和每癌种最少 spot 数；不足时该 batch 跳过 WB
+  - `--wb_regularizer {l2,entropy}`、`--wb_epsilon`：`dual_potential` 的 regularizer 设置，默认 `l2` 与 0.1
+  - `--wb_label_balanced_sampling {0,1}`：可选 label-balanced WB 内部抽样，默认关闭
+  - `--wb_state_direction {0,1}`、`--wb_state_direction_weight`：可选 tumor-normal shared state direction 约束，默认关闭
+  - `--wb_eval_loss {0,1}`：验证阶段是否计算 WB diagnostics，默认关闭；开启会增加验证耗时
+  - `--best_metric {val_macro_f1,val_auprc,val_accuracy,val_auroc,val_avg_total_loss}`：最佳 checkpoint 选择指标，默认 `val_macro_f1`
+  - 实现细节：
+    - 训练推理路径不变：`GNNBackbone -> h -> ClassifierHead`
+    - WB 训练阶段额外使用 `GeneratedSupportMap` 得到 `b=T_phi(h)`，并交替更新 potentials 与主模型
+    - 若 `use_domain_adv_cancer=0` 但 `use_wb_align=1`，训练仍会构建 `n_domains_cancer` 供 potential bank 使用
+    - 如果同时开启 `use_mmd=1` 和 `use_wb_align=1`，代码会打印 warning；主实验建议二者互斥
 - 划分/验证：
   - --stratify_by_cancer 按癌种分层（默认启用，按比例划分且每癌种保底 1 张，n=1 仅训练）
   - --no_stratify_by_cancer 关闭分层，使用最后 1 张作为验证
@@ -524,6 +556,7 @@ python -m stonco.core.train \
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
 - 图像预处理（当 --use_image_features 1）：img_feature_names.txt，img_scaler.joblib，img_pca.joblib（若 --img_use_pca 1）
 - 模型：model.pt（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）；可选：model_best.pt（启用 --save_last 时保存最优模型）
+- WB 训练 artifacts（当 `--use_wb_align 1`）：`wb_support_map_last.pt`、`wb_potentials_last.pt`、`wb_config.json`
 - 额外轮次快照：若设置 `--save_epoch_checkpoints`，会额外生成自包含的 `epoch_checkpoints/epoch_XXX/` 目录，包含 `model.pt`、`meta.json`、预处理器文件，以及按该轮截断的训练曲线与 `loss_components.csv`（若对应开关启用）
 - 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint、saved_epoch_checkpoints、requested_save_epoch_checkpoints）
 - GNN 主干配置：新训练产物以 `cfg.GNN_hidden` 为准；旧产物若仅含 `cfg.hidden` 仍可兼容加载
@@ -532,7 +565,8 @@ python -m stonco.core.train \
   - `train_loss.svg`：`3x3`，包含训练损失组件和 `train_accuracy`
   - `train_val_loss.svg`：`3x3`，包含训练/验证损失对照和 `accuracy`
   - `train_val_metrics.svg`：`2x2`，包含 `val_accuracy/val_macro_f1/val_auroc/val_auprc`
-- Loss 组件：`loss_components.csv` 新增 `lr` 列，并继续保存训练/验证损失及 `val_*` 指标
+  - `wb_train_loss.svg`：启用 WB 时额外保存，包含 `avg_total_loss`、`avg_task_loss`、`avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_anchor`、`wb_lambda`、active cancers/spots 等 WB diagnostics
+- Loss 组件：`loss_components.csv` 新增 `lr` 列，并继续保存训练/验证损失及 `val_*` 指标；启用 WB 时额外包含 `avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_anchor`、`avg_wb_active_cancers`、`avg_wb_active_spots`、`wb_lambda` 等列
 - 命名更新：此前文档中的 `Var_risk/var_risk` 已统一更名为 `batch_loss_variance`，含义不变，仍表示每个 epoch 内 mini-batch 总损失的方差。
 
 ### 5.1 产物路径与内容补充
@@ -551,7 +585,7 @@ python -m stonco.core.train \
 
 > 详细实现参见 `stonco/core/train.py`
 
-### 5.2 常见命令行示例：双域、KFold、LOCO
+### 5.2 常见命令行示例：双域、WB、KFold、LOCO
 
 - 双域对抗（癌种域 + 批次域）的典型组合：
 ```bash
@@ -596,6 +630,75 @@ python -m stonco.core.train \
 - 域标签从 `data/cancer_sample_labels.csv` 读取：`cancer_type`（cancer 域）与 `Batch_id`（batch 域）；`Batch_id` 缺失时回退为 `slide_id`；训练时按当前 fold/train 出现的类别动态映射到连续索引（K 动态）。
 - `--lambda_*` 是 alpha（域 loss 权重），beta（GRL 对抗强度）由 `--grl_beta_mode` 控制：`dann` 为带 delay 的 DANN schedule，`constant` 为全程恒定，`linear` 为显式 delay + 线性 warm-up。
 - 域 loss 以 spot-level 计算（对所有 spot 做全局 mean）；域 CE 默认启用 graph-frequency 的 sqrt 反频率 class weight，并做 `clamp(0.5, 5.0)` + mean-normalize 稳定化。
+
+- 对齐项只开 WB、关闭 MMD 与 cancer GRL 的推荐起点：
+
+```bash
+python -m stonco.core.train \
+  --train_npz /path/to/train_data.npz \
+  --artifacts_dir /path/to/artifacts_wb_only \
+  --epochs 100 \
+  --early_patience 0 \
+  --batch_size_graphs 12 \
+  --model gatv2 \
+  --heads 4 \
+  --GNN_hidden 128,32,16 \
+  --num_layers 3 \
+  --dropout 0.3 \
+  --clf_hidden 256,128,64 \
+  --use_pca 0 \
+  --use_image_features 0 \
+  --n_hvg all \
+  --lap_pe_dim 16 \
+  --concat_lap_pe 1 \
+  --use_domain_adv_slide 1 \
+  --use_domain_adv_cancer 0 \
+  --lambda_slide 0.1 \
+  --lambda_cancer 0 \
+  --grl_beta_mode constant \
+  --grl_beta_slide_target 4.0 \
+  --use_mmd 0 \
+  --use_wb_align 1 \
+  --wb_loss_type euclidean_pairwise \
+  --wb_support_mode generated_support \
+  --lambda_wb 0.005 \
+  --wb_warmup_epochs 10 \
+  --wb_ramp_epochs 20 \
+  --wb_anchor_weight 0.5 \
+  --wb_spots_per_graph 64 \
+  --wb_spots_per_cancer 0 \
+  --wb_support_size 128 \
+  --wb_min_cancers 2 \
+  --wb_min_spots 2 \
+  --wb_label_balanced_sampling 0 \
+  --wb_state_direction 0 \
+  --wb_eval_loss 0 \
+  --best_metric val_macro_f1 \
+  --sampler_mode cancer_balanced \
+  --sampler_k_cancers 4 \
+  --sampler_m_per_cancer 3 \
+  --sampler_enforce_distinct_batch 1 \
+  --subgraph_mode off \
+  --save_train_curves 1 \
+  --save_loss_components 1
+```
+
+`dual_potential` 版本更接近正规 dual-potential WB objective，但计算量更高。可在上面命令基础上改为：
+
+```bash
+--wb_loss_type dual_potential \
+--lambda_wb 0.001 \
+--wb_spots_per_graph 32 \
+--wb_support_size 64 \
+--wb_regularizer l2 \
+--wb_epsilon 0.1
+```
+
+WB 运行建议：
+
+- WB 主实验推荐 `--use_mmd 0`，避免与 MMD 同时约束导致归因不清。
+- 若保留 cancer GRL，建议把 `--lambda_cancer` 降到 `0.05-0.1`；如果下游任务性能下降，可先关闭 cancer GRL。
+- `euclidean_pairwise` 可以先用于快速筛参；`dual_potential` 建议在较小 `wb_spots_per_graph` / `wb_support_size` 下验证稳定后再放大。
 
 - 基于癌种的 KFold（随机生成 K 组“每癌种 1 张验证”组合）：
 
