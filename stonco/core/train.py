@@ -1,6 +1,12 @@
-import argparse, os, numpy as np, torch, math, itertools
+import argparse, os, numpy as np, torch, math, itertools, shutil
 from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
 from .models import STOnco_Classifier
+from .sampler import (
+    CancerBalancedBatchSampler,
+    build_training_subgraphs,
+    normalize_sampler_config,
+    summarize_batches,
+)
 from stonco.utils.utils import normalize_gnn_config, save_model, save_json, load_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 import torch.nn.functional as F
@@ -86,6 +92,137 @@ def _resolve_cancer_type(sample_id: str, id2type: dict, fallback_cache: set) -> 
                 fallback_cache.add(sample_id)
     return ctype
 
+
+def _normalize_save_epoch_checkpoints(raw_value):
+    values = []
+
+    def _append(value):
+        if value is None:
+            return
+        if isinstance(value, bool):
+            raise ValueError(f'save_epoch_checkpoints must be positive integers, got bool: {value}')
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _append(item)
+            return
+        if isinstance(value, str):
+            s = value.strip()
+            if s == '':
+                return
+            for part in s.split(','):
+                part = part.strip()
+                if part == '':
+                    continue
+                _append(part)
+            return
+        try:
+            iv = int(value)
+        except Exception as exc:
+            raise ValueError(f'save_epoch_checkpoints must contain positive integers, got: {value}') from exc
+        if iv <= 0:
+            raise ValueError(f'save_epoch_checkpoints must be > 0, got: {iv}')
+        values.append(iv)
+
+    _append(raw_value)
+    return sorted(set(values))
+
+
+def _slice_hist_until_epoch(hist, epoch):
+    hist = dict(hist or {})
+    epoch = int(epoch)
+    sliced = {}
+    for key, values in hist.items():
+        if isinstance(values, pd.Series):
+            sliced[key] = values.iloc[:epoch].tolist()
+        elif isinstance(values, np.ndarray):
+            sliced[key] = values[:epoch].tolist()
+        elif isinstance(values, (list, tuple)):
+            sliced[key] = list(values[:epoch])
+        else:
+            sliced[key] = copy.deepcopy(values)
+    return sliced
+
+
+def _copy_epoch_static_artifacts(source_dir, target_dir):
+    if source_dir is None:
+        return
+    filenames = [
+        'genes_hvg.txt',
+        'scaler.joblib',
+        'pca.joblib',
+        'img_feature_names.txt',
+        'img_scaler.joblib',
+        'img_pca.joblib',
+    ]
+    os.makedirs(target_dir, exist_ok=True)
+    for name in filenames:
+        src = os.path.join(source_dir, name)
+        dst = os.path.join(target_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+
+
+def _save_extra_epoch_checkpoints(
+    model,
+    epoch_states,
+    cfg,
+    out_dir,
+    extra_meta=None,
+    hist=None,
+    save_train_curves=False,
+    save_loss_components=False,
+    domain_plot_kwargs=None,
+    artifact_source_dir=None,
+):
+    epoch_states = dict(epoch_states or {})
+    if len(epoch_states) == 0:
+        return []
+    extra_meta = dict(extra_meta or {})
+    domain_plot_kwargs = dict(domain_plot_kwargs or {})
+    artifact_source_dir = artifact_source_dir or out_dir
+    ckpt_root = os.path.join(out_dir, 'epoch_checkpoints')
+    original_state = copy.deepcopy(model.state_dict())
+    saved_epochs = []
+    try:
+        for epoch in sorted(int(k) for k in epoch_states.keys()):
+            item = dict(epoch_states.get(epoch, {}) or {})
+            state = item.get('state', None)
+            if state is None:
+                continue
+            metrics = dict(item.get('metrics', {}) or {})
+            epoch_dir = os.path.join(ckpt_root, f'epoch_{int(epoch)}')
+            model.load_state_dict(state)
+            save_model(model, epoch_dir)
+            _copy_epoch_static_artifacts(artifact_source_dir, epoch_dir)
+
+            hist_epoch = _slice_hist_until_epoch(hist, epoch) if hist is not None else None
+            if hist_epoch is not None and len(hist_epoch.get('avg_total_loss', [])) > 0:
+                if save_train_curves:
+                    _plot_train_metrics(hist_epoch, epoch_dir)
+                    _plot_domain_diagnostics(hist_epoch, epoch_dir, **domain_plot_kwargs)
+                if save_loss_components:
+                    _save_loss_components_csv(hist_epoch, epoch_dir)
+
+            meta = {
+                'cfg': cfg,
+                'best_epoch': int(epoch),
+                'last_epoch': int(epoch),
+                'completed_full_epochs': False,
+                'saved_checkpoint': 'epoch',
+                'saved_epoch': int(epoch),
+                'saved_epoch_checkpoints': [int(epoch)],
+                'requested_save_epoch_checkpoints': [int(epoch)],
+                'metrics': metrics,
+                'last_metrics': metrics,
+            }
+            meta.update(copy.deepcopy(extra_meta))
+            save_json(meta, os.path.join(epoch_dir, 'meta.json'))
+            print(f'Saved extra epoch artifacts to {epoch_dir}')
+            saved_epochs.append(int(epoch))
+    finally:
+        model.load_state_dict(original_state)
+    return saved_epochs
+
 def _stratified_single_split(present_ids, rng, val_ratio=0.2):
     """按比例划分验证集（保底每癌种1张，n=1则只进训练）。
     返回 (train_ids, val_ids)
@@ -160,6 +297,7 @@ def assemble_pyg(Xp_gene, xy, y, cfg, Xp_img=None, img_mask=None):
     x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float(), y=torch.from_numpy(y).long())
     data.num_nodes = x.shape[0]
+    data.pos = torch.from_numpy(np.asarray(xy)).float()
     return data
 
 def eval_logits(logits, y, return_predictions=False):
@@ -204,6 +342,13 @@ def main():
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--early_patience', type=int, default=None, help='早停耐心值，<=0 表示关闭早停')
     parser.add_argument('--batch_size_graphs', type=int, default=None)
+    parser.add_argument('--sampler_mode', choices=['random', 'cancer_balanced', 'cancer_balanced_subgraph'], default=None, help='训练集sampler模式')
+    parser.add_argument('--sampler_k_cancers', type=int, default=None, help='每个batch优先采样的癌种数K')
+    parser.add_argument('--sampler_m_per_cancer', type=int, default=None, help='每个癌种优先采样的父切片数M')
+    parser.add_argument('--sampler_enforce_distinct_batch', type=int, choices=[0,1], default=None, help='采样时尽量约束同癌种内不同bat_dom (1/0)')
+    parser.add_argument('--subgraph_mode', choices=['off', 'static', 'online'], default=None, help='训练子图模式：off/static/online')
+    parser.add_argument('--subgraph_target_spots', type=int, default=None, help='静态子图目标spots数')
+    parser.add_argument('--subgraph_min_spots', type=int, default=None, help='静态子图最小spots数')
     parser.add_argument('--model', choices=['gatv2', 'sage', 'gcn'], default=None, help='选择GNN主干，默认gatv2')
     parser.add_argument('--heads', type=int, default=None, help='GATv2的多头数（仅对gatv2有效）')
     parser.add_argument('--concat_lap_pe', type=int, choices=[0,1], default=None, help='是否将lapPE拼接至节点特征（1/0）')
@@ -294,10 +439,20 @@ def main():
     # 新增：保存最后一个epoch（仅当实际跑满 epochs 时覆盖 model.pt，同时保存 best 到 model_best.pt）
     parser.add_argument('--save_last', action='store_true',
                         help='若训练实际跑满 epochs：用最后一个epoch覆盖 artifacts_dir/model.pt；并额外保存最优模型到 artifacts_dir/model_best.pt（不强制关闭早停）')
+    parser.add_argument('--save_epoch_checkpoints', type=int, nargs='*', default=None,
+                        help='额外保存指定epoch的模型快照，例如 --save_epoch_checkpoints 100 200；输出到 artifacts_dir/epoch_checkpoints/epoch_XXX/')
 
     args = parser.parse_args()
 
-    cfg = {'pca_dim':64, 'lap_pe_dim':16, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'lr_scheduler':'none', 'lr_warmup_epochs':10, 'min_lr_ratio':0.01, 'plateau_metric':'val_accuracy', 'plateau_factor':0.5, 'plateau_patience':10, 'plateau_threshold':1e-4, 'plateau_cooldown':0, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+    cfg = {'pca_dim':64, 'lap_pe_dim':0, 'knn_k':6, 'gaussian_sigma_factor':1.0, 'num_layers':3, 'dropout':0.3, 'model':'gatv2', 'heads':4, 'lr':1e-3, 'weight_decay':1e-4, 'lr_scheduler':'none', 'lr_warmup_epochs':10, 'min_lr_ratio':0.01, 'plateau_metric':'val_accuracy', 'plateau_factor':0.5, 'plateau_patience':10, 'plateau_threshold':1e-4, 'plateau_cooldown':0, 'epochs':100, 'batch_size_graphs':2, 'early_patience':30,
+           'sampler_mode': 'random',
+           'sampler_k_cancers': None,
+           'sampler_m_per_cancer': None,
+           'sampler_enforce_distinct_batch': True,
+           'sampler_seed': None,
+           'subgraph_mode': 'off',
+           'subgraph_target_spots': 1000,
+           'subgraph_min_spots': 300,
            # 控制项
            'use_pca': False,
            # 方案1：早期融合（默认关闭以保持旧行为）
@@ -361,6 +516,20 @@ def main():
         cfg['early_patience'] = args.early_patience
     if args.batch_size_graphs is not None:
         cfg['batch_size_graphs'] = args.batch_size_graphs
+    if getattr(args, 'sampler_mode', None) is not None:
+        cfg['sampler_mode'] = str(args.sampler_mode)
+    if getattr(args, 'sampler_k_cancers', None) is not None:
+        cfg['sampler_k_cancers'] = int(args.sampler_k_cancers)
+    if getattr(args, 'sampler_m_per_cancer', None) is not None:
+        cfg['sampler_m_per_cancer'] = int(args.sampler_m_per_cancer)
+    if getattr(args, 'sampler_enforce_distinct_batch', None) is not None:
+        cfg['sampler_enforce_distinct_batch'] = bool(args.sampler_enforce_distinct_batch)
+    if getattr(args, 'subgraph_mode', None) is not None:
+        cfg['subgraph_mode'] = str(args.subgraph_mode)
+    if getattr(args, 'subgraph_target_spots', None) is not None:
+        cfg['subgraph_target_spots'] = int(args.subgraph_target_spots)
+    if getattr(args, 'subgraph_min_spots', None) is not None:
+        cfg['subgraph_min_spots'] = int(args.subgraph_min_spots)
     if args.model is not None:
         cfg['model'] = args.model
     if args.heads is not None:
@@ -532,6 +701,8 @@ def main():
     cfg['mmd_sigma'] = None if cfg.get('mmd_sigma', None) is None else float(cfg['mmd_sigma'])
     cfg['mmd_max_pairs'] = int(cfg.get('mmd_max_pairs', 8))
     cfg['mmd_spots_per_slide'] = int(cfg.get('mmd_spots_per_slide', 0))
+    if cfg.get('sampler_seed', None) is None:
+        cfg['sampler_seed'] = int(getattr(args, 'split_seed', 42))
     cfg['lr_scheduler'] = str(cfg.get('lr_scheduler', 'none')).lower()
     if cfg['lr_scheduler'] not in {'none', 'linear', 'cosine', 'warmup_cosine', 'plateau'}:
         raise ValueError(f"cfg['lr_scheduler'] must be one of none/linear/cosine/warmup_cosine/plateau, got: {cfg['lr_scheduler']}")
@@ -563,6 +734,13 @@ def main():
     if cfg['plateau_cooldown'] < 0:
         raise ValueError(f"cfg['plateau_cooldown'] must be >= 0, got: {cfg['plateau_cooldown']}")
     cfg = normalize_gnn_config(cfg)
+    cfg = normalize_sampler_config(cfg)
+    args._save_epoch_checkpoints = _normalize_save_epoch_checkpoints(getattr(args, 'save_epoch_checkpoints', None))
+    invalid_save_epochs = [ep for ep in args._save_epoch_checkpoints if int(ep) > int(cfg.get('epochs', 0))]
+    if len(invalid_save_epochs) > 0:
+        raise ValueError(
+            f"save_epoch_checkpoints contains epochs beyond cfg['epochs']={cfg.get('epochs')}: {invalid_save_epochs}"
+        )
 
     # 设备控制（优先使用命令行指定，否则自动检测；HPO 模式不再强制 CPU）
     if args.device is not None:
@@ -789,6 +967,7 @@ def train_and_validate(
     progress_desc=None,
     progress_leave=False,
     capture_last_state=False,
+    capture_epoch_states=None,
 ):
     """封装单次训练+验证，返回(best_metrics, hist_dict, best_state_dict)
     report_cb(epoch, metrics) 可选用于HPO报告。
@@ -831,6 +1010,8 @@ def train_and_validate(
     grl_mode = str(cfg.get('grl_beta_mode', 'dann'))
     if grl_mode not in {'dann', 'constant', 'linear'}:
         raise ValueError(f"cfg['grl_beta_mode'] must be 'dann', 'constant' or 'linear', got: {cfg.get('grl_beta_mode')}")
+    capture_epoch_states = {int(v) for v in (capture_epoch_states or [])}
+    saved_epoch_states = {}
 
     def _make_graph_frequency_weights(graph_labels, k, device):
         k = int(k)
@@ -1043,7 +1224,49 @@ def train_and_validate(
     if plateau_threshold < 0:
         raise ValueError(f"cfg['plateau_threshold'] must be >= 0, got: {plateau_threshold}")
 
-    train_loader = PyGDataLoader(train_graphs, batch_size=cfg['batch_size_graphs'], shuffle=True, num_workers=num_workers)
+    effective_train_graphs = build_training_subgraphs(train_graphs, cfg)
+    if str(cfg.get('subgraph_mode', 'off')).lower() != 'off':
+        print(
+            f"[Sampler] subgraph_mode={cfg.get('subgraph_mode')}: expanded "
+            f"{len(train_graphs)} parent graphs to {len(effective_train_graphs)} training graphs"
+        )
+
+    batch_size_graphs = int(cfg['batch_size_graphs'])
+    sampler_mode = str(cfg.get('sampler_mode', 'random')).lower()
+    use_balanced_sampler = (
+        sampler_mode == 'cancer_balanced'
+        and batch_size_graphs >= 4
+        and len(effective_train_graphs) >= batch_size_graphs
+    )
+
+    if use_balanced_sampler:
+        train_batch_sampler = CancerBalancedBatchSampler(
+            effective_train_graphs,
+            batch_size=batch_size_graphs,
+            k_cancers=int(cfg.get('sampler_k_cancers', 1)),
+            m_per_cancer=int(cfg.get('sampler_m_per_cancer', 1)),
+            seed=int(cfg.get('sampler_seed', 42)),
+            enforce_distinct_batch=bool(cfg.get('sampler_enforce_distinct_batch', True)),
+            num_batches=int(math.ceil(len(effective_train_graphs) / float(max(batch_size_graphs, 1)))),
+        )
+        sampler_preview = train_batch_sampler.preview_batches()
+        sampler_summary = summarize_batches(effective_train_graphs, sampler_preview)
+        print(
+            f"[Sampler] mode={sampler_mode}, K={cfg.get('sampler_k_cancers')}, M={cfg.get('sampler_m_per_cancer')}, "
+            f"batch_size={batch_size_graphs}, avg_unique_cancers={sampler_summary['avg_unique_cancers']:.2f}, "
+            f"avg_unique_batches={sampler_summary['avg_unique_batches']:.2f}, "
+            f"avg_unique_slides={sampler_summary['avg_unique_slides']:.2f}, "
+            f"avg_unique_parents={sampler_summary['avg_unique_parents']:.2f}"
+        )
+        train_loader = PyGDataLoader(effective_train_graphs, batch_sampler=train_batch_sampler, num_workers=num_workers)
+    else:
+        if sampler_mode == 'cancer_balanced' and batch_size_graphs < 4:
+            print(
+                f"[Sampler] Warning: batch_size_graphs={batch_size_graphs} is too small for cancer-balanced batching; "
+                "fallback to random shuffle."
+            )
+        train_loader = PyGDataLoader(effective_train_graphs, batch_size=batch_size_graphs, shuffle=True, num_workers=num_workers)
+
     val_loader = PyGDataLoader(
         val_graphs,
         batch_size=cfg['batch_size_graphs'],
@@ -1057,13 +1280,13 @@ def train_and_validate(
     dom_w_cancer = None
     if cfg.get('use_domain_adv_slide', False) and n_domains_batch is not None:
         dom_w_batch = _make_graph_frequency_weights(
-            [int(g.bat_dom.item()) for g in train_graphs if hasattr(g, 'bat_dom')],
+            [int(g.bat_dom.item()) for g in effective_train_graphs if hasattr(g, 'bat_dom')],
             int(n_domains_batch),
             device,
         )
     if cfg.get('use_domain_adv_cancer', False) and n_domains_cancer is not None:
         dom_w_cancer = _make_graph_frequency_weights(
-            [int(g.cancer_dom.item()) for g in train_graphs if hasattr(g, 'cancer_dom')],
+            [int(g.cancer_dom.item()) for g in effective_train_graphs if hasattr(g, 'cancer_dom')],
             int(n_domains_cancer),
             device,
         )
@@ -1586,7 +1809,8 @@ def train_and_validate(
             except Exception:
                 pass
 
-        if val_accuracy > best['accuracy']:
+        improved = val_accuracy > best['accuracy']
+        if improved:
             best = {
                 'auroc': metrics['auroc'],
                 'accuracy': metrics['accuracy'],
@@ -1598,8 +1822,15 @@ def train_and_validate(
             patience = 0
         else:
             patience += 1
-            if early_stop_enabled and patience >= early_patience:
-                break
+
+        if int(epoch) in capture_epoch_states and int(epoch) not in saved_epoch_states:
+            saved_epoch_states[int(epoch)] = {
+                'state': copy.deepcopy(model.state_dict()),
+                'metrics': dict(metrics),
+            }
+
+        if (not improved) and early_stop_enabled and patience >= early_patience:
+            break
     best['last_epoch'] = int(last_epoch)
     best['last_metrics'] = last_metrics if last_metrics is not None else {
         'accuracy': float('nan'),
@@ -1608,6 +1839,7 @@ def train_and_validate(
         'auprc': float('nan'),
     }
     best['completed_full_epochs'] = bool(int(last_epoch) == int(cfg.get('epochs', 0)))
+    best['epoch_states'] = saved_epoch_states
     if capture_last_state:
         best['last_state'] = copy.deepcopy(model.state_dict())
     return best, hist, best['state']
@@ -1967,6 +2199,7 @@ def run_single_training(args, cfg, device):
         progress_desc='Train',
         progress_leave=True,
         capture_last_state=bool(getattr(args, 'save_last', False)),
+        capture_epoch_states=getattr(args, '_save_epoch_checkpoints', []),
     )
 
     # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
@@ -1997,12 +2230,35 @@ def run_single_training(args, cfg, device):
         saved_checkpoint = 'best'
     train_ids = list(getattr(args, '_train_ids', []))
     val_ids = list(getattr(args, '_val_ids', []))
+    requested_save_epochs = list(getattr(args, '_save_epoch_checkpoints', []))
+    extra_saved_epochs = _save_extra_epoch_checkpoints(
+        model,
+        best.get('epoch_states', {}),
+        cfg,
+        args.artifacts_dir,
+        extra_meta={'train_ids': train_ids, 'val_ids': val_ids},
+        hist=hist,
+        save_train_curves=bool(getattr(args, 'save_train_curves', 1)),
+        save_loss_components=bool(getattr(args, 'save_loss_components', 0)),
+        domain_plot_kwargs={
+            'n_domains_batch': train_seen_n_domains_batch,
+            'n_domains_cancer': train_seen_n_domains_cancer,
+            'lambda_slide': cfg.get('lambda_slide', 0.0),
+            'lambda_cancer': cfg.get('lambda_cancer', 0.0),
+        },
+        artifact_source_dir=args.artifacts_dir,
+    )
+    missing_save_epochs = sorted(set(requested_save_epochs) - set(extra_saved_epochs))
+    if len(missing_save_epochs) > 0:
+        print(f"[Warn] Requested save_epoch_checkpoints were not reached: {missing_save_epochs}")
     meta = {
         'cfg': cfg,
         'best_epoch': best['epoch'],
         'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
         'completed_full_epochs': bool(completed_full_epochs),
         'saved_checkpoint': saved_checkpoint,
+        'saved_epoch_checkpoints': extra_saved_epochs,
+        'requested_save_epoch_checkpoints': requested_save_epochs,
         'val_ids': val_ids,
         'train_ids': train_ids,
         'metrics': {
@@ -2258,6 +2514,7 @@ def run_kfold_training(args, cfg, device):
             progress_desc=f'Fold {i}/{total_folds}',
             progress_leave=False,
             capture_last_state=bool(getattr(args, 'save_last', False)),
+            capture_epoch_states=getattr(args, '_save_epoch_checkpoints', []),
         )
         train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
 
@@ -2325,12 +2582,35 @@ def run_kfold_training(args, cfg, device):
             print(f"[KFold] Saved model to {model_path}")
         else:
             print(f"[KFold] Saved model to {fold_dir} (model.pt)")
+        requested_save_epochs = list(getattr(args, '_save_epoch_checkpoints', []))
+        extra_saved_epochs = _save_extra_epoch_checkpoints(
+            model,
+            best.get('epoch_states', {}),
+            cfg,
+            fold_dir,
+            extra_meta={'train_ids': train_ids, 'val_ids': val_ids},
+            hist=hist,
+            save_train_curves=bool(getattr(args, 'save_train_curves', 1)),
+            save_loss_components=bool(getattr(args, 'save_loss_components', 0)),
+            domain_plot_kwargs={
+                'n_domains_batch': train_seen_n_domains_batch,
+                'n_domains_cancer': train_seen_n_domains_cancer,
+                'lambda_slide': cfg.get('lambda_slide', 0.0),
+                'lambda_cancer': cfg.get('lambda_cancer', 0.0),
+            },
+            artifact_source_dir=fold_dir,
+        )
+        missing_save_epochs = sorted(set(requested_save_epochs) - set(extra_saved_epochs))
+        if len(missing_save_epochs) > 0:
+            print(f"[KFold] Warning: requested save_epoch_checkpoints were not reached: {missing_save_epochs}")
         meta = {
             'cfg': cfg,
             'best_epoch': best['epoch'],
             'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
             'completed_full_epochs': bool(completed_full_epochs),
             'saved_checkpoint': saved_checkpoint,
+            'saved_epoch_checkpoints': extra_saved_epochs,
+            'requested_save_epoch_checkpoints': requested_save_epochs,
             'val_ids': val_ids,
             'train_ids': train_ids,
             'metrics': {
@@ -2649,6 +2929,7 @@ def run_loco_training(args, cfg, device):
             progress_desc=f'LOCO {ct}',
             progress_leave=False,
             capture_last_state=bool(getattr(args, 'save_last', False)),
+            capture_epoch_states=getattr(args, '_save_epoch_checkpoints', []),
         )
         train_seen_n_domains_batch, train_seen_n_domains_cancer = _count_seen_domains(train_graphs)
 
@@ -2711,6 +2992,27 @@ def run_loco_training(args, cfg, device):
         else:
             save_model(model, loco_dir)  # model.pt
             saved_checkpoint = 'best'
+        requested_save_epochs = list(getattr(args, '_save_epoch_checkpoints', []))
+        extra_saved_epochs = _save_extra_epoch_checkpoints(
+            model,
+            best.get('epoch_states', {}),
+            cfg,
+            loco_dir,
+            extra_meta={'train_npz': str(args.train_npz), 'train_ids': train_ids, 'val_ids': val_ids},
+            hist=hist,
+            save_train_curves=bool(getattr(args, 'save_train_curves', 1)),
+            save_loss_components=bool(getattr(args, 'save_loss_components', 0)),
+            domain_plot_kwargs={
+                'n_domains_batch': train_seen_n_domains_batch,
+                'n_domains_cancer': train_seen_n_domains_cancer,
+                'lambda_slide': cfg.get('lambda_slide', 0.0),
+                'lambda_cancer': cfg.get('lambda_cancer', 0.0),
+            },
+            artifact_source_dir=loco_dir,
+        )
+        missing_save_epochs = sorted(set(requested_save_epochs) - set(extra_saved_epochs))
+        if len(missing_save_epochs) > 0:
+            print(f"[LOCO] Warning: requested save_epoch_checkpoints were not reached: {missing_save_epochs}")
         meta = {
             'cfg': cfg,
             'train_npz': str(args.train_npz),
@@ -2718,6 +3020,8 @@ def run_loco_training(args, cfg, device):
             'last_epoch': int(best.get('last_epoch', best.get('epoch', -1))),
             'completed_full_epochs': bool(completed_full_epochs),
             'saved_checkpoint': saved_checkpoint,
+            'saved_epoch_checkpoints': extra_saved_epochs,
+            'requested_save_epoch_checkpoints': requested_save_epochs,
             'val_ids': val_ids,
             'train_ids': train_ids,
             'metrics': {

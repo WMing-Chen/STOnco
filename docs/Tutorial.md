@@ -16,6 +16,9 @@
 - visualize_prediction.py：单切片真实/预测空间分布可视化（SVG）
 - export_spot_embeddings.py：导出每个 spot 的 embedding，支持 `h`（默认）或 `z_clf`（分类头 latent）；`z64` 作为旧兼容别名保留
 - visualize_umap_tsne.py：对导出的 `h_*` / `z_clf_*` embedding 做 UMAP + t-SNE 可视化（SVG）；兼容读取历史 `z64_*`
+- evaluate_embedding_mixing.py：在 embedding / UMAP / t-SNE 空间上计算 `iLISI` / `cLISI`，输出混合评估汇总 CSV，并可选导出每个 spot 的局部 LISI
+- run_embedding_analysis_pipeline.py：一键串联 embedding 导出、UMAP/t-SNE 绘图与 LISI 量化
+- analyze_spot_embedding_domains.py：对导出的 `spot_embeddings_*.csv` 计算域均值/方差统计，并生成热图、箱线图、KDE 与二维散点诊断图
 - Dual-Domain Adversarial Learning.md：双域自适应设计说明
 - utils.py：模型与元信息存取
 - synthetic_data/：示例合成/模拟数据（可选）
@@ -64,7 +67,7 @@ pip install torch_geometric==2.6.1
 
 ## 快速开始
 
-一键式示例流程：从原始 CSV 准备数据 → 训练（示例使用双域对抗默认配置）→ 单/批量推理 → 可视化 →（可选）导出 embedding 并做 UMAP/t-SNE。
+一键式示例流程：从原始 CSV 准备数据 → 训练（示例使用双域对抗默认配置）→ 单/批量推理 → 可视化 →（可选）导出 embedding、做 UMAP/t-SNE，并进一步做 mixing/LISI 量化。
 
 ```bash
 # 0) 路径约定（请按需修改）
@@ -149,10 +152,34 @@ python -m stonco.utils.visualize_umap_tsne \
   --seed 42 \
   --color_cols sample_id tumor_label batch_id \
   --embed_source h
+
+# 7) 计算 embedding / UMAP 空间上的 mixing 指标（可选）
+python -m stonco.utils.evaluate_embedding_mixing \
+  --embeddings_csv $ARTIFACTS/spot_embeddings_val_npz.csv \
+  --out_csv $ARTIFACTS/embedding_plots/mixing_metrics_h.csv \
+  --embed_source h \
+  --spaces embedding umap \
+  --group_cols sample_id batch_id tumor_label \
+  --group_roles sample_id:integration batch_id:integration tumor_label:conservation \
+  --k_values 15 30 50
+
+# 8) 或者直接一条命令串联导出 + 可视化 + LISI 评估（可选）
+python -m stonco.utils.run_embedding_analysis_pipeline \
+  --artifacts_dir $ARTIFACTS \
+  --out_dir $ARTIFACTS/embedding_analysis \
+  --npz_glob "$VAL_NPZ_DIR/*.npz" \
+  --embed_source h \
+  --group_cols sample_id batch_id tumor_label \
+  --group_roles sample_id:integration batch_id:integration tumor_label:conservation \
+  --metric_spaces embedding umap \
+  --k_values 15 30 50 \
+  --color_cols sample_id batch_id tumor_label
 ```
 
 默认参数要点：
 - `visualize_umap_tsne.py` 默认仍会生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的图；若传 `--color_cols ...`，则改为按指定列生成
+- `evaluate_embedding_mixing.py` 默认只评估 `embedding` 空间；若要把 UMAP / t-SNE 作为辅助指标，需显式传 `--spaces embedding umap` 或 `--spaces embedding umap tsne`
+- `run_embedding_analysis_pipeline.py` 默认会先导出 embedding，再保存降维坐标 CSV，最后输出 LISI 汇总 CSV；默认指标空间是 `embedding umap`
 - prepare_data：`--xy_cols row col`、`--label_col true_label` 为默认；build-single-npz 若不传 `--sample_id`，将用坐标文件上一级目录名。
 - 训练（train.py）：
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
@@ -427,6 +454,22 @@ python -m stonco.core.train \
     - --use_image_features {0,1}（默认 0，保持 gene-only 行为；启用后节点输入为 `gene → image → img_mask → (LapPE)`）
     - --img_use_pca {0,1}（默认 1，对 2048 维图像特征做 PCA 降维）
     - --img_pca_dim（默认 256，仅当 --img_use_pca 1 生效；若有效 spot 数（img_mask==1）小于该值会直接报错）
+- 训练 sampler / 子图：
+  - `--sampler_mode {random,cancer_balanced,cancer_balanced_subgraph}`（默认 `random`）
+  - `--sampler_k_cancers`：每个 batch 优先采样的癌种数 `K`
+  - `--sampler_m_per_cancer`：每个癌种优先采样的父切片数 `M`
+  - `--sampler_enforce_distinct_batch {0,1}`：同癌种内尽量约束不同 `bat_dom`（默认 1）
+  - `--subgraph_mode {off,static,online}`（默认 `off`）
+  - `--subgraph_target_spots`：静态子图目标 spot 数，默认 1000
+  - `--subgraph_min_spots`：静态子图最小 spot 数，默认 300
+  - `cancer_balanced_subgraph` 是兼容别名：内部会归一化为 `sampler_mode=cancer_balanced + subgraph_mode=static`
+  - `subgraph_mode=online` 目前保留接口但尚未实现；当前应使用 `static`
+  - 当 `batch_size_graphs < 4` 或有效训练图数不足时，会自动回退到普通随机 shuffle
+  - 若未显式给 `K/M`，会按 `batch_size_graphs` 自动推断：
+    - `4 -> K=2, M=2`
+    - `6 -> K=3, M=2`
+    - `8 -> K=4, M=2`
+    - `>=12` 且可被 3 整除时优先用 `M=3`
 - 优化器：--lr，--weight_decay
 - 学习率调度：
   - `--lr_scheduler {none,linear,cosine,warmup_cosine,plateau}`（默认 `none`）
@@ -474,13 +517,15 @@ python -m stonco.core.train \
   - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
   - --save_train_curves 0/1（默认 1）：保存 `lr.svg`、`train_loss.svg`、`train_val_loss.svg` 与 `train_val_metrics.svg`
   - --save_last：若训练实际跑满 `--epochs`，则用最后一个 epoch 覆盖 `artifacts_dir/model.pt`；同时额外保存最优模型到 `artifacts_dir/model_best.pt`（不强制关闭早停；如需保证跑满可用 `--early_patience 0`）
+  - --save_epoch_checkpoints：额外保存指定 epoch 的模型快照，例如 `--epochs 300 --save_epoch_checkpoints 100 200` 会在训练结束后额外写出 `epoch_checkpoints/epoch_100/` 与 `epoch_checkpoints/epoch_200/`；每个 `epoch_XXX/` 会保存与常规训练目录一致的核心文件布局（`model.pt`、`meta.json`、预处理器文件，以及按该轮截断的曲线/`loss_components.csv`）；若训练因早停未跑到某个请求轮次，会在日志中提示未保存
   - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于 `artifacts_dir/model.pt` 对应的模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
 - 图像预处理（当 --use_image_features 1）：img_feature_names.txt，img_scaler.joblib，img_pca.joblib（若 --img_use_pca 1）
 - 模型：model.pt（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）；可选：model_best.pt（启用 --save_last 时保存最优模型）
-- 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint）
+- 额外轮次快照：若设置 `--save_epoch_checkpoints`，会额外生成自包含的 `epoch_checkpoints/epoch_XXX/` 目录，包含 `model.pt`、`meta.json`、预处理器文件，以及按该轮截断的训练曲线与 `loss_components.csv`（若对应开关启用）
+- 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint、saved_epoch_checkpoints、requested_save_epoch_checkpoints）
 - GNN 主干配置：新训练产物以 `cfg.GNN_hidden` 为准；旧产物若仅含 `cfg.hidden` 仍可兼容加载
 - 可视化：
   - `lr.svg`：单独保存学习率曲线
@@ -605,6 +650,54 @@ python -m stonco.core.train \
   --epochs 60 --early_patience 20 --num_workers 0 --device cuda
 ```
 产物：`../loco_eval/{CancerType}/` 每癌种一个子目录，含该设定下的最优 `model.pt` 与 `meta.json`，并在 `../loco_eval/loco_summary.csv` 汇总。
+
+### 5.3 Sampler 双模式与子图训练
+
+`train.py` 当前已支持两层控制：
+
+- `sampler_mode=random`：默认随机打乱训练图
+- `sampler_mode=cancer_balanced`：在训练 batch 内尽量同时覆盖多个 `cancer_dom`、多个父切片，并在可行时约束不同 `bat_dom`
+- `subgraph_mode=off|static|online`：控制训练集是否展开为子图；验证集始终保持整图
+
+实际行为：
+
+- 训练集先按父切片完成 train/val split，再决定是否对子图展开，避免 train/val 泄漏
+- `subgraph_mode=static` 时，只对训练集父图切子图；验证与测试仍使用整图
+- 静态子图会为每个子图生成唯一 `slide_id`，同时保留 `parent_slide_id` 与 `subgraph_id`
+- 同一 batch 的 sampler 去重优先基于 `parent_slide_id`，因此子图模式下会尽量避免同一 batch 重复同一个父切片
+- 若训练图 spot 数小于 `max(subgraph_target_spots, subgraph_min_spots)`，则该图会以单个 `__sg000` 全图子图形式保留
+- `subgraph_mode=online` 当前会直接报 `NotImplementedError`
+
+推荐示例：
+
+```bash
+# 一图一切片 + cancer-balanced sampler
+python -m stonco.core.train \
+  --train_npz /path/to/train_data.npz \
+  --artifacts_dir /path/to/artifacts_sampler \
+  --batch_size_graphs 8 \
+  --sampler_mode cancer_balanced \
+  --sampler_k_cancers 4 \
+  --sampler_m_per_cancer 2 \
+  --sampler_enforce_distinct_batch 1 \
+  --epochs 80 --early_patience 20
+
+# 静态子图训练 + cancer-balanced sampler
+python -m stonco.core.train \
+  --train_npz /path/to/train_data.npz \
+  --artifacts_dir /path/to/artifacts_sampler_subgraph \
+  --batch_size_graphs 8 \
+  --sampler_mode cancer_balanced_subgraph \
+  --subgraph_target_spots 1000 \
+  --subgraph_min_spots 300 \
+  --epochs 80 --early_patience 20
+```
+
+日志与运行期提示：
+
+- 启用 `static` 子图模式时，训练开始前会打印父图数到训练图数的展开统计
+- 启用 `cancer_balanced` 时，会打印 sampler 预览摘要：`avg_unique_cancers`、`avg_unique_batches`、`avg_unique_slides`、`avg_unique_parents`
+- 验证 loader 不使用该 sampler，仍保持 `shuffle=False`
 
 ---
 
@@ -806,10 +899,27 @@ python -m stonco.utils.visualize_prediction \
 
 ---
 
-## 9. 导出 Spot Embedding（`h` / `z_clf`）与 UMAP + t-SNE
+## 9. Embedding 导出、UMAP/t-SNE 与 Mixing/LISI 评估
 
-用于调试/分析：导出每个 spot 的 embedding，并用 UMAP 与 t-SNE 可视化。
+本章用于 embedding 分析与去批次/跨域整合评估，覆盖五个层次：
 
+- `export_spot_embeddings.py`：导出每个 spot 的 embedding CSV
+- `visualize_umap_tsne.py`：计算 UMAP / t-SNE 并输出 SVG；可选保存降维坐标 CSV
+- `evaluate_embedding_mixing.py`：在 embedding / UMAP / t-SNE 空间上计算 `iLISI` / `cLISI`
+- `run_embedding_analysis_pipeline.py`：一条命令串联前面三步
+- `analyze_spot_embedding_domains.py`：针对已导出的 `spot_embeddings_*.csv` 做域统计、局部维度分布和二维散点诊断
+
+推荐解读口径：
+
+- embedding-space LISI 是主指标，应作为正式比较依据
+- UMAP-space / t-SNE-space LISI 是辅助指标，主要用于把图上的“看起来混不混”转成数字
+- 对希望被混合的标签列使用 `iLISI`（integration）
+- 对希望被保留的标签列使用 `cLISI`（conservation）
+
+常见场景：
+
+- 单癌种去批次：重点看 `sample_id`、`batch_id` 的 `iLISI` 是否提升，同时监控 `tumor_label` 的 `cLISI` 不要异常升高
+- 多癌种联合训练：`cancer_type` 不应写死，若目标是跨癌种整合则用 `iLISI`，若目标是保留癌种差异则用 `cLISI`
 - 默认导出 `h`：即 GNN backbone 的输出表示，更适合直接观察域对抗分支作用效果
 - 可选导出 `z_clf`：即 task MLP 最后一层隐藏表示，维度由 `clf_hidden[-1]` 自动决定
 - `z64` 作为兼容别名保留，仅适用于分类头 latent 维度确实为 64 的模型
@@ -879,13 +989,16 @@ python -m stonco.utils.visualize_umap_tsne \
   --out_dir /path/to/artifacts/embedding_plots \
   --max_points 50000 \
   --seed 42 \
-  --embed_source h
+  --embed_source h \
+  --color_cols sample_id batch_id tumor_label \
+  --out_coords_csv /path/to/artifacts/embedding_plots/spot_embeddings_h_coords.csv
 ```
 
 输出：
-- `umap_tsne_h_by_tumor.svg`
-- `umap_tsne_h_by_batch.svg`
-- `umap_tsne_h_by_cancer.svg`
+- `umap_tsne_h_by_sample_id.svg`
+- `umap_tsne_h_by_batch_id.svg`
+- `umap_tsne_h_by_tumor_label.svg`
+- `spot_embeddings_h_coords.csv`（如果传了 `--out_coords_csv`）
 
 说明：
 - `--embed_source {h,z_clf,z64}` 用来指定读取哪类列：
@@ -893,10 +1006,155 @@ python -m stonco.utils.visualize_umap_tsne \
   - `--embed_source z_clf` -> 优先读取 `z_clf_*`，若是旧 CSV 则兼容读取 `z64_*`
   - `--embed_source z64` -> 仅读取历史 `z64_*`
 - 若切换到 `z_clf`，输出文件名会变为：
-  - `umap_tsne_z_clf_by_tumor.svg`
-  - `umap_tsne_z_clf_by_batch.svg`
-  - `umap_tsne_z_clf_by_cancer.svg`
+  - `umap_tsne_z_clf_by_sample_id.svg`
+  - `umap_tsne_z_clf_by_batch_id.svg`
+  - `umap_tsne_z_clf_by_tumor_label.svg`
 - `h` 维度不是固定 64，会按实际导出的列数自适应读取；`visualize_umap_tsne.py` 不再对 embedding 维度写死为 64
+- `--out_coords_csv` 建议在需要做 UMAP/t-SNE 空间 LISI 时一起保存，这样评估脚本使用的坐标会与图像完全一致
+- 若不传 `--color_cols`，默认仍生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的图
+
+### 9.3 LISI 混合评估（`evaluate_embedding_mixing.py`）
+
+主评估推荐在原始 embedding 空间完成，UMAP / t-SNE 空间只作为辅助解释。
+
+`group_role` 与 `metric_name` 的关系：
+
+- `integration` -> `iLISI`
+- `conservation` -> `cLISI`
+
+常用示例：
+
+```bash
+python -m stonco.utils.evaluate_embedding_mixing \
+  --embeddings_csv /path/to/artifacts/spot_embeddings_val_npz.csv \
+  --coords_csv /path/to/artifacts/embedding_plots/spot_embeddings_h_coords.csv \
+  --out_csv /path/to/artifacts/embedding_plots/mixing_metrics_h.csv \
+  --out_spot_csv /path/to/artifacts/embedding_plots/mixing_metrics_h_spot.csv \
+  --embed_source h \
+  --spaces embedding umap tsne \
+  --group_cols sample_id batch_id tumor_label \
+  --group_roles sample_id:integration batch_id:integration tumor_label:conservation \
+  --k_values 15 30 50 \
+  --max_points 50000 \
+  --seed 42
+```
+
+说明：
+- `--embeddings_csv` 必需；用于读取 metadata 和 embedding 列
+- `--coords_csv` 可选；若提供，则 `umap_1/umap_2` 与 `tsne_1/tsne_2` 从这里读取
+- `--spaces` 可选 `embedding`、`umap`、`tsne`
+- `--group_cols` 为要评估的 metadata 列
+- `--group_roles` 允许显式指定列的角色，格式例如 `sample_id:integration tumor_label:conservation`
+- 若不传 `--group_roles`，脚本会自动推断常见列：
+  - integration：`sample_id`、`batch_id`、`slide_id`
+  - conservation：`tumor_label`、`cell_type`、`region`
+  - 其他列如 `cancer_type` 建议显式传入，避免误判实验目标
+- `--k_values` 默认是 `15 30 50`
+- 对缺失列、唯一值列或有效组数 `<=1` 的列，脚本会 warning 并跳过，不会让整个评估流程失败
+
+汇总 CSV 的关键字段：
+- `group_col`
+- `group_role`
+- `metric_name`
+- `space`
+- `embed_source`
+- `embed_dim`
+- `k`
+- `n_spots_total`
+- `n_valid`
+- `n_groups`
+- `lisi_mean`
+- `lisi_median`
+- `lisi_q25`
+- `lisi_q75`
+
+BRCA-only 去批次推荐默认配置：
+
+```bash
+--group_cols sample_id batch_id tumor_label \
+--group_roles sample_id:integration batch_id:integration tumor_label:conservation \
+--spaces embedding umap \
+--k_values 15 30 50
+```
+
+建议解读顺序：
+- 先看 `space=embedding` 下 `sample_id` / `batch_id` 的 `iLISI`
+- 再看 `space=umap` 或 `space=tsne` 下对应的辅助 `iLISI`
+- 同时检查 `tumor_label` 的 `cLISI` 是否被异常拉高
+
+### 9.4 一键三步流程（`run_embedding_analysis_pipeline.py`）
+
+如果日常实验希望“一条命令跑完导出、作图、量化”，可以直接使用 pipeline：
+
+```bash
+python -m stonco.utils.run_embedding_analysis_pipeline \
+  --artifacts_dir /path/to/artifacts \
+  --out_dir /path/to/artifacts/embedding_analysis \
+  --npz_glob '/path/to/val_npz/*.npz' \
+  --embed_source h \
+  --group_cols sample_id batch_id tumor_label \
+  --group_roles sample_id:integration batch_id:integration tumor_label:conservation \
+  --metric_spaces embedding umap \
+  --k_values 15 30 50 \
+  --max_points 50000 \
+  --seed 42 \
+  --color_cols sample_id batch_id tumor_label \
+  --save_spot_metrics
+```
+
+默认产物会统一落在 `--out_dir` 下：
+- `spot_embeddings_h.csv`
+- `spot_embeddings_h_coords.csv`
+- `mixing_metrics_h.csv`
+- `mixing_metrics_h_spot.csv`（仅 `--save_spot_metrics` 时输出）
+- `umap_tsne_h_by_sample_id.svg`
+- `umap_tsne_h_by_batch_id.svg`
+- `umap_tsne_h_by_tumor_label.svg`
+
+说明：
+- pipeline 只是编排层，本身不重复实现算法，而是顺序调用三个工具
+- 默认 `--metric_spaces embedding umap`，因此输出天然区分“主指标”和“辅助指标”
+- 若希望纳入 t-SNE 辅助指标，可显式传 `--metric_spaces embedding umap tsne`
+- 输入侧与 `export_spot_embeddings.py` 一致，支持混合使用 `--train_npz`、重复 `--npz` 和重复 `--npz_glob`
+
+### 9.5 embedding 域统计与局部二维诊断（`analyze_spot_embedding_domains.py`）
+
+当你已经有 `spot_embeddings_h.csv` 或 `spot_embeddings_z_clf.csv`，并且想快速回答下面这些问题时，可以直接使用这个脚本：
+
+- 不同域（如 `cancer_type`、`batch_id`）在 embedding 上的逐维均值和方差分别是多少
+- 某几个维度（例如 `h_7`、`h_20`）在不同域上的均值分布是否仍有明显偏移
+- 某几个维度在 spot 级别按 `cancer_type` 分组后的 KDE 是什么样
+- 两个指定维度在二维平面上的 spot 分布是否存在癌种聚类，以及均衡抽样后视觉上是否仍然分离
+
+常用示例：
+
+```bash
+python -m stonco.utils.analyze_spot_embedding_domains \
+  --embeddings_csv /path/to/artifacts/spot_embeddings_h.csv \
+  --out_dir /path/to/artifacts/embedding_analysis \
+  --group_cols cancer_type batch_id \
+  --selected_dims 7 20 \
+  --spot_kde_group_col cancer_type \
+  --joint_scatter_group_col cancer_type \
+  --joint_scatter_sample_caps 3000 1000
+```
+
+默认会生成的产物包括：
+- `domain_stats_by_cancer_type.csv`、`domain_stats_by_batch_id.csv`
+- `domain_stats_by_cancer_type_overview.svg`、`domain_stats_by_batch_id_overview.svg`
+- `selected_means_cancer_type_h7_h20.csv`、`selected_means_batch_id_h7_h20.csv`
+- `mean_h7_h20_density_compare.svg`
+- `h_7_spot_level_kde_by_cancer_type.svg`、`h_20_spot_level_kde_by_cancer_type.svg`
+- `h_7_h_20_spot_scatter_by_cancer_type.svg`
+- `h_7_h_20_spot_scatter_by_cancer_type_sampled_1000_per_group.svg`（以及对应抽样 CSV）
+
+说明：
+- `--embedding_prefix` 默认是 `h_`，因此 `--selected_dims 7 20` 对应读取 `h_7`、`h_20`；若分析 `z_clf_*`，可改为 `--embedding_prefix z_clf_`
+- `--group_cols` 控制会输出哪些域统计表和 overview 图；默认是 `cancer_type batch_id`
+- `--spot_kde_group_col` 控制 spot 级别 KDE 的分组列；默认是 `cancer_type`
+- `--joint_scatter_group_col` 控制二维散点图上色分组列
+- `--joint_scatter_sample_caps` 可以同时给多个值，例如 `3000 1000`，脚本会分别导出多版均衡抽样二维散点图
+- 该脚本是“诊断型”工具，适合回答“域偏移主要落在哪些维度、在二维投影上是否仍可见”；正式量化比较仍建议结合 9.3 节的 LISI 指标一起看
 
 ---
 

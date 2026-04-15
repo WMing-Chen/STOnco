@@ -1,363 +1,627 @@
-# STOnco Architecture Figure (Paper-Ready, Block-Level)
+# STOnco Model Architecture Figure (Current Code, Block-Level)
 
-This note is a **paper figure drafting spec** based on the current code:
+This note is a paper figure drafting spec synchronized with the current code:
 
-- Model: `stonco/core/models.py` (`STOnco_Classifier`, GATv2 backbone)
-- Graph construction: `stonco/utils/preprocessing.py` (`Preprocessor`, `GraphBuilder`)
-- Training loss & GRL schedule: `stonco/core/train.py`
+- Model: `stonco/core/models.py` (`STOnco_Classifier`, `GNNBackbone`)
+- Feature construction and graph construction: `stonco/utils/preprocessing.py`
+- Training data assembly and losses: `stonco/core/train.py`
+- Inference path: `stonco/core/infer.py`, `stonco/core/batch_infer.py`
 
-Target configuration (as confirmed):
-
-- Backbone: **GATv2**
-- LapPE: **shown in the main figure**, **unweighted Laplacian**, **not concatenated** to node features
-- Dual-domain adversarial learning: **enabled for both slide/batch domain and cancer domain**
-- Figure detail level: **module-level** (no BN/LN/Dropout boxes in the figure)
-- Figure text: **English**
-- Deliverables: **textual structure + dimension spec + Mermaid + Graphviz DOT**
+The current implementation is no longer a fixed "GATv2 only + LapPE shown but not concatenated" architecture. The model is a configurable GNN framework with optional image-feature early fusion, optional LapPE concatenation, optional dual-domain adversarial heads, and optional MMD alignment on the shared GNN representation.
 
 ---
 
-## 1. Symbols and Tensor Shapes
+## 1. Current Defaults and Configurable Branches
 
-Per slide (one PyG graph per slide):
+Default training configuration in `stonco/core/train.py`:
 
-- `N`: number of spots (nodes) in the slide
-- `G`: number of genes in the raw expression matrix
-- `n_hvg`: number of HVGs selected (or `'all'`)
-- `D`: feature dimension after preprocessing
-  - If PCA is used: `D = pca_dim`
-  - If PCA is not used: `D = n_hvg`
-- `k`: KNN neighbors (graph connectivity), `k = knn_k`
-- `E`: number of directed edges in `edge_index` (KNN is symmetrized, so typically `E ≈ 2 * N * k`)
+| Component | Current default | Configurable behavior |
+|---|---:|---|
+| GNN backbone | `gatv2` | `gatv2`, `gcn`, or `sage` via `--model` |
+| GNN hidden dims | `[256, 128, 64]` | scalar repeated by `num_layers`, or comma/list dims via `GNN_hidden` |
+| GATv2 heads | `4` | used only when `model='gatv2'` |
+| Gene PCA | off (`use_pca=False`) | if on, gene dim becomes `pca_dim` |
+| HVG count | `n_hvg='all'` | integer top-HVG count or all genes |
+| Image early fusion | off | if on, append processed image features and an `img_mask` column |
+| LapPE | off (`lap_pe_dim=0`) | if `lap_pe_dim>0`, compute PE; append only when `concat_lap_pe=True` |
+| LapPE weights | unweighted | can use Gaussian edge weights via `lap_pe_use_gaussian=True` |
+| Slide/batch domain head | on in training | disabled if `use_domain_adv_slide=False` or no domain count |
+| Cancer-type domain head | on in training | disabled if `use_domain_adv_cancer=False` or no domain count |
+| MMD alignment | off | if on, applies pairwise multi-domain RBF MMD on `h` |
+
+Figure recommendation:
+
+- Draw the main path as gene features -> graph -> GNN -> tumor probability.
+- Draw image features, LapPE, domain heads, and MMD as optional/config-controlled branches.
+- For a default-config figure, hide image fusion, hide LapPE, hide MMD, keep both domain heads for training.
+
+---
+
+## 2. Symbols and Tensor Shapes
+
+Per slide:
+
+- `N`: number of spots/nodes
+- `G`: number of genes in raw expression matrix
+- `G_hvg`: selected gene count (`n_hvg`, or all genes)
+- `D_gene`: output dimension of gene preprocessing
+  - `D_gene = pca_dim` if `use_pca=True`
+  - `D_gene = G_hvg` if `use_pca=False`
+- `D_img_raw`: raw image feature dimension, typically 2048 when image features are present
+- `D_img`: processed image feature dimension
+  - `D_img = img_pca_dim` if `img_use_pca=True`
+  - `D_img = D_img_raw` if `img_use_pca=False`
 - `K`: LapPE dimension, `K = lap_pe_dim`
-- `H`: number of attention heads for GATv2, `H = heads`
-- `hidden`: per-head hidden dimension in GATv2 (`out_channels` in `GATv2Conv`)
-- `d_gnn`: backbone output dim per node
-  - For GATv2 with `concat=True`: `d_gnn = hidden * H`
+- `E`: number of directed PyG edges after KNN symmetrization, typically near `2*N*k`
+- `H`: GATv2 attention heads, `H = heads`
+- `L`: effective number of GNN layers, equal to `len(GNN_hidden)` after config normalization
+- `g_i`: hidden dim configured for GNN layer `i`
+- `d_gnn`: final GNN node embedding dimension
+  - GATv2: `d_gnn = g_L * H` because `concat=True`
+  - GCN or GraphSAGE: `d_gnn = g_L`
+- `C_clf`: classifier latent dimension, equal to the last value in `clf_hidden`
+- `K_slide`: number of slide/batch domains
+- `K_cancer`: number of cancer-type domains
+
+Final node input dimension:
+
+```text
+D_in = D_gene
+     + I_image * (D_img + 1)
+     + I_lap_concat * K
+```
+
+Where:
+
+- `I_image = 1` only when `use_image_features=True`; the extra `+1` is the appended `img_mask` column.
+- `I_lap_concat = 1` only when `lap_pe_dim>0`, PE is computed, and `concat_lap_pe=True`.
 
 ---
 
-## 2. Pipeline Blocks (Exactly What the Code Does)
+## 3. Data and Feature Construction
 
-### 2.1 Input (NPZ)
+### 3.1 Inputs
 
-- Expression: `X ∈ R^{N×G}`
-- Coordinates: `xy ∈ R^{N×2}`
-- (Training only) labels: `y ∈ {0,1}^{N}` (code supports `y = -1` as unlabeled mask)
+Training NPZ path uses batched arrays such as:
 
-### 2.2 Preprocessing (Gene Feature Engineering)
+- Gene expression: `Xs`, each slide `X in R^(N x G)`
+- Coordinates: `xys`, each slide `xy in R^(N x 2)`
+- Labels: `ys`, each slide `y in {0,1,-1}^N`
+- Slide IDs: `slide_ids`
+- Gene names: `gene_names`
+- Optional image features when `use_image_features=True`: `X_imgs`, `img_masks`, `img_feature_names`
 
-Module: `Preprocessor` (`stonco/utils/preprocessing.py`)
+Single-slide inference NPZ uses keys such as `X`, `xy`, `gene_names`, and optional image keys. If a trained image-fusion model receives an inference slide without image keys, inference falls back to zero image features and `img_mask=0`.
 
-1. Library-size normalization (CP10K), spot-wise
-2. `log1p`
-3. HVG selection (`scanpy` seurat_v3 if available; else variance-top)
-4. Percentile clipping (1%–99%)
-5. Standardize (Z-score) + clip to `[-zclip, zclip]`
-6. Optional PCA
+Label convention:
+
+- `y=1`: tumor
+- `y=0`: non-tumor
+- `y=-1`: unlabeled node; excluded from task BCE loss
+
+### 3.2 Gene Preprocessing
+
+Module: `Preprocessor` in `stonco/utils/preprocessing.py`
+
+Current processing sequence:
+
+1. Library-size normalization to CP10K.
+2. Optional `log1p` transform (`do_log1p=True` by default).
+3. HVG selection using Scanpy `seurat_v3` if available; otherwise top variance genes.
+4. Percentile clipping at 1% and 99%.
+5. StandardScaler Z-score normalization.
+6. Clip normalized values to `[-zclip, zclip]`.
+7. Optional PCA.
 
 Output:
 
-- `Xp ∈ R^{N×D}`
+```text
+Xp_gene in R^(N x D_gene)
+```
 
-### 2.3 Graph Construction (Spatial KNN Graph)
+Important current default:
 
-Module: `GraphBuilder` (`stonco/utils/preprocessing.py`)
+- `n_hvg='all'`
+- `use_pca=False`
+- Therefore the default gene feature dimension is all selected genes, not `pca_dim=64`.
 
-1. KNN graph on spatial coordinates (`xy`)
-2. Edge weights via Gaussian kernel:
-   - `w_ij = exp(- ||xy_i - xy_j||^2 / (2σ^2))`
-   - `σ = gaussian_sigma_factor * mean(nearest-neighbor distance)`
-3. Symmetrize edges (add reverse direction)
+### 3.3 Optional Image Feature Preprocessing
 
-Graph representation (PyG):
+Module: `ImagePreprocessor` in `stonco/utils/preprocessing.py`
 
-- `edge_index ∈ N^{2×E}`
-- `edge_weight ∈ R^{E}`
+Enabled only when `use_image_features=True`.
 
-Note (important for accurate figure caption):
+Processing sequence:
 
-- In the current implementation, **GATv2 backbone does not consume `edge_weight`** (it only uses `edge_index`).
-- `edge_weight` is still computed/stored (and is used by other backbones or optional components).
+1. Use `img_mask` to select valid image-feature rows for fitting.
+2. Fit StandardScaler on valid image features.
+3. Optionally fit PCA (`img_use_pca=True`, default `img_pca_dim=256`).
+4. Transform each slide; invalid image rows become zeros.
+5. Append `img_mask` as a one-column feature.
 
-### 2.4 Laplacian Positional Encoding (LapPE)
+Output before fusion:
+
+```text
+Xp_img in R^(N x D_img)
+img_mask_col in R^(N x 1)
+```
+
+### 3.4 Spatial KNN Graph
+
+Module: `GraphBuilder.build_knn(...)`
+
+Steps:
+
+1. Build KNN graph on spatial coordinates `xy`, using `knn_k`.
+2. Compute Gaussian edge weights:
+
+```text
+w_ij = exp(- ||xy_i - xy_j||^2 / (2*sigma^2))
+sigma = gaussian_sigma_factor * mean(nearest-neighbor distance)
+```
+
+3. Symmetrize by adding reverse edges.
+
+PyG graph tensors:
+
+```text
+edge_index in N^(2 x E)
+edge_weight in R^E
+```
+
+Backbone-specific use of `edge_weight`:
+
+- GATv2 ignores `edge_weight`; it uses `edge_index`.
+- GCN receives `edge_weight` when available.
+- GraphSAGE uses the custom `WeightedSAGEConv`, which performs an edge-weighted neighbor mean.
+
+### 3.5 Optional Laplacian Positional Encoding
 
 Module: `GraphBuilder.lap_pe(...)`
 
-- Computes `PE ∈ R^{N×K}` from the (symmetrized) adjacency.
-- In this confirmed setting:
-  - **Unweighted Laplacian** (no Gaussian weights in Laplacian construction)
-  - **Not concatenated** to node features (`concat_lap_pe = 0`)
+Enabled only when `lap_pe_dim > 0`.
 
-Consistency note for the paper figure:
+Current behavior:
 
-- In code, LapPE affects the model **only if** it is concatenated (`concat_lap_pe = 1`).
-- Since this setting uses `concat_lap_pe = 0`, LapPE can be depicted as **computed/available but not injected** (use a dashed arrow or a greyed-out merge node in the figure).
+- Computes normalized Laplacian eigenvector PE with shape `PE in R^(N x K)`.
+- Uses an unweighted adjacency by default.
+- Uses Gaussian edge weights only when `lap_pe_use_gaussian=True`.
+- PE is appended to node features only when `concat_lap_pe=True`.
 
-Final node features actually fed to the backbone:
+Feature assembly order in `build_node_features_early_fusion(...)`:
 
-- `x = Xp ∈ R^{N×D}` (LapPE not concatenated)
+```text
+x = [Xp_gene]
+if image fusion: x = [Xp_gene, Xp_img, img_mask_col]
+if LapPE concat: x = [previous_x, PE]
+```
+
+Output:
+
+```text
+x in R^(N x D_in)
+```
 
 ---
 
-## 3. Model Architecture (STOnco_Classifier)
+## 4. Model Architecture: `STOnco_Classifier`
 
-Module: `STOnco_Classifier` (`stonco/core/models.py`)
+### 4.1 GNN Backbone
 
-### 3.1 GNN Backbone: GATv2 (L layers)
+Module: `GNNBackbone`
 
-Backbone block:
+Forward:
 
-`h = GATv2Backbone(x, edge_index)`
+```text
+h = GNNBackbone(x, edge_index, edge_weight)
+```
 
-Layer spec (repeated `L = num_layers` times):
+Each GNN layer applies:
 
-- `GATv2Conv(d_in → hidden, heads=H, concat=True)`
-- (Implementation detail, not drawn at module-level): ReLU + LayerNorm + Dropout
+```text
+graph convolution -> ReLU -> LayerNorm -> Dropout
+```
 
-Shapes:
+Backbone choices:
 
-- Input: `x ∈ R^{N×D}`
-- Output: `h ∈ R^{N×(hidden·H)}`
+| `model` | Layer implementation | Layer output dim | Edge weights |
+|---|---|---:|---|
+| `gatv2` | `GATv2Conv(dim_prev, g_i, heads=H, concat=True)` | `g_i * H` | ignored |
+| `gcn` | `GCNConv(dim_prev, g_i)` | `g_i` | used when provided |
+| `sage` | custom `WeightedSAGEConv(dim_prev, g_i)` | `g_i` | used for weighted mean |
 
-### 3.2 Task Head: Tumor / Non-tumor Classifier
+Backbone output:
+
+```text
+h in R^(N x d_gnn)
+```
+
+### 4.2 Tumor / Non-Tumor Task Head
 
 Module: `ClassifierHead`
 
-Block-level MLP (spot-level):
+Config:
 
-- `h → z64 → logit`
+- `clf_hidden`, default `[256, 128, 64]`
+- Dropout inside the classifier is currently fixed to `0.1` when constructed by `STOnco_Classifier`
+
+Forward:
+
+```text
+h -> Linear/BN/ReLU/Dropout blocks -> z_clf -> fc_out -> logits
+```
 
 Shapes:
 
-- Input: `h ∈ R^{N×d_gnn}`
-- Intermediate embedding: `z64 ∈ R^{N×64}`
-- Output logits: `logits ∈ R^{N}` (binary, per spot)
-- Output probabilities: `p_tumor = sigmoid(logits) ∈ (0,1)^{N}`
+```text
+z_clf in R^(N x C_clf)
+logits in R^N
+p_tumor = sigmoid(logits)
+```
 
-### 3.3 Dual-Domain Adversarial Heads (Enabled)
+Compatibility note:
+
+- `forward(..., return_z=True)` returns `out['z_clf']`.
+- It also returns `out['z64']` only when `C_clf == 64`.
+- Therefore figure labels should use `z_clf` unless the plotted configuration fixes `clf_hidden[-1]=64`.
+
+### 4.3 Optional Dual-Domain Adversarial Heads
 
 Modules:
 
 - `DomainHead` for slide/batch domain
 - `DomainHead` for cancer-type domain
-- Gradient Reversal Layer (GRL) implemented by `grad_reverse(...)`
+- `grad_reverse(...)` implemented by `GradientReversalFunction`
 
-Both heads take the **same node embedding `h`** as input, and are **parallel branches**:
+Each domain head is:
 
-- Slide/batch domain branch:
-  - `h --GRL(β_slide)--> dom_head_slide(h) → dom_logits_slide ∈ R^{N×K_slide}`
-- Cancer-type domain branch:
-  - `h --GRL(β_cancer)--> dom_head_cancer(h) → dom_logits_cancer ∈ R^{N×K_cancer}`
+```text
+Linear(d_gnn, dom_hidden) -> ReLU -> Linear(dom_hidden, n_domains)
+```
 
-Where:
+Training branches:
 
-- `K_slide = n_domains_slide` (# of slide/batch domains)
-- `K_cancer = n_domains_cancer` (# of cancer types/domains)
+```text
+h -- GRL(beta_slide)  -> Slide/Batch DomainHead -> dom_logits_slide  in R^(N x K_slide)
+h -- GRL(beta_cancer) -> Cancer-Type DomainHead -> dom_logits_cancer in R^(N x K_cancer)
+```
 
----
+The two heads are independent parallel classifiers attached to the same shared node embedding `h`.
 
-## 4. Training Objective (What to Show in the Figure)
+Inference note:
 
-Losses are computed in `stonco/core/train.py`:
+- Inference constructs the model for the task path and loads weights with `strict=False`.
+- Domain heads are not needed for prediction.
 
-1. Task loss (spot-level):
-   - `L_task = BCEWithLogits(logits, y)` (only for labeled nodes where `y >= 0`)
-2. Domain losses (spot-level, but targets are graph-level domains broadcast to all nodes in that graph):
-   - `L_slide = CE(dom_logits_slide, slide_domain_label)`
-   - `L_cancer = CE(dom_logits_cancer, cancer_domain_label)`
-3. Total:
+### 4.4 Optional Return of Shared Embedding
 
-`L_total = L_task + λ_slide · L_slide + λ_cancer · L_cancer`
+`STOnco_Classifier.forward(..., return_h=True)` adds:
 
-GRL strength scheduling:
+```text
+out['h'] = h
+```
 
-- `β_*` is either DANN-style increasing (`grl_beta_mode='dann'`) or constant.
-
-Figure suggestion:
-
-- Use **dashed arrows** on the GRL branches, labeled `GRL (β_slide)` and `GRL (β_cancer)`.
-- Place `λ_slide`, `λ_cancer` near the two domain losses.
+This is used by MMD training and downstream embedding export/analysis paths.
 
 ---
 
-## 5. Paper Figure Layout (Recommended)
+## 5. Training Objective
 
-### Option A (single figure with 3 panels)
+Losses are computed in `stonco/core/train.py`.
 
-**(a) Graph construction**
+### 5.1 Task Loss
 
-- `X, xy → Preprocessor → Xp`
-- `xy → KNN graph → edge_index`
-- `edge_index → LapPE (K dims) → PE` (dashed merge indicating "not concatenated")
+Spot-level binary classification:
 
-**(b) Network**
+```text
+L_task = BCEWithLogits(logits[y>=0], y[y>=0])
+```
 
-- `x=Xp, edge_index → [GATv2 layer × L] → h → Task head → p_tumor`
+Unlabeled nodes (`y=-1`) are masked out.
 
-**(c) Dual-domain adversarial learning**
+### 5.2 Domain Adversarial Losses
 
-- From `h` branch out to:
-  - `GRL → Slide Domain Head → CE`
-  - `GRL → Cancer Domain Head → CE`
-  - Combine into `L_total`
+Domain labels are graph-level fields:
+
+- `bat_dom`: slide/batch domain index
+- `cancer_dom`: cancer-type domain index
+
+During mini-batch training, graph-level labels are expanded to nodes using `batch.batch`:
+
+```text
+slide_target_nodes  = batch.bat_dom[batch.batch]
+cancer_target_nodes = batch.cancer_dom[batch.batch]
+```
+
+Optimization uses CrossEntropyLoss. When domain class weights are available, the optimized CE uses graph-frequency weights:
+
+```text
+w_domain = sqrt(n_graph / (n_domain * graph_count_domain))
+```
+
+Weights are clamped to `[0.5, 5.0]` and mean-normalized.
+
+Weighted loss terms:
+
+```text
+L_slide  = lambda_slide  * CE_weighted(dom_logits_slide,  slide_target_nodes)
+L_cancer = lambda_cancer * CE_weighted(dom_logits_cancer, cancer_target_nodes)
+```
+
+GRL beta schedule:
+
+- `grl_beta_mode='dann'` (default): delayed DANN curve from 0 to the target beta.
+- `grl_beta_mode='constant'`: beta equals the target value for all steps.
+- `grl_beta_mode='linear'`: delayed linear warm-up to the target beta.
+
+Defaults:
+
+- `beta_slide_target = 1.0`
+- `beta_cancer_target = 0.5`
+- slide delay = 1 epoch
+- cancer delay = 3 epochs
+
+### 5.3 Optional MMD Alignment
+
+Enabled only when `use_mmd=True`.
+
+MMD operates on the shared GNN embedding `h`, not on `z_clf`.
+
+Config:
+
+- `mmd_on`: `slide`, `cancer`, or `both`
+- `lambda_mmd`: default `0.05`
+- multi-kernel RBF MMD with configurable `mmd_num_kernels`, `mmd_kernel_mul`, and optional fixed `mmd_sigma`
+- optional `mmd_spots_per_slide` node sampling
+- optional `mmd_max_pairs` cap on domain pairs per batch
+
+Loss:
+
+```text
+L_mmd = lambda_mmd * MMD_slide   if mmd_on in {slide, both}
+      + lambda_mmd * MMD_cancer  if mmd_on in {cancer, both}
+```
+
+### 5.4 Total Training Loss
+
+Only enabled terms are present:
+
+```text
+L_total = L_task
+        + L_slide
+        + L_cancer
+        + L_mmd
+```
+
+For the default training configuration, this reduces to:
+
+```text
+L_total = L_task
+        + lambda_slide  * L_slide_CE
+        + lambda_cancer * L_cancer_CE
+```
+
+because MMD is off by default.
 
 ---
 
-## 6. Figure Labels (English, Ready to Paste)
+## 6. Paper Figure Layout
 
-Suggested block labels:
+### Recommended three-panel figure
 
-- **Preprocessing**: “CP10K + log1p + HVG + Z-score + (PCA)”
-- **Graph**: “Spatial KNN graph (k=…)”
-- **Edge weight**: “Gaussian edge weight” (optional note: “not used by GATv2”)
-- **LapPE**: “Laplacian positional encoding (K=…)” (note: “computed, not concatenated”)
-- **Backbone**: “GATv2 encoder (L layers, H heads)”
-- **Task head**: “MLP classifier → tumor probability”
-- **GRL**: “Gradient Reversal Layer”
-- **Domain heads**: “Slide/Batch domain classifier”, “Cancer-type domain classifier”
+**(a) Feature and graph construction**
+
+- `X -> gene preprocessing -> Xp_gene`
+- Optional `X_img, img_mask -> image preprocessing -> Xp_img, img_mask_col`
+- `xy -> spatial KNN -> edge_index, edge_weight`
+- Optional `edge_index (+ edge_weight) -> LapPE -> PE`
+- Concatenate enabled node features into `x`
+
+**(b) STOnco encoder and task head**
+
+- `x, edge_index, optional edge_weight -> configurable GNN backbone -> h`
+- `h -> classifier MLP -> logits -> p_tumor`
+
+**(c) Training-only adaptation losses**
+
+- `h -> GRL(beta_slide) -> slide/batch domain head -> CE`
+- `h -> GRL(beta_cancer) -> cancer-type domain head -> CE`
+- Optional `h -> multi-domain RBF MMD`
+- Combine enabled losses into `L_total`
 
 ---
 
-## 7. Mermaid Draft (Flowchart)
+## 7. Figure Labels
 
-You can paste this into a Mermaid renderer and export SVG.
+Suggested English labels:
+
+- **Gene preprocessing**: "CP10K + log1p + HVG/all genes + Z-score + optional PCA"
+- **Image preprocessing**: "Image features + mask, optional PCA"
+- **Feature fusion**: "Early fusion: concat enabled node features"
+- **Graph**: "Spatial KNN graph"
+- **Edge weight**: "Gaussian edge weight"
+- **LapPE**: "Optional Laplacian positional encoding"
+- **Backbone**: "Configurable GNN encoder: GATv2 / GCN / GraphSAGE"
+- **Task head**: "MLP classifier -> tumor probability"
+- **GRL**: "Gradient Reversal Layer"
+- **Domain heads**: "Slide/Batch domain classifier", "Cancer-type domain classifier"
+- **MMD**: "Optional multi-domain RBF MMD on h"
+
+Caption note:
+
+- "GATv2 ignores Gaussian edge weights; GCN and weighted GraphSAGE consume them."
+
+---
+
+## 8. Mermaid Draft
+
+Paste into a Mermaid renderer and export SVG.
 
 ```mermaid
 flowchart LR
   %% ===== Inputs =====
-  X["Expression X (N×G)"] --> P
-  XY["Coordinates xy (N×2)"] --> G
+  X["Expression X<br/>(N x G)"] --> GP
+  XY["Coordinates xy<br/>(N x 2)"] --> KNN
+  IMG["Image features<br/>(optional)"] -.-> IP
+  IMGM["img_mask<br/>(optional)"] -.-> IP
 
-  %% ===== Preprocessing =====
-  subgraph S1["Preprocessing"]
-    P["CP10K + log1p + HVG + Z-score + (PCA)"]
-    XP["Xp (N×D)"]
-    P --> XP
+  %% ===== Feature Construction =====
+  subgraph S1["Feature Construction"]
+    GP["Gene preprocessing<br/>CP10K + log1p + HVG/all genes + Z-score + optional PCA"]
+    XG["Xp_gene<br/>(N x D_gene)"]
+    IP["Image preprocessing<br/>scale + optional PCA"]
+    XI["Xp_img + img_mask_col<br/>(optional)"]
+    FEAT["Node feature x<br/>concat enabled features"]
+    GP --> XG --> FEAT
+    IP -. "if use_image_features" .-> XI -.-> FEAT
   end
 
   %% ===== Graph Construction =====
   subgraph S2["Graph Construction"]
-    G["Spatial KNN (k)"]
-    EI["edge_index (2×E)"]
-    EW["edge_weight (E)\n(Gaussian; not used by GATv2)"]
-    G --> EI
-    G --> EW
-
-    LPE["LapPE (N×K)\n(unweighted Laplacian)"]
-    EI --> LPE
+    KNN["Spatial KNN<br/>(k = knn_k)"]
+    EI["edge_index<br/>(2 x E)"]
+    EW["edge_weight<br/>Gaussian (E)"]
+    LPE["LapPE<br/>(optional, N x K)"]
+    KNN --> EI
+    KNN --> EW
+    EI -. "if lap_pe_dim > 0" .-> LPE
+    EW -. "optional weighted LapPE" .-> LPE
   end
 
-  %% LapPE shown but not injected
-  LPE -. "not concatenated" .-> XP
+  LPE -. "if concat_lap_pe" .-> FEAT
 
   %% ===== Model =====
   subgraph S3["STOnco_Classifier"]
-    B["GATv2 backbone\n(L layers, H heads)"]
-    HN["h (N×(hidden·H))"]
-    TH["Task head (MLP)\n→ logits (N)"]
-    PT["p_tumor = sigmoid(logits)"]
+    B["GNN backbone<br/>GATv2 / GCN / GraphSAGE"]
+    H["shared node embedding h<br/>(N x d_gnn)"]
+    CLF["ClassifierHead<br/>MLP"]
+    LOG["logits<br/>(N)"]
+    PROB["p_tumor = sigmoid(logits)"]
 
-    XP --> B
+    FEAT --> B
     EI --> B
-    B --> HN --> TH --> PT
+    EW -. "GCN/SAGE only" .-> B
+    B --> H --> CLF --> LOG --> PROB
 
-    %% Dual-domain adversarial branches (enabled)
-    GRLS["GRL (β_slide)"]
-    DH_S["Slide/Batch Domain Head\n→ dom_logits_slide (N×K_slide)"]
+    GRLS["GRL beta_slide"]
+    DHS["Slide/Batch DomainHead<br/>(training optional)"]
+    GRLC["GRL beta_cancer"]
+    DHC["Cancer-Type DomainHead<br/>(training optional)"]
+    MMD["Multi-domain RBF MMD<br/>(optional)"]
 
-    GRLC["GRL (β_cancer)"]
-    DH_C["Cancer Domain Head\n→ dom_logits_cancer (N×K_cancer)"]
-
-    HN -.-> GRLS --> DH_S
-    HN -.-> GRLC --> DH_C
+    H -.-> GRLS --> DHS
+    H -.-> GRLC --> DHC
+    H -. "if use_mmd" .-> MMD
   end
 
   %% ===== Losses =====
   subgraph S4["Training Objective"]
-    LT["L_task: BCEWithLogits"]
-    LS["L_slide: CE (λ_slide)"]
-    LC["L_cancer: CE (λ_cancer)"]
-    LALL["L_total = L_task + λ_slide·L_slide + λ_cancer·L_cancer"]
+    LT["L_task<br/>BCEWithLogits on labeled nodes"]
+    LS["lambda_slide * CE_slide"]
+    LC["lambda_cancer * CE_cancer"]
+    LM["lambda_mmd * MMD"]
+    LALL["L_total<br/>sum of enabled losses"]
 
-    TH --> LT
-    DH_S --> LS
-    DH_C --> LC
+    LOG --> LT
+    DHS --> LS
+    DHC --> LC
+    MMD --> LM
     LT --> LALL
     LS --> LALL
     LC --> LALL
+    LM --> LALL
   end
 ```
 
 ---
 
-## 8. Graphviz DOT Draft (Alternative)
+## 9. Graphviz DOT Draft
 
 ```dot
 digraph STOnco {
   rankdir=LR;
   labelloc="t";
-  label="STOnco (GATv2 + LapPE shown (not concatenated) + Dual-Domain Adversarial)";
+  label="STOnco Current Architecture: Configurable GNN + Optional Fusion, Domain Adversarial Learning, and MMD";
 
   node [shape=box, style="rounded", fontsize=10];
+  edge [fontsize=9];
 
-  subgraph cluster_pre {
-    label="Preprocessing";
-    X [label="Expression X (N×G)"];
-    P [label="CP10K + log1p + HVG + Z-score + (PCA)"];
-    XP [label="Xp (N×D)"];
-    X -> P -> XP;
+  subgraph cluster_features {
+    label="Feature Construction";
+    X [label="Expression X\n(N x G)"];
+    GP [label="Gene preprocessing\nCP10K + log1p + HVG/all genes\nZ-score + optional PCA"];
+    XG [label="Xp_gene\n(N x D_gene)"];
+    IMG [label="Image features\noptional"];
+    MASK [label="img_mask\noptional"];
+    IP [label="Image preprocessing\nscale + optional PCA"];
+    XI [label="Xp_img + img_mask_col\noptional"];
+    FEAT [label="Node feature x\nconcat enabled features"];
+
+    X -> GP -> XG -> FEAT;
+    IMG -> IP [style=dashed, label="if use_image_features"];
+    MASK -> IP [style=dashed];
+    IP -> XI [style=dashed];
+    XI -> FEAT [style=dashed];
   }
 
   subgraph cluster_graph {
     label="Graph Construction";
-    XY [label="Coordinates xy (N×2)"];
-    KNN [label="Spatial KNN (k)"];
-    EI [label="edge_index (2×E)"];
-    EW [label="edge_weight (E)\\nGaussian; not used by GATv2"];
-    LPE [label="LapPE (N×K)\\nunweighted Laplacian"];
+    XY [label="Coordinates xy\n(N x 2)"];
+    KNN [label="Spatial KNN\n(k = knn_k)"];
+    EI [label="edge_index\n(2 x E)"];
+    EW [label="edge_weight\nGaussian (E)"];
+    LPE [label="LapPE\noptional (N x K)"];
+
     XY -> KNN -> EI;
     KNN -> EW;
-    EI -> LPE;
+    EI -> LPE [style=dashed, label="if lap_pe_dim > 0"];
+    EW -> LPE [style=dashed, label="optional weighted LapPE"];
   }
 
-  %% LapPE is drawn but not injected
-  LPE -> XP [style=dashed, label="not concatenated", fontsize=9];
+  LPE -> FEAT [style=dashed, label="if concat_lap_pe"];
 
   subgraph cluster_model {
     label="STOnco_Classifier";
-    B [label="GATv2 backbone\\n(L layers, H heads)"];
-    HN [label="h (N×(hidden·H))"];
-    TH [label="Task head (MLP)\\nlogits (N)"];
-    PT [label="p_tumor = sigmoid(logits)"];
-    XP -> B;
+    B [label="GNN backbone\nGATv2 / GCN / GraphSAGE"];
+    H [label="Shared embedding h\n(N x d_gnn)"];
+    CLF [label="ClassifierHead\nMLP"];
+    LOG [label="logits\n(N)"];
+    PROB [label="p_tumor = sigmoid(logits)"];
+
+    FEAT -> B;
     EI -> B;
-    B -> HN -> TH -> PT;
+    EW -> B [style=dashed, label="GCN/SAGE only"];
+    B -> H -> CLF -> LOG -> PROB;
 
-    GRLS [label="GRL (β_slide)"];
-    DHS [label="Slide/Batch Domain Head\\ndom_logits_slide (N×K_slide)"];
-    GRLC [label="GRL (β_cancer)"];
-    DHC [label="Cancer Domain Head\\ndom_logits_cancer (N×K_cancer)"];
+    GRLS [label="GRL beta_slide"];
+    DHS [label="Slide/Batch DomainHead\ntraining optional"];
+    GRLC [label="GRL beta_cancer"];
+    DHC [label="Cancer-Type DomainHead\ntraining optional"];
+    MMD [label="Multi-domain RBF MMD\noptional"];
 
-    HN -> GRLS [style=dashed];
+    H -> GRLS [style=dashed];
     GRLS -> DHS;
-    HN -> GRLC [style=dashed];
+    H -> GRLC [style=dashed];
     GRLC -> DHC;
+    H -> MMD [style=dashed, label="if use_mmd"];
   }
 
   subgraph cluster_loss {
     label="Training Objective";
-    LT [label="L_task: BCEWithLogits"];
-    LS [label="L_slide: CE (× λ_slide)"];
-    LC [label="L_cancer: CE (× λ_cancer)"];
-    LALL [label="L_total = L_task + λ_slide·L_slide + λ_cancer·L_cancer"];
-    TH -> LT;
+    LT [label="L_task\nBCEWithLogits"];
+    LS [label="lambda_slide * CE_slide"];
+    LC [label="lambda_cancer * CE_cancer"];
+    LM [label="lambda_mmd * MMD"];
+    LALL [label="L_total\nsum of enabled losses"];
+
+    LOG -> LT;
     DHS -> LS;
     DHC -> LC;
+    MMD -> LM;
     LT -> LALL;
     LS -> LALL;
     LC -> LALL;
+    LM -> LALL;
   }
 }
 ```
-

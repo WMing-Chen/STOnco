@@ -1,5 +1,98 @@
 # Update Log
 
+## 2026-04-10 16:23:02 CST
+
+- 更新内容：训练流程新增 `--save_epoch_checkpoints` 参数，可在常规最优/最后一轮之外额外保留指定 epoch 的模型结果。
+- 代码影响：
+  - `stonco/core/train.py` 新增 `--save_epoch_checkpoints` 参数解析与归一化校验，支持一次传入多个正整数 epoch
+  - 单次训练、KFold 与 LOCO 三条训练路径都会在训练过程中捕获指定 epoch 的 `state_dict`，并在训练结束后统一写出到 `epoch_checkpoints/epoch_XXX/`
+  - 根目录 `meta.json` 新增 `saved_epoch_checkpoints` 与 `requested_save_epoch_checkpoints` 字段，用于记录请求轮次与实际成功保存的轮次
+  - `docs/Tutorial.md` 补充了该参数的用法、输出目录结构与早停下的行为说明
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `docs/Tutorial.md`
+- 说明：
+  - 例如 `--epochs 300 --save_epoch_checkpoints 100` 会在正常训练到 300 轮的同时额外保留第 100 轮模型
+  - 额外保存的 `epoch_checkpoints/epoch_XXX/` 目录会复制预处理器文件，并生成与该轮对应的 `model.pt`、`meta.json`、训练曲线和 `loss_components.csv`，便于直接按常规 artifacts 目录使用
+  - 若开启早停且训练提前结束，未到达的请求轮次不会生成快照，并会在日志中给出提示
+
+## 2026-04-10 15:40:07 CST
+
+- 更新内容：新增 embedding 域统计与局部二维诊断工具 `analyze_spot_embedding_domains.py`，并将其使用方法补充到 `docs/Tutorial.md`。
+- 代码影响：
+  - 新增 `stonco/utils/analyze_spot_embedding_domains.py`，用于对 `spot_embeddings_*.csv` 计算域均值/方差统计，并生成热图、箱线图、局部维度 KDE、一维 spot 散点分布图与二维联合散点图
+  - 支持按组均衡抽样导出二维散点图与对应抽样 CSV，便于对比 `h_7/h_20` 等局部维度组合在不同域上的分布
+  - `docs/Tutorial.md` 第 9 章新增 “9.5 embedding 域统计与局部二维诊断” 小节，补充用途、示例命令、默认产物与参数说明
+- 涉及文件：
+  - `stonco/utils/analyze_spot_embedding_domains.py`
+  - `docs/Tutorial.md`
+- 说明：
+  - 脚本默认面向 `h_*` embedding 列；若分析分类头 latent，可通过 `--embedding_prefix z_clf_` 切换到 `z_clf_*`
+  - 该工具偏向诊断与解释，适合定位域偏移残留在哪些维度；正式量化比较仍建议结合 `evaluate_embedding_mixing.py` 的 LISI 指标一起使用
+
+## 2026-04-09 20:29:18 CST
+
+- 更新内容：将 `stonco.core.train` 的 LapPE 默认设置从启用改为关闭。
+- 代码影响：
+  - `stonco/core/train.py` 默认配置中的 `lap_pe_dim` 从 `16` 改为 `0`
+  - 不显式传入 `--lap_pe_dim` 时，训练流程不再默认计算 LapPE
+- 涉及文件：
+  - `stonco/core/train.py`
+- 说明：
+  - 本次仅调整 `stonco.core.train` 的默认训练配置
+  - 如需重新启用，可在训练命令中显式传入 `--lap_pe_dim` 为正整数
+
+## 2026-04-07 11:35:00 CST
+
+- 更新内容：训练流程新增 sampler 双模式与静态子图训练支持，并将对应说明同步到 `docs/Tutorial.md`。
+- 代码影响：
+  - `train.py` 新增 `sampler_mode`、`sampler_k_cancers`、`sampler_m_per_cancer`、`sampler_enforce_distinct_batch`、`subgraph_mode`、`subgraph_target_spots`、`subgraph_min_spots`
+  - 新增 `stonco/core/sampler.py`，实现 `CancerBalancedBatchSampler`、训练集静态子图展开与 sampler 配置归一化
+  - `cancer_balanced_subgraph` 会自动归一化为 `cancer_balanced + static subgraph`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `stonco/core/sampler.py`
+  - `docs/PLAN_sampler_dual_mode.md`
+  - `docs/Tutorial.md`
+- 说明：
+  - 训练集在 train/val split 后再展开子图；验证集保持整图
+  - `subgraph_mode=online` 目前保留接口，尚未实现
+
+## 2026-04-07 11:20:00 CST
+
+- 更新内容：完成通用 embedding mixing 评估流程落地，新增 embedding-space / UMAP-space / tSNE-space 的 LISI 量化工具，并补齐一键串联的分析 pipeline。
+- 代码影响：
+  - 新增公共算法模块：
+    - `stonco/utils/embedding_analysis.py`
+  - 新增独立评估入口：
+    - `stonco/utils/evaluate_embedding_mixing.py`
+  - 新增一键分析编排入口：
+    - `stonco/utils/run_embedding_analysis_pipeline.py`
+  - `visualize_umap_tsne.py` 新增参数：
+    - `--out_coords_csv`
+  - `visualize_umap_tsne.py` 现可在生成 SVG 的同时导出与图像完全一致的 `umap_1/umap_2`、`tsne_1/tsne_2` 坐标 CSV，供后续 LISI 评估复用
+  - `evaluate_embedding_mixing.py` 支持：
+    - `--spaces embedding umap tsne`
+    - `--group_cols`
+    - `--group_roles col:integration|conservation`
+    - `--k_values`
+    - `--out_spot_csv`
+  - `run_embedding_analysis_pipeline.py` 会顺序串联：
+    - 导出 embedding CSV
+    - 生成 UMAP/t-SNE 图与坐标 CSV
+    - 输出 mixing 指标汇总 CSV（以及可选的 per-spot CSV）
+- 涉及文件：
+  - `stonco/utils/embedding_analysis.py`
+  - `stonco/utils/evaluate_embedding_mixing.py`
+  - `stonco/utils/run_embedding_analysis_pipeline.py`
+  - `stonco/utils/visualize_umap_tsne.py`
+  - `docs/PLAN_embedding_mixing_eval_pipeline.md`
+  - `docs/Tutorial.md`
+- 说明：
+  - 正式结论应以 `space=embedding` 的 LISI 为主，`space=umap/tsne` 仅作为配图辅助指标
+  - `group_roles` 对常见列支持自动推断：`sample_id/batch_id/slide_id -> integration`，`tumor_label/cell_type/region -> conservation`
+  - `cancer_type` 的角色不写死，应按实验目标显式指定
+
 ## 2026-04-03 17:57:32 CST
 
 - 更新内容：`visualize_umap_tsne.py` 新增可选参数 `--color_cols`，允许按任意指定 metadata 列生成 UMAP + t-SNE 着色图，同时默认行为保持不变。
