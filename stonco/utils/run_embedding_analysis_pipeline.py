@@ -50,6 +50,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--umap_n_neighbors', type=int, default=15, help='UMAP n_neighbors parameter.')
     parser.add_argument('--umap_min_dist', type=float, default=0.1, help='UMAP min_dist parameter.')
     parser.add_argument('--tsne_perplexity', type=float, default=None, help='Optional t-SNE perplexity override.')
+    parser.add_argument(
+        '--highlight_col',
+        default=None,
+        help='Optional metadata column used to draw selected spots as triangles in UMAP/t-SNE plots.',
+    )
+    parser.add_argument(
+        '--highlight_values',
+        nargs='+',
+        default=None,
+        help='Values in --highlight_col to draw as triangles. Does not affect exported embeddings or LISI metrics.',
+    )
+    parser.add_argument('--highlight_marker', default='^', help='Matplotlib marker for highlighted spots. Default: triangle (^).')
+    parser.add_argument('--highlight_point_size', type=float, default=None, help='Optional marker size for highlighted spots.')
     parser.add_argument('--save_spot_metrics', action='store_true', help='Also save per-spot LISI values.')
     return parser
 
@@ -120,6 +133,13 @@ def main() -> None:
         visualize_cmd.extend(['--max_points', str(args.max_points)])
     if args.tsne_perplexity is not None:
         visualize_cmd.extend(['--tsne_perplexity', str(args.tsne_perplexity)])
+    if args.highlight_col or args.highlight_values:
+        if not args.highlight_col or not args.highlight_values:
+            raise ValueError('--highlight_col and --highlight_values must be provided together.')
+        visualize_cmd.extend(['--highlight_col', args.highlight_col, '--highlight_values', *[str(v) for v in args.highlight_values]])
+        visualize_cmd.extend(['--highlight_marker', args.highlight_marker])
+        if args.highlight_point_size is not None:
+            visualize_cmd.extend(['--highlight_point_size', str(args.highlight_point_size)])
     print('Running:', ' '.join(visualize_cmd))
     subprocess.run(visualize_cmd, check=True)
 

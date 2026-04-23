@@ -283,7 +283,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     """可视化单个切片的核心逻辑"""
     # 兼容旧模型：若缺失新字段则给默认
     cfg.setdefault('lap_pe_dim', 16)
-    cfg.setdefault('concat_lap_pe', True)
+    cfg.setdefault('concat_lap_pe', False)
     cfg.setdefault('lap_pe_use_gaussian', False)
     cfg.setdefault('knn_k', 6)
     cfg.setdefault('gaussian_sigma_factor', 1.0)
@@ -291,6 +291,9 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     cfg.setdefault('heads', 4)
     cfg.setdefault('num_layers', 3)
     cfg.setdefault('dropout', 0.3)
+    cfg['gnn_dropout'] = float(cfg['dropout'] if cfg.get('gnn_dropout', None) is None else cfg['gnn_dropout'])
+    cfg['clf_dropout'] = float(cfg['dropout'] if cfg.get('clf_dropout', None) is None else cfg['clf_dropout'])
+    cfg['dom_dropout'] = float(cfg['dropout'] if cfg.get('dom_dropout', None) is None else cfg['dom_dropout'])
     cfg.setdefault('edge_attr_dim', 0)
     cfg.setdefault('use_edge_attr', False)
     cfg.setdefault('clf_hidden', [256, 128, 64])
@@ -346,6 +349,9 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
         hidden=cfg['GNN_hidden'],
         num_layers=cfg['num_layers'],
         dropout=cfg['dropout'],
+        gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
+        clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
+        dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
         model=cfg['model'],
         heads=cfg.get('heads', 4),
         clf_hidden=clf_hidden,

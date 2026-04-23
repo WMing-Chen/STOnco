@@ -18,6 +18,33 @@ def _sanitize_name(text: str) -> str:
     return safe.strip('_') or 'column'
 
 
+def _resolve_metadata_column(df: pd.DataFrame, col: str) -> str:
+    if col in df.columns:
+        return col
+    key = str(col).strip().lower().replace('-', '_')
+    aliases = {
+        'cancer': 'cancer_type',
+        'cancer_type': 'cancer_type',
+        'sample': 'sample_id',
+        'sampleid': 'sample_id',
+        'sample_id': 'sample_id',
+        'batch': 'batch_id',
+        'batchid': 'batch_id',
+        'batch_id': 'batch_id',
+    }
+    return aliases.get(key, col)
+
+
+def _expand_cli_values(values) -> list[str]:
+    expanded = []
+    for value in values or []:
+        for part in str(value).split(','):
+            part = part.strip()
+            if part:
+                expanded.append(part)
+    return expanded
+
+
 def _normalize_category_labels(color_col: str, series: pd.Series) -> pd.Series:
     s = series.copy()
     try:
@@ -75,6 +102,10 @@ def _plot_two_panels(
     title_fontsize=18,
     label_fontsize=14,
     legend_fontsize=12,
+    highlight_mask=None,
+    highlight_label=None,
+    highlight_marker='^',
+    highlight_point_size=None,
 ):
     import matplotlib
     matplotlib.use('Agg')
@@ -94,11 +125,41 @@ def _plot_two_panels(
             label2color['Non-malignant spot'] = '#71CCEA'
         if 'Malignant spot' in label2color:
             label2color['Malignant spot'] = '#B20A0A'
-    point_colors = labels.map(label2color).to_list()
+    point_colors = np.asarray(labels.map(label2color).to_list(), dtype=object)
+    if highlight_mask is None:
+        highlight_mask = np.zeros(len(labels), dtype=bool)
+    else:
+        highlight_mask = np.asarray(highlight_mask, dtype=bool)
+        if highlight_mask.shape[0] != len(labels):
+            raise ValueError(f'highlight_mask length mismatch: {highlight_mask.shape[0]} vs {len(labels)}')
+    normal_mask = ~highlight_mask
+    highlight_point_size = float(highlight_point_size if highlight_point_size is not None else max(float(point_size) * 3.0, 10.0))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     for ax, coords, title in zip(axes, [coords_left, coords_right], [title_left, title_right]):
-        ax.scatter(coords[:, 0], coords[:, 1], c=point_colors, s=float(point_size), alpha=float(alpha), linewidths=0)
+        if np.any(normal_mask):
+            ax.scatter(
+                coords[normal_mask, 0],
+                coords[normal_mask, 1],
+                c=point_colors[normal_mask].tolist(),
+                s=float(point_size),
+                alpha=float(alpha),
+                linewidths=0,
+                marker='o',
+            )
+        if np.any(highlight_mask):
+            highlight_scatter = ax.scatter(
+                coords[highlight_mask, 0],
+                coords[highlight_mask, 1],
+                facecolors=point_colors[highlight_mask].tolist(),
+                s=highlight_point_size,
+                alpha=float(alpha),
+                linewidths=0,
+                edgecolors='none',
+                marker=highlight_marker,
+            )
+            highlight_scatter.set_edgecolor('none')
+            highlight_scatter.set_linewidth(0)
         ax.set_title(title, fontsize=int(title_fontsize))
         ax.set_xticks([])
         ax.set_yticks([])
@@ -121,6 +182,20 @@ def _plot_two_panels(
         )
         for u in uniq
     ]
+    if np.any(highlight_mask):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker=highlight_marker,
+                color='none',
+                label=highlight_label or 'Highlighted',
+                markerfacecolor='#6e6e6e',
+                markeredgecolor='none',
+                markersize=8,
+                linewidth=0,
+            )
+        )
     max_rows_per_col = 30
     ncol = max(1, int(np.ceil(len(handles) / max_rows_per_col)))
 
@@ -174,6 +249,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--umap_n_neighbors', type=int, default=15, help='UMAP n_neighbors parameter')
     parser.add_argument('--umap_min_dist', type=float, default=0.1, help='UMAP min_dist parameter')
     parser.add_argument('--tsne_perplexity', type=float, default=None, help='Optional t-SNE perplexity override')
+    parser.add_argument(
+        '--highlight_col',
+        default=None,
+        help='Optional metadata column used to draw selected spots as triangles, e.g. cancer_type, sample_id, or batch_id.',
+    )
+    parser.add_argument(
+        '--highlight_values',
+        nargs='+',
+        default=None,
+        help='Values in --highlight_col to draw as triangles. Other spots keep the default circle marker.',
+    )
+    parser.add_argument('--highlight_marker', default='^', help='Matplotlib marker for highlighted spots. Default: triangle (^).')
+    parser.add_argument('--highlight_point_size', type=float, default=None, help='Optional marker size for highlighted spots.')
     return parser
 
 
@@ -198,6 +286,22 @@ def run_visualization(args: argparse.Namespace) -> dict[str, object]:
     out_dir = args.out_dir or (os.path.dirname(os.path.abspath(args.embeddings_csv)) or '.')
     os.makedirs(out_dir, exist_ok=True)
 
+    highlight_mask = None
+    highlight_label = None
+    if args.highlight_col or args.highlight_values:
+        if not args.highlight_col or not args.highlight_values:
+            raise ValueError('--highlight_col and --highlight_values must be provided together.')
+        highlight_col = _resolve_metadata_column(df, args.highlight_col)
+        if highlight_col not in df.columns:
+            print(f'[Warn] Missing highlight column {args.highlight_col} in embeddings CSV; no triangle highlight will be used.')
+        else:
+            highlight_values = _expand_cli_values(args.highlight_values)
+            values = {str(v) for v in highlight_values}
+            highlight_mask = df[highlight_col].astype(str).isin(values).to_numpy()
+            value_text = ','.join(str(v) for v in highlight_values)
+            highlight_label = f'{highlight_col}={value_text}'
+            print(f'[Info] Highlight {int(highlight_mask.sum())}/{len(df)} spots as triangles: {highlight_label}')
+
     color_cols = args.color_cols or ['tumor_label', 'batch_id', 'cancer_type']
     plots = [(col, f'umap_tsne_{args.embed_source}_by_{_sanitize_name(col)}.svg') for col in color_cols]
     for col, fname in plots:
@@ -215,6 +319,10 @@ def run_visualization(args: argparse.Namespace) -> dict[str, object]:
             out_svg=out_svg,
             point_size=args.point_size,
             alpha=args.alpha,
+            highlight_mask=highlight_mask,
+            highlight_label=highlight_label,
+            highlight_marker=args.highlight_marker,
+            highlight_point_size=args.highlight_point_size,
         )
         print('Saved', out_svg)
 

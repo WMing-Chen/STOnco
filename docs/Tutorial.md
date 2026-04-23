@@ -19,6 +19,8 @@
 - evaluate_embedding_mixing.py：在 embedding / UMAP / t-SNE 空间上计算 `iLISI` / `cLISI`，输出混合评估汇总 CSV，并可选导出每个 spot 的局部 LISI
 - run_embedding_analysis_pipeline.py：一键串联 embedding 导出、UMAP/t-SNE 绘图与 LISI 量化
 - analyze_spot_embedding_domains.py：对导出的 `spot_embeddings_*.csv` 计算域均值/方差统计，并生成热图、箱线图、KDE 与二维散点诊断图
+- scripts/plot_loco_umap_tsne.sh：批量绘制 LOCO 各癌种 fold 的 UMAP/t-SNE，可选遍历 epoch checkpoints，默认突出留出癌种为三角形
+- scripts/eval_visualize_loco.sh：汇总 LOCO per-slide 指标、绘图，并可选生成 best/worst slide 空间预测图
 - Dual-Domain Adversarial Learning.md：双域自适应设计说明
 - utils.py：模型与元信息存取
 - synthetic_data/：示例合成/模拟数据（可选）
@@ -43,7 +45,7 @@
   - `run_single_training` / `run_kfold_training` / `run_loco_training`：三种训练模式入口。
 - `stonco/core/wb_potentials.py`
   - `GeneratedSupportMap`：训练阶段生成 `b=T_phi(h)` 的 identity-initialized residual map。
-  - `GeneratedSupportWBLoss`：generated-support WB loss helper，支持 `euclidean_pairwise` 与 `dual_potential`。
+  - `GeneratedSupportWBLoss`：generated-support WB loss helper，支持 `euclidean_pairwise`、`dual_potential` 与 `sinkhorn_divergence`。
 - `stonco/core/infer.py`
   - `InferenceEngine`：封装预处理、构图、预测与基因重要性计算。
 - `stonco/core/batch_infer.py`
@@ -96,7 +98,7 @@ python -m stonco.utils.prepare_data build-val-npz \
   --xy_cols row col \
   --label_col true_label
 
-# 2) 训练（双域对抗：默认启用；alpha=--lambda_*、beta=--grl_beta_* 可独立调节）
+# 2) 训练（示例显式启用双域对抗；默认仅启用 GNN + 分类头）
 python -m stonco.core.train \
   --train_npz $DATA_ROOT/train_data.npz \
   --artifacts_dir $ARTIFACTS \
@@ -181,17 +183,19 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
 
 默认参数要点：
 - `visualize_umap_tsne.py` 默认仍会生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的图；若传 `--color_cols ...`，则改为按指定列生成
+- `visualize_umap_tsne.py` / `run_embedding_analysis_pipeline.py` 可选 `--highlight_col` + `--highlight_values`，把指定 cancer/sample/batch 的 spot 画成三角形；该功能只影响 SVG 点形状，不影响 embedding、coords 或 LISI 结果
 - `evaluate_embedding_mixing.py` 默认只评估 `embedding` 空间；若要把 UMAP / t-SNE 作为辅助指标，需显式传 `--spaces embedding umap` 或 `--spaces embedding umap tsne`
 - `run_embedding_analysis_pipeline.py` 默认会先导出 embedding，再保存降维坐标 CSV，最后输出 LISI 汇总 CSV；默认指标空间是 `embedding umap`
 - prepare_data：`--xy_cols row col`、`--label_col true_label` 为默认；build-single-npz 若不传 `--sample_id`，将用坐标文件上一级目录名。
 - 训练（train.py）：
   - 设备：默认自动检测 CUDA；线程：`--num_threads` 不传则由 PyTorch 默认；DataLoader `--num_workers` 默认 0。
-  - 学习率调度：`--lr_scheduler` 默认 `none`
-    - `none`：固定学习率
-    - `linear`：按总 step 线性衰减到 `lr * min_lr_ratio`
-    - `cosine`：按总 step 余弦衰减到 `lr * min_lr_ratio`
-    - `warmup_cosine`：先 warmup 到 base lr，再做 cosine decay
-    - `plateau`：按验证指标停滞自动降 lr
+  - 学习率：`--lr` / `--weight_decay` 保留为全局默认；可用 `--gnn_lr`、`--clf_lr`、`--dom_lr`、`--wb_support_lr` 以及对应 `*_weight_decay` 分别覆盖 GNN、分类头、域对抗 head、WB support map
+  - 学习率调度：`--lr_scheduler` 默认 `none`；主 optimizer 使用 PyTorch param groups，scheduler 采用统一节奏、分组 base lr
+    - `none`：各参数组固定使用自己的 base lr
+    - `linear`：按总 step 线性衰减到各自 `base_lr * min_lr_ratio`
+    - `cosine`：按总 step 余弦衰减到各自 `base_lr * min_lr_ratio`
+    - `warmup_cosine`：各组先 warmup 到自己的 base lr，再做 cosine decay
+    - `plateau`：按验证指标停滞自动降 lr，各组使用自己的 `base_lr * min_lr_ratio` 作为下限
   - scheduler 相关默认值：
     - `--lr_warmup_epochs 10`
     - `--min_lr_ratio 0.01`
@@ -209,7 +213,7 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
   - 若使用 `--lr_scheduler plateau`：
     - 推荐关闭早停：`--early_patience 0`
     - 若不关闭，需显著增大 `--early_patience`，否则 plateau 刚降 lr 训练就可能被 early stopping 提前终止
-  - 双域对抗：细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制；默认两者均启用（slide 对应 batch 域）。
+  - 双域对抗：细粒度开关 `--use_domain_adv_slide/--use_domain_adv_cancer` 可单独控制；默认两者均关闭（slide 对应 batch 域）。如需启用，显式传入 `--use_domain_adv_slide 1` 和/或 `--use_domain_adv_cancer 1`。
   - alpha（域 loss 权重）：`--lambda_slide/--lambda_cancer`（默认 **1.0/1.0**）。
   - beta（GRL 对抗强度）：由 `--grl_beta_mode` 控制（默认 `dann`）
     - `dann`：支持两路独立 `delay_epochs`；delay 前 `beta=0`，之后在剩余训练过程上重新归一化并走完整 DANN 曲线。核心参数：`--grl_beta_slide_target/--grl_beta_cancer_target/--grl_beta_gamma`（默认 **1.0/0.5/10**）以及 `--grl_beta_slide_delay_epochs/--grl_beta_cancer_delay_epochs`（默认 **1/3**）
@@ -217,7 +221,7 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
     - `linear`：delay 前 `beta=0`，delay 后线性升到 `*_target`；默认 slide 为 **delay=1, warmup=8**，cancer 为 **delay=3, warmup=12**
   - Wasserstein barycenter 对齐（可选）：
     - `--use_wb_align 1` 启用 generated-support WB；推荐与 `--use_mmd 0` 搭配作为 MMD 替代实验
-    - `--wb_loss_type euclidean_pairwise` 是低计算量默认起点；`dual_potential` 更贴近正规 dual-potential WB objective，但更慢
+    - `--wb_loss_type euclidean_pairwise` 是低计算量默认起点；`dual_potential` 使用 neural dual surrogate；`sinkhorn_divergence` 使用 batch 内 debiased Sinkhorn divergence，更接近标准 entropy-regularized OT，但计算量更高
     - WB 仍让分类 head 使用 `h`，训练阶段额外学习 `b=T_phi(h)` 并通过 anchor 把对齐效果传回 `h`
     - 推荐配合 `--sampler_mode cancer_balanced --sampler_k_cancers 4 --sampler_m_per_cancer 2/3`
   - 外部验证：`--val_sample_dir` 指定外部验证 NPZ 目录（单切片），验证指标会合并计算。
@@ -421,20 +425,23 @@ python -m stonco.core.train \
   --artifacts_dir /path/to/artifacts \
   --val_sample_dir /path/to/val_npz_dir \
   --epochs 100 \
-  --early_patience 30 \
   --batch_size_graphs 2
 ```
 
 主要参数（部分）：
 - 基本：
   - --train_npz 必需；--artifacts_dir 默认为 artifacts
-  - --epochs，--early_patience，--batch_size_graphs
+  - --epochs，--early_patience（默认 0，<=0 表示关闭早停），--batch_size_graphs
   - --device cpu/cuda（不指定自动检测,默认cuda）
   - --num_threads 控制 PyTorch 线程数（CPU 时限制核心占用）
   - --num_workers DataLoader 进程数（验证集内部自动≤2）
 - 模型与结构：
   - --model {gatv2,sage,gcn}（默认 gatv2），--heads（仅 gatv2）
   - --GNN_hidden，--num_layers，--dropout
+  - Dropout：`--dropout` 保留为全局默认 dropout（默认 0.3）；可用 `--gnn_dropout`、`--clf_dropout`、`--dom_dropout` 分别覆盖 GNN backbone、分类头、域对抗 head。若模块级参数不传，则回退使用 `--dropout`
+    - `--gnn_dropout` 作用于 GNN 每层输出后的 dropout；当 `--model gatv2` 时也传给 `GATv2Conv(..., dropout=...)`
+    - `--clf_dropout` 作用于分类头每个隐藏层后的 dropout；分类头不再使用历史写死的 0.1
+    - `--dom_dropout` 作用于 slide/cancer 两个域对抗 head 的 `Linear -> ReLU -> Dropout -> Linear` 中间 dropout
   - `--GNN_hidden` 支持单个整数或逗号分隔列表，默认 `256,128,64`
   - 例：
     - `--GNN_hidden 128` 且 `--num_layers 3` -> 实际为 `[128,128,128]`
@@ -454,7 +461,7 @@ python -m stonco.core.train \
     - `clf_hidden`：分类头各隐藏层宽度列表
     - `clf_latent_dim`：分类头最后一层隐藏表示维度，即 `clf_hidden[-1]`
   - 域头：--dom_hidden（默认 64；作用于 batch/cancer 两个域头）
-  - LapPE：--lap_pe_dim（>0 启用，默认 16）、--concat_lap_pe {0,1}、--lap_pe_use_gaussian {0,1}
+  - LapPE：--lap_pe_dim（>0 启用，默认 0）、--concat_lap_pe {0,1}（默认 0，需显式传 1 才会拼接）、--lap_pe_use_gaussian {0,1}
 - 预处理：
   - --use_pca {0,1}（可选 PCA；默认关闭）
   - --n_hvg N 或 'all'（默认 'all' 表示使用所有基因）
@@ -478,24 +485,29 @@ python -m stonco.core.train \
     - `6 -> K=3, M=2`
     - `8 -> K=4, M=2`
     - `>=12` 且可被 3 整除时优先用 `M=3`
-- 优化器：--lr，--weight_decay
+- 优化器与分模块学习率：
+  - `--lr`、`--weight_decay`：全局默认学习率与权重衰减，旧命令保持兼容
+  - 模块级 lr 覆盖：`--gnn_lr`、`--clf_lr`、`--dom_lr`、`--wb_support_lr`；不传时分别回退到 `--lr`
+  - 模块级 weight decay 覆盖：`--gnn_weight_decay`、`--clf_weight_decay`、`--dom_weight_decay`、`--wb_support_weight_decay`；不传时分别回退到 `--weight_decay`
+  - 主 optimizer 使用 PyTorch 原生 param groups：`gnn`、`clf`、`dom`、`wb_support`、`wb_main`；其中 `wb_main` 目前主要对应 WB 的 `state_direction`，跟随 `wb_support_lr/wb_support_weight_decay`
+  - WB potential 使用独立 optimizer：`--wb_potential_lr` 默认 `1e-4`，`--wb_potential_weight_decay` 默认 `0.0`；第一版不跟随主 scheduler
 - 学习率调度：
   - `--lr_scheduler {none,linear,cosine,warmup_cosine,plateau}`（默认 `none`）
   - `--lr_warmup_epochs`：仅 `warmup_cosine` 使用，默认 10
   - `--min_lr_ratio`：最小学习率比例，默认 0.01
   - `--plateau_metric {val_accuracy,val_avg_total_loss,val_macro_f1,val_auroc,val_auprc}`（默认 `val_accuracy`）
-  - `--plateau_factor`：触发后 `lr = lr * factor`，默认 0.5
+  - `--plateau_factor`：触发后各主参数组 `lr = lr * factor`，默认 0.5
   - `--plateau_patience`：默认 10
   - `--plateau_threshold`：默认 `1e-4`
   - `--plateau_cooldown`：默认 0
   - 语义：
-    - `linear`：从 base lr 线性衰减到 `base_lr * min_lr_ratio`
-    - `cosine`：从 base lr 余弦衰减到 `base_lr * min_lr_ratio`
-    - `warmup_cosine`：前 `lr_warmup_epochs` 线性 warmup，后续 cosine 衰减
-    - `plateau`：每轮验证后按监控指标调用 `ReduceLROnPlateau.step(metric)`
+    - `linear`：各参数组从自己的 base lr 线性衰减到 `base_lr * min_lr_ratio`
+    - `cosine`：各参数组从自己的 base lr 余弦衰减到 `base_lr * min_lr_ratio`
+    - `warmup_cosine`：各参数组先 warmup 到自己的 base lr，后续按同一 cosine 节奏衰减
+    - `plateau`：每轮验证后按监控指标调用 `ReduceLROnPlateau.step(metric)`，各参数组使用自己的 `base_lr * min_lr_ratio` 作为 `min_lr`
   - `plateau` 与 early stopping 可能相互竞争，推荐优先关闭早停使用；若监控指标为 `NaN`，该轮会跳过 `plateau.step`
 - 域自适应（双域，对抗式）：
-  - 细粒度：--use_domain_adv_slide {0,1}（batch 域），--use_domain_adv_cancer {0,1}
+  - 细粒度：--use_domain_adv_slide {0,1}（batch 域，默认 0），--use_domain_adv_cancer {0,1}（默认 0）
   - alpha（域 loss 权重）：--lambda_slide（batch 域），--lambda_cancer（cancer 域）（默认 1.0/1.0）
   - beta（GRL 对抗强度）：--grl_beta_mode {dann,constant,linear}（默认 dann）
     - dann：delay-aware DANN schedule
@@ -514,26 +526,29 @@ python -m stonco.core.train \
       - 行为：delay 前 `beta=0`，delay 后线性升到 `*_target`
 - Wasserstein barycenter 对齐（可选，作用于 GNN latent `h`）：
   - `--use_wb_align {0,1}`：启用 generated-support WB 对齐，默认 0
-  - `--wb_loss_type {euclidean_pairwise,dual_potential}`：WB loss 类型；默认 `euclidean_pairwise`
+  - `--wb_loss_type {euclidean_pairwise,dual_potential,sinkhorn_divergence}`：WB loss 类型；默认 `euclidean_pairwise`
     - `euclidean_pairwise`：用 generated support 上的两两欧氏距离 / energy-distance surrogate 加 potential critic，计算量较低
     - `dual_potential`：source-side `f_k(h)` + support-side `g_k(b)` 的 dual-potential WB objective，计算量较高
+    - `sinkhorn_divergence`：对每个 active cancer 的 `h` 分布与 generated support `b=T_phi(h)` 计算 debiased Sinkhorn divergence；不训练跨 batch potential bank，更接近标准 entropy-regularized OT，但比 `euclidean_pairwise` 更耗时
   - `--wb_support_mode generated_support`：第一版仅支持 `b=T_phi(h)`；不使用 pooled support、memory bank 或独立 finite atoms
   - `--lambda_wb`、`--wb_warmup_epochs`、`--wb_ramp_epochs`：WB 总权重与 warmup/ramp 调度
   - `--wb_anchor_weight`：`h` 与 `b` 的 anchor 权重；anchor 在训练循环中单独加一次，避免 generated support 与分类表征脱耦
-  - `--wb_support_hidden`、`--wb_support_dropout`：`GeneratedSupportMap` 结构参数
-  - `--wb_potential_hidden`、`--wb_potential_lr`、`--wb_pot_every_n_steps`：potential 网络与交替更新频率
+  - `--wb_support_hidden`、`--wb_support_dropout`：`GeneratedSupportMap` 结构参数；若不显式传 `--wb_support_dropout`，默认跟随全局 `--dropout`，显式传入时覆盖该值
+  - `--wb_potential_hidden`、`--wb_potential_lr`、`--wb_potential_weight_decay`、`--wb_pot_every_n_steps`：potential 网络、独立 optimizer 与交替更新频率；WB potential MLP 当前不使用 dropout
   - `--wb_spots_per_graph`：每张 graph/slide 最多抽取多少 spot 参与 WB，默认 64
   - `--wb_spots_per_cancer`：每个 cancer 的二级 spot cap，默认 0 表示关闭
   - `--wb_support_size`：`dual_potential` 中从 selected `b` 再抽取的 support-side 点数，默认 128
   - `--wb_min_cancers`、`--wb_min_spots`：计算 WB 的最少 active cancer 数和每癌种最少 spot 数；不足时该 batch 跳过 WB
-  - `--wb_regularizer {l2,entropy}`、`--wb_epsilon`：`dual_potential` 的 regularizer 设置，默认 `l2` 与 0.1
+  - `--wb_regularizer {l2,entropy}`、`--wb_epsilon`：`dual_potential` 中表示 regularizer 设置；`sinkhorn_divergence` 中 `--wb_regularizer` 会被忽略，`--wb_epsilon` 作为 Sinkhorn entropy epsilon
+  - `--wb_sinkhorn_iters`：`sinkhorn_divergence` 的 log-domain Sinkhorn 迭代次数，默认 50
   - `--wb_label_balanced_sampling {0,1}`：可选 label-balanced WB 内部抽样，默认关闭
   - `--wb_state_direction {0,1}`、`--wb_state_direction_weight`：可选 tumor-normal shared state direction 约束，默认关闭
   - `--wb_eval_loss {0,1}`：验证阶段是否计算 WB diagnostics，默认关闭；开启会增加验证耗时
   - `--best_metric {val_macro_f1,val_auprc,val_accuracy,val_auroc,val_avg_total_loss}`：最佳 checkpoint 选择指标，默认 `val_macro_f1`
   - 实现细节：
     - 训练推理路径不变：`GNNBackbone -> h -> ClassifierHead`
-    - WB 训练阶段额外使用 `GeneratedSupportMap` 得到 `b=T_phi(h)`，并交替更新 potentials 与主模型
+    - WB 训练阶段额外使用 `GeneratedSupportMap` 得到 `b=T_phi(h)`；`euclidean_pairwise`/`dual_potential` 会交替更新 potentials 与主模型，`sinkhorn_divergence` 则直接在主模型步骤中计算 Sinkhorn loss
+    - `sinkhorn_divergence` 不使用 neural potentials；Sinkhorn 内部的 scaling/dual variables 是当前 batch 的数值求解变量，不作为跨 batch 参数保存
     - 若 `use_domain_adv_cancer=0` 但 `use_wb_align=1`，训练仍会构建 `n_domains_cancer` 供 potential bank 使用
     - 如果同时开启 `use_mmd=1` 和 `use_wb_align=1`，代码会打印 warning；主实验建议二者互斥
 - 划分/验证：
@@ -548,25 +563,26 @@ python -m stonco.core.train \
   - --val_sample_dir 外部验证 NPZ 目录（单切片），验证指标与内部验证合并计算
   - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
   - --save_train_curves 0/1（默认 1）：保存 `lr.svg`、`train_loss.svg`、`train_val_loss.svg` 与 `train_val_metrics.svg`
-  - --save_last：若训练实际跑满 `--epochs`，则用最后一个 epoch 覆盖 `artifacts_dir/model.pt`；同时额外保存最优模型到 `artifacts_dir/model_best.pt`（不强制关闭早停；如需保证跑满可用 `--early_patience 0`）
+  - --save_last 0/1（默认 1；也兼容不带值的 `--save_last`）：若训练实际跑满 `--epochs`，则用最后一个 epoch 覆盖 `artifacts_dir/model.pt`；同时额外保存最优模型到 `artifacts_dir/model_best.pt`。默认 `--early_patience 0`，因此默认会跑满；若显式开启早停且提前结束，则 `model.pt` 回退为最优模型
   - --save_epoch_checkpoints：额外保存指定 epoch 的模型快照，例如 `--epochs 300 --save_epoch_checkpoints 100 200` 会在训练结束后额外写出 `epoch_checkpoints/epoch_100/` 与 `epoch_checkpoints/epoch_200/`；每个 `epoch_XXX/` 会保存与常规训练目录一致的核心文件布局（`model.pt`、`meta.json`、预处理器文件，以及按该轮截断的曲线/`loss_components.csv`）；若训练因早停未跑到某个请求轮次，会在日志中提示未保存
   - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于 `artifacts_dir/model.pt` 对应的模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
 
 训练产物（artifacts_dir）：
 - 预处理：genes_hvg.txt，scaler.joblib，pca.joblib（若启用）
 - 图像预处理（当 --use_image_features 1）：img_feature_names.txt，img_scaler.joblib，img_pca.joblib（若 --img_use_pca 1）
-- 模型：model.pt（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）；可选：model_best.pt（启用 --save_last 时保存最优模型）
+- 模型：`model.pt`（默认保存最后一轮；若 `--save_last 0` 则保存最优模型；若显式开启早停且提前结束，则回退为最优模型）；`model_best.pt`（默认保存最优模型，启用 save_last 时写出）
 - WB 训练 artifacts（当 `--use_wb_align 1`）：`wb_support_map_last.pt`、`wb_potentials_last.pt`、`wb_config.json`
+  - `sinkhorn_divergence` 不训练跨 batch neural potential bank，但仍保留 `wb_potentials_last.pt` 文件名用于兼容 WB artifact 布局；其中主要记录 WB module 的可保存状态
 - 额外轮次快照：若设置 `--save_epoch_checkpoints`，会额外生成自包含的 `epoch_checkpoints/epoch_XXX/` 目录，包含 `model.pt`、`meta.json`、预处理器文件，以及按该轮截断的训练曲线与 `loss_components.csv`（若对应开关启用）
 - 元信息：meta.json（含 cfg、best_epoch、train_ids、val_ids、metrics；并追加 last_epoch、last_metrics、completed_full_epochs、saved_checkpoint、saved_epoch_checkpoints、requested_save_epoch_checkpoints）
 - GNN 主干配置：新训练产物以 `cfg.GNN_hidden` 为准；旧产物若仅含 `cfg.hidden` 仍可兼容加载
 - 可视化：
-  - `lr.svg`：单独保存学习率曲线
+  - `lr.svg`：单独保存学习率曲线；当前主曲线沿用兼容字段 `lr`，即 `gnn` 参数组 lr
   - `train_loss.svg`：`3x3`，包含训练损失组件和 `train_accuracy`
   - `train_val_loss.svg`：`3x3`，包含训练/验证损失对照和 `accuracy`
   - `train_val_metrics.svg`：`2x2`，包含 `val_accuracy/val_macro_f1/val_auroc/val_auprc`
-  - `wb_train_loss.svg`：启用 WB 时额外保存，包含 `avg_total_loss`、`avg_task_loss`、`avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_anchor`、`wb_lambda`、active cancers/spots 等 WB diagnostics
-- Loss 组件：`loss_components.csv` 新增 `lr` 列，并继续保存训练/验证损失及 `val_*` 指标；启用 WB 时额外包含 `avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_anchor`、`avg_wb_active_cancers`、`avg_wb_active_spots`、`wb_lambda` 等列
+  - `wb_train_loss.svg`：启用 WB 时额外保存，包含 `avg_total_loss`、`avg_task_loss`、`avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_sinkhorn`、`avg_wb_anchor`、`wb_lambda`、active cancers/spots 等 WB diagnostics；图中子图会按当前 loss 类型和可用曲线自动布局
+- Loss 组件：`loss_components.csv` 保留 `lr` 列，并新增 `lr_gnn`、`lr_clf`、`lr_dom`、`lr_wb_support`、`lr_wb_potential`；继续保存训练/验证损失及 `val_*` 指标；启用 WB 时额外包含 `avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_sinkhorn`、`avg_wb_anchor`、`avg_wb_active_cancers`、`avg_wb_active_spots`、`wb_lambda` 等列；若 `--wb_eval_loss 1`，还会记录对应 validation WB diagnostics，例如 `val_avg_wb_loss` 与 `val_avg_wb_sinkhorn`
 - 命名更新：此前文档中的 `Var_risk/var_risk` 已统一更名为 `batch_loss_variance`，含义不变，仍表示每个 epoch 内 mini-batch 总损失的方差。
 
 ### 5.1 产物路径与内容补充
@@ -576,11 +592,11 @@ python -m stonco.core.train \
 - 按癌种 KFold（--kfold_cancer）：
   - 统一在 artifacts_dir 的同级目录创建 `kfold_val/`；每一折的产物位于 `kfold_val/fold_{i}/`：
     - 预处理器产物（与单次训练一致）
-    - `model.pt`（默认最优；若启用 --save_last 且跑满 epochs 则为最后一轮）与 `meta.json`（包含本折的 train/val 划分与 best/last 指标等）
-    - （可选）`model_best.pt`（启用 --save_last 时保存最优模型）
+    - `model.pt`（默认保存最后一轮；若 `--save_last 0` 则保存最优模型；若显式开启早停且提前结束，则回退为最优模型）与 `meta.json`（包含本折的 train/val 划分与 best/last 指标等）
+    - `model_best.pt`（默认保存最优模型，启用 save_last 时写出）
   - 汇总表：`kfold_val/kfold_summary.csv`，包含每折的 `fold, best_epoch, auroc, auprc, accuracy, macro_f1, n_train, n_val`，并在日志中打印均值概览。
 - LOCO 留一癌种（--leave_one_cancer_out）：
-  - 在 artifacts_dir 的父目录创建 `loco_eval/`，并为每个癌种建立子目录 `loco_eval/{CancerType}/`，内部包含 `model.pt`、`meta.json` 与该癌种的划分信息（若启用 --save_last 且跑满 epochs，将用最后一轮覆盖 model.pt，并保存最优到 model_best.pt）。
+  - 在 artifacts_dir 的父目录创建 `loco_eval/`，并为每个癌种建立子目录 `loco_eval/{CancerType}/`，内部包含 `model.pt`、`meta.json` 与该癌种的划分信息（默认跑满 epochs 并用最后一轮覆盖 `model.pt`，同时保存最优到 `model_best.pt`；若 `--save_last 0` 则 `model.pt` 保存最优模型）。
   - 汇总表：`loco_eval/loco_summary.csv`，字段与 KFold 类似（含 per-cancer 的最佳指标与样本统计）。
 
 > 详细实现参见 `stonco/core/train.py`
@@ -627,6 +643,9 @@ python -m stonco.core.train \
 - 若不显式传 `--GNN_hidden`，当前默认主干宽度为 `256,128,64`
 - 若想保留旧版“所有层都是 128”的写法，应改为 `--GNN_hidden 128 --num_layers 3`
 - 若想指定逐层不同宽度，可写为 `--GNN_hidden 128,45,64`；此时可不再单独传 `--num_layers`
+- 若想拆分不同模块的 dropout，可在全局 `--dropout` 之外追加模块级覆盖，例如 `--dropout 0.3 --gnn_dropout 0.2 --clf_dropout 0.4 --dom_dropout 0.1`；未覆盖的模块继续使用 `--dropout`
+- LapPE 默认不计算也不拼接；若需要使用 LapPE，应同时传入正数 `--lap_pe_dim` 和 `--concat_lap_pe 1`，例如 `--lap_pe_dim 16 --concat_lap_pe 1`
+- 若想拆分不同模块的学习率，可在全局 `--lr` / `--weight_decay` 之外追加模块级覆盖，例如 `--lr 1e-3 --gnn_lr 5e-4 --clf_lr 1e-3 --dom_lr 2e-4 --wb_support_lr 7e-4`；scheduler 会保持这些组间 base lr 比例
 - 域标签从 `data/cancer_sample_labels.csv` 读取：`cancer_type`（cancer 域）与 `Batch_id`（batch 域）；`Batch_id` 缺失时回退为 `slide_id`；训练时按当前 fold/train 出现的类别动态映射到连续索引（K 动态）。
 - `--lambda_*` 是 alpha（域 loss 权重），beta（GRL 对抗强度）由 `--grl_beta_mode` 控制：`dann` 为带 delay 的 DANN schedule，`constant` 为全程恒定，`linear` 为显式 delay + 线性 warm-up。
 - 域 loss 以 spot-level 计算（对所有 spot 做全局 mean）；域 CE 默认启用 graph-frequency 的 sqrt 反频率 class weight，并做 `clamp(0.5, 5.0)` + mean-normalize 稳定化。
@@ -694,11 +713,23 @@ python -m stonco.core.train \
 --wb_epsilon 0.1
 ```
 
+`sinkhorn_divergence` 版本使用 batch 内 debiased Sinkhorn divergence，可作为更接近标准 OT 的 WB 主损失。可在上面命令基础上改为：
+
+```bash
+--wb_loss_type sinkhorn_divergence \
+--lambda_wb 0.15 \
+--wb_epsilon 0.1 \
+--wb_sinkhorn_iters 50 \
+--wb_spots_per_graph 128 \
+--wb_support_size 256 \
+--wb_anchor_weight 1
+```
+
 WB 运行建议：
 
 - WB 主实验推荐 `--use_mmd 0`，避免与 MMD 同时约束导致归因不清。
 - 若保留 cancer GRL，建议把 `--lambda_cancer` 降到 `0.05-0.1`；如果下游任务性能下降，可先关闭 cancer GRL。
-- `euclidean_pairwise` 可以先用于快速筛参；`dual_potential` 建议在较小 `wb_spots_per_graph` / `wb_support_size` 下验证稳定后再放大。
+- `euclidean_pairwise` 可以先用于快速筛参；`dual_potential` 建议在较小 `wb_spots_per_graph` / `wb_support_size` 下验证稳定后再放大；`sinkhorn_divergence` 优先调 `--lambda_wb`、`--wb_epsilon`、`--wb_sinkhorn_iters`、`--wb_support_size` 与 `--wb_spots_per_graph`。
 
 - 基于癌种的 KFold（随机生成 K 组“每癌种 1 张验证”组合）：
 
@@ -1004,13 +1035,15 @@ python -m stonco.utils.visualize_prediction \
 
 ## 9. Embedding 导出、UMAP/t-SNE 与 Mixing/LISI 评估
 
-本章用于 embedding 分析与去批次/跨域整合评估，覆盖五个层次：
+本章用于 embedding 分析与去批次/跨域整合评估，覆盖常规 embedding pipeline 和 LOCO 专用可视化脚本：
 
 - `export_spot_embeddings.py`：导出每个 spot 的 embedding CSV
 - `visualize_umap_tsne.py`：计算 UMAP / t-SNE 并输出 SVG；可选保存降维坐标 CSV
 - `evaluate_embedding_mixing.py`：在 embedding / UMAP / t-SNE 空间上计算 `iLISI` / `cLISI`
 - `run_embedding_analysis_pipeline.py`：一条命令串联前面三步
 - `analyze_spot_embedding_domains.py`：针对已导出的 `spot_embeddings_*.csv` 做域统计、局部维度分布和二维散点诊断
+- `scripts/plot_loco_umap_tsne.sh`：批量绘制 LOCO 各癌种 fold 的 UMAP/t-SNE，默认高亮当前留出癌种
+- `scripts/eval_visualize_loco.sh`：汇总 LOCO per-slide 指标并生成辅助图
 
 推荐解读口径：
 
@@ -1023,7 +1056,7 @@ python -m stonco.utils.visualize_prediction \
 
 - 单癌种去批次：重点看 `sample_id`、`batch_id` 的 `iLISI` 是否提升，同时监控 `tumor_label` 的 `cLISI` 不要异常升高
 - 多癌种联合训练：`cancer_type` 不应写死，若目标是跨癌种整合则用 `iLISI`，若目标是保留癌种差异则用 `cLISI`
-- 默认导出 `h`：即 GNN backbone 的输出表示，更适合直接观察域对抗分支作用效果
+- 默认导出 `h`：即 GNN backbone 的输出表示；启用域对抗/MMD/WB 时，可直接观察这些分支作用后的共享表征
 - 可选导出 `z_clf`：即 task MLP 最后一层隐藏表示，维度由 `clf_hidden[-1]` 自动决定
 - `z64` 作为兼容别名保留，仅适用于分类头 latent 维度确实为 64 的模型
 
@@ -1094,6 +1127,8 @@ python -m stonco.utils.visualize_umap_tsne \
   --seed 42 \
   --embed_source h \
   --color_cols sample_id batch_id tumor_label \
+  --highlight_col cancer_type \
+  --highlight_values BRCA \
   --out_coords_csv /path/to/artifacts/embedding_plots/spot_embeddings_h_coords.csv
 ```
 
@@ -1115,6 +1150,8 @@ python -m stonco.utils.visualize_umap_tsne \
 - `h` 维度不是固定 64，会按实际导出的列数自适应读取；`visualize_umap_tsne.py` 不再对 embedding 维度写死为 64
 - `--out_coords_csv` 建议在需要做 UMAP/t-SNE 空间 LISI 时一起保存，这样评估脚本使用的坐标会与图像完全一致
 - 若不传 `--color_cols`，默认仍生成按 `tumor_label`、`batch_id`、`cancer_type` 上色的图
+- `--highlight_col` 与 `--highlight_values` 必须成对使用；匹配到的 spot 会画成三角形，其他 spot 仍为圆点。该功能只影响 SVG，不改变 `spot_embeddings_*.csv`、`*_coords.csv` 或 LISI 结果。
+- `--highlight_col` 常用值为 `cancer_type`、`sample_id`、`batch_id`；也兼容简写 `cancer`、`sampleid`、`batchid`。`--highlight_values` 支持空格分隔或逗号分隔，例如 `--highlight_values BRCA GBM` 或 `--highlight_values BRCA,GBM`。
 
 ### 9.3 LISI 混合评估（`evaluate_embedding_mixing.py`）
 
@@ -1202,6 +1239,8 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
   --max_points 50000 \
   --seed 42 \
   --color_cols sample_id batch_id tumor_label \
+  --highlight_col cancer_type \
+  --highlight_values BRCA \
   --save_spot_metrics
 ```
 
@@ -1219,8 +1258,78 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
 - 默认 `--metric_spaces embedding umap`，因此输出天然区分“主指标”和“辅助指标”
 - 若希望纳入 t-SNE 辅助指标，可显式传 `--metric_spaces embedding umap tsne`
 - 输入侧与 `export_spot_embeddings.py` 一致，支持混合使用 `--train_npz`、重复 `--npz` 和重复 `--npz_glob`
+- 可直接传 `--highlight_col` / `--highlight_values`，pipeline 会把高亮参数传给 `visualize_umap_tsne.py`；高亮不参与 LISI 计算
 
-### 9.5 embedding 域统计与局部二维诊断（`analyze_spot_embedding_domains.py`）
+### 9.5 LOCO UMAP/t-SNE 与留出癌种高亮
+
+当 `--leave_one_cancer_out` 已生成 `loco_eval/{CancerType}/` 后，可以用仓库脚本批量绘制每个 LOCO fold 的 embedding UMAP/t-SNE。默认用于检查“训练癌种和留出癌种是否混在一起”：
+
+```bash
+bash /apps/users/sky_luozhihui/STOnco/model/STOnco/scripts/plot_loco_umap_tsne.sh \
+  --loco_dir /path/to/loco_eval \
+  --train_npz /path/to/train_data.npz
+```
+
+默认行为：
+- `--subset all`：每个 fold 绘制该 fold 的训练样本 + 留出样本，适合检查训练癌种与留出癌种是否混合
+- `--embed_source h`：默认观察 GNN latent `h`
+- 默认输出到 `loco_eval/loco_umap_tsne/{CancerType}/final_all_h/`
+- 默认 `--highlight_col cancer_type --highlight_values {CancerType}`：当前 fold 的留出癌种画为三角形，训练癌种仍为圆点
+- `plot_loco_umap_tsne.sh` 的 `--metric_spaces` 与 `--k_values` 需要传逗号分隔字符串，例如 `embedding,umap,tsne` 与 `15,30,50`
+- 若已有 `mixing_metrics_h.csv`，脚本默认跳过该目录；需要重画 SVG 时加 `--force`
+
+输出示例：
+- `loco_umap_tsne/BRCA/final_all_h/spot_embeddings_h.csv`
+- `loco_umap_tsne/BRCA/final_all_h/spot_embeddings_h_coords.csv`
+- `loco_umap_tsne/BRCA/final_all_h/mixing_metrics_h.csv`
+- `loco_umap_tsne/BRCA/final_all_h/umap_tsne_h_by_cancer_type.svg`
+- `loco_umap_tsne/BRCA/final_all_h/umap_tsne_h_by_tumor_label.svg`
+
+绘制全部或指定 checkpoints：
+
+```bash
+# 全部 checkpoint
+bash /apps/users/sky_luozhihui/STOnco/model/STOnco/scripts/plot_loco_umap_tsne.sh \
+  --loco_dir /path/to/loco_eval \
+  --train_npz /path/to/train_data.npz \
+  --include_checkpoints
+
+# 只绘制部分 checkpoint
+bash /apps/users/sky_luozhihui/STOnco/model/STOnco/scripts/plot_loco_umap_tsne.sh \
+  --loco_dir /path/to/loco_eval \
+  --train_npz /path/to/train_data.npz \
+  --include_checkpoints \
+  --checkpoint_epochs 20,25,30,50
+```
+
+手动指定高亮对象：
+
+```bash
+# 高亮指定癌种
+--highlight_col cancer_type --highlight_values BRCA,GBM
+
+# 高亮指定样本或 batch；sampleid/batchid 会自动映射为 sample_id/batch_id
+--highlight_col sampleid --highlight_values sample_1,sample_2
+--highlight_col batchid --highlight_values batch_1,batch_2
+
+# 禁用 LOCO 默认高亮
+--no_highlight_loco
+```
+
+解读建议：
+- 看 `umap_tsne_h_by_cancer_type.svg`：三角形是当前 fold 的留出癌种，圆点是训练癌种；三角形若分散在圆点中，说明留出癌种与训练癌种在该 embedding 中混合较好
+- 看 `umap_tsne_h_by_tumor_label.svg`：确认 tumor/normal 判别结构没有被 WB/Sinkhorn 过度抹平
+- 正式量化仍优先看 `mixing_metrics_h.csv` 中 `space=embedding` 的 LISI；UMAP/t-SNE 图主要用于诊断和解释
+
+LOCO 汇总指标与空间预测图可用：
+
+```bash
+bash /apps/users/sky_luozhihui/STOnco/model/STOnco/scripts/eval_visualize_loco.sh \
+  --loco_dir /path/to/loco_eval \
+  --train_npz /path/to/train_data.npz
+```
+
+### 9.6 embedding 域统计与局部二维诊断（`analyze_spot_embedding_domains.py`）
 
 当你已经有 `spot_embeddings_h.csv` 或 `spot_embeddings_z_clf.csv`，并且想快速回答下面这些问题时，可以直接使用这个脚本：
 

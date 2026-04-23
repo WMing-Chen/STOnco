@@ -1,5 +1,122 @@
 # Update Log
 
+## 2026-04-18 13:35:58 CST
+
+- 更新内容：完成 generated-support WB 的 `sinkhorn_divergence` 主损失落地，并补充 LOCO embedding 可视化与三角形高亮诊断脚本。
+- 代码影响：
+  - `stonco/core/wb_potentials.py` 的 `GeneratedSupportWBLoss` 新增 `sinkhorn_divergence` 分支：使用 batch 内 log-domain Sinkhorn 计算 debiased Sinkhorn divergence，按 active cancer 计算 `SinkhornD(P_k^h, Q_phi^b)` 后取均值；`Q_phi^b` 仍由 `b=T_phi(h)` 生成
+  - `stonco/core/train.py` 的 `--wb_loss_type` 扩展为 `{euclidean_pairwise,dual_potential,sinkhorn_divergence}`，新增 `--wb_sinkhorn_iters`，并复用 `--wb_epsilon` 作为 Sinkhorn entropy epsilon
+  - `sinkhorn_divergence` 不使用跨 batch neural potential bank；`GeneratedSupportMap`、GNN 与分类头仍通过主 optimizer 跨 batch 更新，推理路径仍为 `GNNBackbone -> h -> ClassifierHead`
+  - `loss_components.csv` 新增并记录 `avg_wb_sinkhorn`、`val_avg_wb_sinkhorn`；`wb_train_loss.svg` 会按可用 WB 曲线自动布局，sinkhorn 模式下包含独立 `wb_sinkhorn` 子图
+  - `stonco/utils/visualize_umap_tsne.py` 和 `stonco/utils/run_embedding_analysis_pipeline.py` 新增可选高亮参数：`--highlight_col`、`--highlight_values`、`--highlight_marker`、`--highlight_point_size`；高亮仅改变 SVG 点形状，指定 spot 画为三角形，不改变 embedding CSV、coords CSV 或 LISI 计算
+  - 新增 `scripts/plot_loco_umap_tsne.sh`：批量遍历 `loco_eval/{CancerType}/`，默认 `--subset all`，默认将当前 LOCO fold 的留出癌种 `cancer_type={CancerType}` 画为三角形；可选 `--include_checkpoints` 绘制全部或指定 epoch checkpoints
+  - 新增 `scripts/eval_visualize_loco.sh`：对 LOCO 汇总结果生成 per-slide 指标图、best/worst slide 表和可选空间预测图；两个脚本均迁移到 `model/STOnco/scripts/`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `stonco/core/wb_potentials.py`
+  - `stonco/utils/visualize_umap_tsne.py`
+  - `stonco/utils/run_embedding_analysis_pipeline.py`
+  - `scripts/plot_loco_umap_tsne.sh`
+  - `scripts/eval_visualize_loco.sh`
+  - `docs/PLAN_sinkhorn_divergence_WB_STOnco.md`
+  - `docs/Tutorial.md`
+  - `Update_Log.md`
+- 说明：
+  - `sinkhorn_divergence` 比 `dual_potential` 更接近标准 entropy-regularized OT / Sinkhorn divergence，但计算量随 active cancer 数、support 点数和 `--wb_sinkhorn_iters` 增加；当前推荐优先调 `--lambda_wb`、`--wb_epsilon`、`--wb_sinkhorn_iters`、`--wb_support_size` 和 `--wb_spots_per_graph`
+  - `wb_regularizer` 对 `sinkhorn_divergence` 无实际作用；若显式设置，训练会提示该参数被忽略，`wb_epsilon` 解释为 Sinkhorn entropy epsilon
+  - LOCO 检查“训练癌种和留出癌种是否混在一起”时，推荐用 `scripts/plot_loco_umap_tsne.sh` 默认配置：图中三角形为留出癌种，圆点为训练癌种
+  - 已完成 Python 语法编译、脚本 `bash -n`、命令行 help 与小型 UMAP/t-SNE 高亮 smoke test
+
+## 2026-04-17 16:53:50 CST
+
+- 更新内容：将两个 domain head 的默认行为改为关闭；默认训练仅启用 GNN encoder + classifier head。
+- 代码影响：
+  - `stonco/core/train.py` 中 `use_domain_adv_slide` 与 `use_domain_adv_cancer` 默认值从 `True` 改为 `False`
+  - 缺省填充逻辑同步改为 `False`，未传 `--use_domain_adv_slide/--use_domain_adv_cancer` 时不会构建或训练两个域对抗 head
+  - CLI help 标注两个开关默认均为 `0`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `docs/Tutorial.md`
+  - `Update_Log.md`
+- 说明：
+  - 如需恢复双域对抗训练，需要显式传入 `--use_domain_adv_slide 1 --use_domain_adv_cancer 1`
+  - 本次按当前需求不更新 `train_hpo.py`
+
+## 2026-04-16 16:44:27 CST
+
+- 更新内容：将 `--concat_lap_pe` 的默认行为改为关闭；只有显式传入 `--concat_lap_pe 1` 时才会把 LapPE 拼接到节点特征。
+- 代码影响：
+  - `stonco/core/train.py` 默认配置 `concat_lap_pe` 从 `True` 改为 `False`，CLI help 标注默认 0
+  - `preprocessing.py`、推理、embedding 导出、预测可视化和 GATv2 示例脚本的缺省 fallback 同步改为 `False`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `stonco/utils/preprocessing.py`
+  - `stonco/core/infer.py`
+  - `stonco/utils/export_spot_embeddings.py`
+  - `stonco/utils/visualize_prediction.py`
+  - `examples/train_gatv2.py`
+  - `examples/infer_gatv2.py`
+  - `docs/Tutorial.md`
+- 说明：
+  - `lap_pe_dim` 默认仍为 `0`；如需使用 LapPE，应显式传入 `--lap_pe_dim N --concat_lap_pe 1`
+  - 本次不更新 `train_hpo.py`
+
+## 2026-04-16 16:30:00 CST
+
+- 更新内容：训练学习率与 weight decay 从单一主 optimizer 参数扩展为“全局默认 + 模块级覆盖”，scheduler 采用统一节奏、分组 base lr。
+- 代码影响：
+  - `stonco/core/train.py` 保留 `--lr`、`--weight_decay` 作为全局默认，并新增 `--gnn_lr`、`--clf_lr`、`--dom_lr`、`--wb_support_lr`
+  - 新增 `--gnn_weight_decay`、`--clf_weight_decay`、`--dom_weight_decay`、`--wb_support_weight_decay`；不传时均回退到全局 `--weight_decay`
+  - 主 optimizer 改为 PyTorch 原生 param groups：`gnn`、`clf`、`dom`、`wb_support`、`wb_main`；`linear/cosine/warmup_cosine` 对所有主参数组使用同一调度 scale，保留组间 base lr 比例
+  - `plateau` scheduler 的 `min_lr` 改为按参数组生成，即每组使用自己的 `base_lr * min_lr_ratio`
+  - WB potential 继续使用独立 optimizer，新增 `--wb_potential_weight_decay`，默认 `0.0`；第一版不跟随主 scheduler
+  - `hist` / `loss_components.csv` 保留 `lr`，并新增 `lr_gnn`、`lr_clf`、`lr_dom`、`lr_wb_support`、`lr_wb_potential`
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `docs/Tutorial.md`
+  - `Update_Log.md`
+- 说明：
+  - `--lr 1e-3` 仍可作为旧命令入口；如需微调模块，可追加 `--gnn_lr 5e-4 --clf_lr 1e-3 --dom_lr 2e-4 --wb_support_lr 7e-4`
+  - MMD 与 GRL 本身没有可训练参数，不新增独立 lr；MMD 强度仍由 `lambda_mmd/mmd_*` 控制，域对抗强度仍由 domain loss 权重与 GRL beta 控制
+  - 本次不更新 `train_hpo.py`；旧日志中“单一 optimizer、单一全局 lr scheduler”的说明已被本条更新取代
+  - 已在 `hpc_gpu01` 的 `stonco` 环境完成 `py_compile`、`import stonco.core.train` 与 param group / plateau `min_lr` smoke test
+
+## 2026-04-16 15:30:00 CST
+
+- 更新内容：训练 dropout 参数从单一 GNN dropout 扩展为“全局默认 + 模块级覆盖”。
+- 代码影响：
+  - `stonco/core/train.py` 保留 `--dropout` 作为全局默认 dropout，并新增 `--gnn_dropout`、`--clf_dropout`、`--dom_dropout`
+  - `stonco/core/models.py` 中 `ClassifierHead` 不再写死 `dropout=0.1`；`DomainHead` 新增 `Linear -> ReLU -> Dropout -> Linear` 结构
+  - 单次训练、KFold、LOCO 训练路径均会把模块级 dropout 传入 `STOnco_Classifier`
+  - `infer.py`、`export_spot_embeddings.py`、`visualize_prediction.py` 兼容读取新旧 `meta.json`：旧产物只有 `cfg.dropout` 时，三个模块级 dropout 自动回退到该值
+  - `--wb_support_dropout` 保留为 WB support map 的高级覆盖参数；未显式传入时默认跟随全局 `--dropout`
+- 涉及文件：
+  - `stonco/core/models.py`
+  - `stonco/core/train.py`
+  - `stonco/core/infer.py`
+  - `stonco/utils/export_spot_embeddings.py`
+  - `stonco/utils/visualize_prediction.py`
+  - `docs/Tutorial.md`
+- 说明：
+  - `--dropout 0.3` 现在表示 GNN、分类头、域头默认都使用 0.3；可用模块级参数分别覆盖
+  - WB potential MLP 当前不加 dropout；MMD 与 GRL 本身没有 dropout，只会通过 changed `h` 间接受影响
+  - 本次不更新 `train_hpo.py`，其 `dropout` 搜索仍保持旧入口语义，后续如需 HPO 支持需单独处理
+
+## 2026-04-16 14:54:20 CST
+
+- 更新内容：训练默认行为调整为不开早停，并默认保存最后一轮模型。
+- 代码影响：
+  - `stonco/core/train.py` 中 `early_patience` 默认值从 `30` 调整为 `0`，即默认关闭 early stopping
+  - `--save_last` 从开关参数调整为 `0/1` 参数，默认 `1`；同时保留不带值的旧写法 `--save_last`，等价于 `--save_last 1`
+  - 单次训练、KFold 与 LOCO 继续复用现有 `bool(args.save_last)` 保存逻辑；默认跑满 epochs 时 `model.pt` 保存最后一轮，`model_best.pt` 保存验证集最优模型
+- 涉及文件：
+  - `stonco/core/train.py`
+  - `docs/Tutorial.md`
+- 说明：
+  - 如需恢复仅保存最优模型到 `model.pt` 的旧行为，可传入 `--save_last 0`
+  - 如需重新启用早停，可显式传入 `--early_patience N`，其中 `N > 0`；若早停提前结束，即使 `save_last=1`，`model.pt` 也会回退保存最优模型
+
+
 ## 2026-04-15 22:30:00 CST
 
 - 更新内容：训练流程新增 generated-support Wasserstein barycenter（WB）对齐，用于以连续可学习的 barycenter support 替代/升级当前基于 MMD 的多癌种 latent 对齐。
@@ -43,7 +160,7 @@
 - 代码影响：
   - 新增 `stonco/utils/analyze_spot_embedding_domains.py`，用于对 `spot_embeddings_*.csv` 计算域均值/方差统计，并生成热图、箱线图、局部维度 KDE、一维 spot 散点分布图与二维联合散点图
   - 支持按组均衡抽样导出二维散点图与对应抽样 CSV，便于对比 `h_7/h_20` 等局部维度组合在不同域上的分布
-  - `docs/Tutorial.md` 第 9 章新增 “9.5 embedding 域统计与局部二维诊断” 小节，补充用途、示例命令、默认产物与参数说明
+  - `docs/Tutorial.md` 第 9 章新增 embedding 域统计与局部二维诊断小节，补充用途、示例命令、默认产物与参数说明
 - 涉及文件：
   - `stonco/utils/analyze_spot_embedding_domains.py`
   - `docs/Tutorial.md`

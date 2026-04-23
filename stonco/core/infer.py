@@ -19,7 +19,7 @@ class InferenceEngine:
         self.cfg = dict(meta.get('cfg', {}))
         # 兼容字段默认
         self.cfg.setdefault('lap_pe_dim', 16)
-        self.cfg.setdefault('concat_lap_pe', True)
+        self.cfg.setdefault('concat_lap_pe', False)
         self.cfg.setdefault('lap_pe_use_gaussian', False)
         self.cfg.setdefault('knn_k', 6)
         self.cfg.setdefault('gaussian_sigma_factor', 1.0)
@@ -27,6 +27,9 @@ class InferenceEngine:
         self.cfg.setdefault('heads', 4)
         self.cfg.setdefault('num_layers', 3)
         self.cfg.setdefault('dropout', 0.3)
+        self.cfg['gnn_dropout'] = float(self.cfg['dropout'] if self.cfg.get('gnn_dropout', None) is None else self.cfg['gnn_dropout'])
+        self.cfg['clf_dropout'] = float(self.cfg['dropout'] if self.cfg.get('clf_dropout', None) is None else self.cfg['clf_dropout'])
+        self.cfg['dom_dropout'] = float(self.cfg['dropout'] if self.cfg.get('dom_dropout', None) is None else self.cfg['dom_dropout'])
         self.cfg.setdefault('clf_hidden', [256, 128, 64])
         self.cfg.setdefault('use_image_features', False)
         self.cfg.setdefault('img_use_pca', True)
@@ -60,6 +63,9 @@ class InferenceEngine:
                 hidden=self.cfg['GNN_hidden'],
                 num_layers=self.cfg['num_layers'],
                 dropout=self.cfg['dropout'],
+                gnn_dropout=self.cfg.get('gnn_dropout', self.cfg.get('dropout', 0.3)),
+                clf_dropout=self.cfg.get('clf_dropout', self.cfg.get('dropout', 0.3)),
+                dom_dropout=self.cfg.get('dom_dropout', self.cfg.get('dropout', 0.3)),
                 model=self.cfg['model'],
                 heads=self.cfg.get('heads', 4),
                 clf_hidden=clf_hidden,

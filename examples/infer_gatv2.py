@@ -24,7 +24,7 @@ def assemble_pyg(Xp: np.ndarray, xy: np.ndarray, cfg: dict) -> PyGData:
         )
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
+    if cfg.get('concat_lap_pe', False) and pe is not None:
         x = np.hstack([Xp, pe]).astype('float32')
     else:
         x = Xp.astype('float32')
@@ -42,7 +42,7 @@ def infer_single(npz_path: str, artifacts_dir: str, out_csv: str, threshold: flo
     meta = load_json(os.path.join(artifacts_dir, 'meta.json'))
     cfg = dict(meta.get('cfg', {}))
     cfg.setdefault('lap_pe_dim', 16)
-    cfg.setdefault('concat_lap_pe', True)
+    cfg.setdefault('concat_lap_pe', False)
     cfg.setdefault('lap_pe_use_gaussian', False)
     cfg.setdefault('knn_k', 6)
     cfg.setdefault('gaussian_sigma_factor', 1.0)

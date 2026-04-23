@@ -126,11 +126,12 @@ class ClassifierHead(nn.Module):
         return logits, None
 
 class DomainHead(nn.Module):
-    def __init__(self, in_dim, n_domains, hidden=64):
+    def __init__(self, in_dim, n_domains, hidden=64, dropout=0.3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
+            nn.Dropout(float(dropout)),
             nn.Linear(hidden, n_domains)
         )
     def forward(self, h):
@@ -152,17 +153,29 @@ class STOnco_Classifier(nn.Module):
         use_domain_adaptation: Whether to enable domain adaptation
     """
     def __init__(self, in_dim, hidden=(256, 128, 64), num_layers=3, dropout=0.3, model='gatv2', heads=4,
+                 gnn_dropout=None,
+                 clf_dropout=None,
+                 dom_dropout=None,
                  clf_hidden=(256, 128, 64),
                  domain_hidden=64,
                  use_domain_adv_slide=False, n_domains_slide=None,
                  use_domain_adv_cancer=False, n_domains_cancer=None):
         super().__init__()
-        self.gnn = GNNBackbone(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout, model=model, heads=heads)
-        self.clf = ClassifierHead(self.gnn.out_dim, hidden_dims=clf_hidden, dropout=0.1)
+        if gnn_dropout is None:
+            gnn_dropout = dropout
+        if clf_dropout is None:
+            clf_dropout = dropout
+        if dom_dropout is None:
+            dom_dropout = dropout
+        self.gnn_dropout = float(gnn_dropout)
+        self.clf_dropout = float(clf_dropout)
+        self.dom_dropout = float(dom_dropout)
+        self.gnn = GNNBackbone(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=self.gnn_dropout, model=model, heads=heads)
+        self.clf = ClassifierHead(self.gnn.out_dim, hidden_dims=clf_hidden, dropout=self.clf_dropout)
         self.use_domain_adv_slide = bool(use_domain_adv_slide) and (n_domains_slide is not None and int(n_domains_slide) > 0)
         self.use_domain_adv_cancer = bool(use_domain_adv_cancer) and (n_domains_cancer is not None and int(n_domains_cancer) > 0)
-        self.dom_slide = DomainHead(self.gnn.out_dim, int(n_domains_slide), hidden=domain_hidden) if self.use_domain_adv_slide else None
-        self.dom_cancer = DomainHead(self.gnn.out_dim, n_domains_cancer, hidden=domain_hidden) \
+        self.dom_slide = DomainHead(self.gnn.out_dim, int(n_domains_slide), hidden=domain_hidden, dropout=self.dom_dropout) if self.use_domain_adv_slide else None
+        self.dom_cancer = DomainHead(self.gnn.out_dim, n_domains_cancer, hidden=domain_hidden, dropout=self.dom_dropout) \
             if self.use_domain_adv_cancer else None
 
     def forward(

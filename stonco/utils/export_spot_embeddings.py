@@ -205,7 +205,7 @@ def run_export(args: argparse.Namespace) -> str:
     meta = load_json(os.path.join(artifacts_dir, 'meta.json'))
     cfg = dict(meta.get('cfg', {}))
     cfg.setdefault('lap_pe_dim', 16)
-    cfg.setdefault('concat_lap_pe', True)
+    cfg.setdefault('concat_lap_pe', False)
     cfg.setdefault('lap_pe_use_gaussian', False)
     cfg.setdefault('knn_k', 6)
     cfg.setdefault('gaussian_sigma_factor', 1.0)
@@ -213,6 +213,9 @@ def run_export(args: argparse.Namespace) -> str:
     cfg.setdefault('heads', 4)
     cfg.setdefault('num_layers', 3)
     cfg.setdefault('dropout', 0.3)
+    cfg['gnn_dropout'] = float(cfg['dropout'] if cfg.get('gnn_dropout', None) is None else cfg['gnn_dropout'])
+    cfg['clf_dropout'] = float(cfg['dropout'] if cfg.get('clf_dropout', None) is None else cfg['clf_dropout'])
+    cfg['dom_dropout'] = float(cfg['dropout'] if cfg.get('dom_dropout', None) is None else cfg['dom_dropout'])
     cfg.setdefault('clf_hidden', [256, 128, 64])
     cfg.setdefault('use_image_features', False)
     cfg.setdefault('img_use_pca', True)
@@ -294,6 +297,9 @@ def run_export(args: argparse.Namespace) -> str:
                     hidden=cfg['GNN_hidden'],
                     num_layers=int(cfg['num_layers']),
                     dropout=float(cfg['dropout']),
+                    gnn_dropout=float(cfg.get('gnn_dropout', cfg.get('dropout', 0.3))),
+                    clf_dropout=float(cfg.get('clf_dropout', cfg.get('dropout', 0.3))),
+                    dom_dropout=float(cfg.get('dom_dropout', cfg.get('dropout', 0.3))),
                     model=str(cfg['model']),
                     heads=int(cfg.get('heads', 4)),
                     clf_hidden=clf_hidden,

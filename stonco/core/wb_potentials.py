@@ -115,6 +115,8 @@ class GeneratedSupportWBLoss(nn.Module):
         euclid_pairwise_weight=1.0,
         potential_weight=1.0,
         potential_constraint_weight=0.01,
+        sinkhorn_iters=50,
+        sw_num_projections=64,
     ):
         super().__init__()
         self.n_domains = int(n_domains)
@@ -132,13 +134,20 @@ class GeneratedSupportWBLoss(nn.Module):
         self.euclid_pairwise_weight = float(euclid_pairwise_weight)
         self.potential_weight = float(potential_weight)
         self.potential_constraint_weight = float(potential_constraint_weight)
+        self.sinkhorn_iters = max(1, int(sinkhorn_iters))
+        self.sw_num_projections = max(1, int(sw_num_projections))
 
         if self.loss_type == 'euclidean_pairwise':
             self.potentials = SinglePotentialBank(self.n_domains, self.in_dim, hidden=potential_hidden)
         elif self.loss_type == 'dual_potential':
             self.potentials = DualPotentialBank(self.n_domains, self.in_dim, hidden=potential_hidden)
+        elif self.loss_type in {'sinkhorn_divergence', 'sliced_wasserstein'}:
+            self.potentials = None
         else:
-            raise ValueError(f"wb_loss_type must be dual_potential or euclidean_pairwise, got: {loss_type}")
+            raise ValueError(
+                "wb_loss_type must be dual_potential, euclidean_pairwise, "
+                f"sinkhorn_divergence, or sliced_wasserstein, got: {loss_type}"
+            )
 
         if self.regularizer not in {'l2', 'entropy'}:
             raise ValueError(f"wb_regularizer must be l2 or entropy, got: {regularizer}")
@@ -150,6 +159,8 @@ class GeneratedSupportWBLoss(nn.Module):
             self.state_direction = nn.Parameter(v)
 
     def potential_parameters(self):
+        if self.potentials is None:
+            return []
         return self.potentials.parameters()
 
     def main_parameters(self):
@@ -166,7 +177,7 @@ class GeneratedSupportWBLoss(nn.Module):
     def _normalize_latent(self, x):
         return F.layer_norm(x, (x.size(-1),))
 
-    def _select_indices(self, cancer_dom, graph_nodes=None, y=None):
+    def _select_indices(self, cancer_dom, graph_nodes=None, y=None, generator=None):
         device = cancer_dom.device
         if cancer_dom.numel() == 0:
             return torch.empty(0, dtype=torch.long, device=device)
@@ -180,7 +191,7 @@ class GeneratedSupportWBLoss(nn.Module):
                 if idx_g.numel() <= int(self.spots_per_graph):
                     keep.append(idx_g)
                 else:
-                    perm = torch.randperm(idx_g.numel(), device=device)[:int(self.spots_per_graph)]
+                    perm = torch.randperm(idx_g.numel(), device=device, generator=generator)[:int(self.spots_per_graph)]
                     keep.append(idx_g[perm])
             idx = torch.cat(keep, dim=0) if keep else torch.empty(0, dtype=torch.long, device=device)
 
@@ -196,7 +207,7 @@ class GeneratedSupportWBLoss(nn.Module):
                 if idx_k.numel() <= int(self.spots_per_cancer):
                     keep.append(idx_k)
                 else:
-                    perm = torch.randperm(idx_k.numel(), device=device)[:int(self.spots_per_cancer)]
+                    perm = torch.randperm(idx_k.numel(), device=device, generator=generator)[:int(self.spots_per_cancer)]
                     keep.append(idx_k[perm])
             idx = torch.cat(keep, dim=0) if keep else torch.empty(0, dtype=torch.long, device=device)
 
@@ -214,8 +225,8 @@ class GeneratedSupportWBLoss(nn.Module):
                 neg = idx_k[y_k == 0]
                 if pos.numel() > 0 and neg.numel() > 0:
                     n = min(int(pos.numel()), int(neg.numel()))
-                    pos = pos[torch.randperm(pos.numel(), device=device)[:n]]
-                    neg = neg[torch.randperm(neg.numel(), device=device)[:n]]
+                    pos = pos[torch.randperm(pos.numel(), device=device, generator=generator)[:n]]
+                    neg = neg[torch.randperm(neg.numel(), device=device, generator=generator)[:n]]
                     keep.append(torch.cat([pos, neg], dim=0))
                 else:
                     labeled = idx_k[y_k >= 0]
@@ -224,8 +235,8 @@ class GeneratedSupportWBLoss(nn.Module):
 
         return idx
 
-    def _prepare(self, h, b, cancer_dom, graph_nodes=None, y=None):
-        idx = self._select_indices(cancer_dom, graph_nodes=graph_nodes, y=y)
+    def _prepare(self, h, b, cancer_dom, graph_nodes=None, y=None, generator=None):
+        idx = self._select_indices(cancer_dom, graph_nodes=graph_nodes, y=y, generator=generator)
         if idx.numel() == 0:
             return None
 
@@ -259,11 +270,54 @@ class GeneratedSupportWBLoss(nn.Module):
             'active_domains': active,
         }
 
-    def _support_subset(self, b):
+    def _support_subset(self, b, generator=None):
         if self.support_size is None or int(self.support_size) <= 0 or b.size(0) <= int(self.support_size):
             return b
-        perm = torch.randperm(b.size(0), device=b.device)[:int(self.support_size)]
+        perm = torch.randperm(b.size(0), device=b.device, generator=generator)[:int(self.support_size)]
         return b[perm]
+
+    def _sample_projection_directions(self, ref, generator=None):
+        directions = torch.randn(
+            int(self.sw_num_projections),
+            int(self.in_dim),
+            device=ref.device,
+            dtype=ref.dtype,
+            generator=generator,
+        )
+        return F.normalize(directions, p=2, dim=1, eps=1e-12)
+
+    def _wasserstein_1d_weighted(self, x, y, weights_x=None, weights_y=None):
+        ref = x if x.numel() > 0 else y
+        if x.numel() == 0 or y.numel() == 0:
+            return self._zero(ref, requires_grad=True)
+
+        x_sorted, x_perm = torch.sort(x.reshape(-1))
+        y_sorted, y_perm = torch.sort(y.reshape(-1))
+        if weights_x is None and weights_y is None and x_sorted.numel() == y_sorted.numel():
+            return (x_sorted - y_sorted).pow(2).mean()
+
+        def _prepare_weights(weights, perm, n, ref_tensor):
+            if weights is None:
+                out = ref_tensor.new_full((n,), 1.0 / float(max(n, 1)))
+            else:
+                out = weights.reshape(-1).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+                if out.numel() != n:
+                    raise ValueError(f'1D Wasserstein weights size mismatch: expected {n}, got {out.numel()}')
+                out = out[perm]
+                total = out.sum().clamp_min(1e-12)
+                out = out / total
+            return out
+
+        wx = _prepare_weights(weights_x, x_perm, x_sorted.numel(), x_sorted)
+        wy = _prepare_weights(weights_y, y_perm, y_sorted.numel(), y_sorted)
+        cdf_x = wx.cumsum(dim=0)
+        cdf_y = wy.cumsum(dim=0)
+        breaks = torch.unique(torch.cat([cdf_x, cdf_y], dim=0), sorted=True)
+        breaks = torch.cat([breaks.new_zeros(1), breaks], dim=0)
+        delta = breaks[1:] - breaks[:-1]
+        idx_x = torch.searchsorted(cdf_x, breaks[1:], right=False).clamp(max=x_sorted.numel() - 1)
+        idx_y = torch.searchsorted(cdf_y, breaks[1:], right=False).clamp(max=y_sorted.numel() - 1)
+        return torch.sum(delta * (x_sorted[idx_x] - y_sorted[idx_y]).pow(2))
 
     def _regularizer(self, t):
         eps = max(float(self.epsilon), 1e-8)
@@ -312,6 +366,83 @@ class GeneratedSupportWBLoss(nn.Module):
             return self._zero(b, requires_grad=True)
         return torch.stack(losses).mean()
 
+    def _sinkhorn_ot(self, x, y, return_plan=False):
+        if x.size(0) == 0 or y.size(0) == 0:
+            z = self._zero(x if x.numel() > 0 else y, requires_grad=True)
+            return (z, None) if return_plan else z
+
+        eps = max(float(self.epsilon), 1e-6)
+        nx = int(x.size(0))
+        ny = int(y.size(0))
+        dim = max(int(x.size(-1)), 1)
+        cost = torch.cdist(x, y, p=2).pow(2) / float(dim)
+
+        log_a = x.new_full((nx,), -math.log(nx))
+        log_b = y.new_full((ny,), -math.log(ny))
+        log_k = -cost / eps
+
+        log_u = x.new_zeros(nx)
+        log_v = y.new_zeros(ny)
+        for _ in range(int(self.sinkhorn_iters)):
+            log_u = log_a - torch.logsumexp(log_k + log_v.view(1, -1), dim=1)
+            log_v = log_b - torch.logsumexp(log_k + log_u.view(-1, 1), dim=0)
+
+        log_pi = log_u.view(-1, 1) + log_k + log_v.view(1, -1)
+        pi = torch.exp(log_pi)
+        kl_term = log_pi - log_a.view(-1, 1) - log_b.view(1, -1)
+        ot_value = (pi * cost).sum() + eps * (pi * kl_term).sum()
+        if return_plan:
+            return ot_value, pi
+        return ot_value
+
+    def _sinkhorn_divergence_loss(self, prepared):
+        h = prepared['h']
+        b_support = self._support_subset(prepared['b'])
+        cancer = prepared['cancer']
+        active = prepared['active_domains']
+        if b_support.size(0) < int(self.min_spots):
+            return self._zero(h, requires_grad=True)
+
+        ot_qq = self._sinkhorn_ot(b_support, b_support)
+        losses = []
+        for k in active:
+            xk = h[cancer == int(k)]
+            if xk.size(0) < int(self.min_spots):
+                continue
+            ot_kq = self._sinkhorn_ot(xk, b_support)
+            ot_kk = self._sinkhorn_ot(xk, xk)
+            losses.append(ot_kq - 0.5 * ot_kk - 0.5 * ot_qq)
+        if not losses:
+            return self._zero(h, requires_grad=True)
+        return torch.stack(losses).mean()
+
+    def _sliced_wasserstein_loss(self, prepared, generator=None):
+        h = prepared['h']
+        b_support = self._support_subset(prepared['b'], generator=generator)
+        if b_support.size(0) < 2:
+            return None
+
+        cancer = prepared['cancer']
+        active = prepared['active_domains']
+        directions = self._sample_projection_directions(b_support, generator=generator)
+        proj_support = torch.matmul(b_support, directions.t())
+
+        losses = []
+        for k in active:
+            xk = h[cancer == int(k)]
+            if xk.size(0) < int(self.min_spots):
+                continue
+            proj_xk = torch.matmul(xk, directions.t())
+            dir_losses = [
+                self._wasserstein_1d_weighted(proj_xk[:, ell], proj_support[:, ell])
+                for ell in range(int(directions.size(0)))
+            ]
+            losses.append(torch.stack(dir_losses).mean())
+
+        if not losses:
+            return self._zero(h, requires_grad=True)
+        return torch.stack(losses).mean()
+
     def _state_direction_loss(self, prepared):
         if self.state_direction is None or prepared.get('y', None) is None:
             return self._zero(prepared['b'], requires_grad=True), 0
@@ -338,8 +469,11 @@ class GeneratedSupportWBLoss(nn.Module):
     def _anchor_loss(self, prepared):
         return (prepared['h'] - prepared['b']).pow(2).mean()
 
-    def potential_loss(self, h, b, cancer_dom, graph_nodes=None, y=None):
-        prepared = self._prepare(h, b, cancer_dom, graph_nodes=graph_nodes, y=y)
+    def potential_loss(self, h, b, cancer_dom, graph_nodes=None, y=None, generator=None):
+        if self.potentials is None:
+            return self._zero(b, requires_grad=False), self._empty_stats(valid=False)
+
+        prepared = self._prepare(h, b, cancer_dom, graph_nodes=graph_nodes, y=y, generator=generator)
         if prepared is None:
             return self._zero(b, requires_grad=False), self._empty_stats(valid=False)
 
@@ -352,6 +486,8 @@ class GeneratedSupportWBLoss(nn.Module):
                 'wb_potential_loss': loss.detach(),
                 'wb_dual_obj': dual_obj.detach(),
                 'wb_euclid_pairwise': h.new_tensor(float('nan')),
+                'wb_sinkhorn': h.new_tensor(float('nan')),
+                'wb_sliced_wasserstein': h.new_tensor(float('nan')),
             })
             return loss, stats
 
@@ -367,20 +503,22 @@ class GeneratedSupportWBLoss(nn.Module):
             'wb_potential_loss': loss.detach(),
             'wb_dual_obj': h.new_tensor(float('nan')),
             'wb_euclid_pairwise': h.new_tensor(float('nan')),
+            'wb_sinkhorn': h.new_tensor(float('nan')),
+            'wb_sliced_wasserstein': h.new_tensor(float('nan')),
             'wb_potential_score': pot_score.mean().detach(),
         })
         return loss, stats
 
-    def model_loss(self, h, b, cancer_dom, graph_nodes=None, y=None):
-        prepared = self._prepare(h, b, cancer_dom, graph_nodes=graph_nodes, y=y)
+    def model_loss(self, h, b, cancer_dom, graph_nodes=None, y=None, generator=None):
+        prepared = self._prepare(h, b, cancer_dom, graph_nodes=graph_nodes, y=y, generator=generator)
         if prepared is None:
             z = self._zero(h, requires_grad=True) + self._zero(b, requires_grad=True)
             return z, z, self._empty_stats(valid=False)
 
-        anchor = self._anchor_loss(prepared)
         shape_loss, shape_count = self._state_direction_loss(prepared)
 
         if self.loss_type == 'dual_potential':
+            anchor = self._anchor_loss(prepared)
             dual_obj = self._dual_objective(prepared)
             raw_loss = dual_obj + self.state_direction_weight * shape_loss
             stats = self._stats_from_prepared(prepared)
@@ -389,12 +527,54 @@ class GeneratedSupportWBLoss(nn.Module):
                 'wb_loss': raw_loss.detach(),
                 'wb_dual_obj': dual_obj.detach(),
                 'wb_euclid_pairwise': h.new_tensor(float('nan')),
+                'wb_sinkhorn': h.new_tensor(float('nan')),
+                'wb_sliced_wasserstein': h.new_tensor(float('nan')),
                 'wb_anchor': anchor.detach(),
                 'wb_state_direction': shape_loss.detach(),
                 'wb_state_direction_count': float(shape_count),
             })
             return raw_loss, anchor, stats
 
+        if self.loss_type == 'sinkhorn_divergence':
+            anchor = self._anchor_loss(prepared)
+            sinkhorn_loss = self._sinkhorn_divergence_loss(prepared)
+            raw_loss = sinkhorn_loss + self.state_direction_weight * shape_loss
+            stats = self._stats_from_prepared(prepared)
+            stats.update({
+                'valid': True,
+                'wb_loss': raw_loss.detach(),
+                'wb_dual_obj': h.new_tensor(float('nan')),
+                'wb_euclid_pairwise': h.new_tensor(float('nan')),
+                'wb_sinkhorn': sinkhorn_loss.detach(),
+                'wb_sliced_wasserstein': h.new_tensor(float('nan')),
+                'wb_anchor': anchor.detach(),
+                'wb_state_direction': shape_loss.detach(),
+                'wb_state_direction_count': float(shape_count),
+            })
+            return raw_loss, anchor, stats
+
+        if self.loss_type == 'sliced_wasserstein':
+            sliced_loss = self._sliced_wasserstein_loss(prepared, generator=generator)
+            if sliced_loss is None:
+                z = self._zero(h, requires_grad=True) + self._zero(b, requires_grad=True)
+                return z, z, self._empty_stats(valid=False)
+            anchor = self._anchor_loss(prepared)
+            raw_loss = sliced_loss + self.state_direction_weight * shape_loss
+            stats = self._stats_from_prepared(prepared)
+            stats.update({
+                'valid': True,
+                'wb_loss': raw_loss.detach(),
+                'wb_dual_obj': h.new_tensor(float('nan')),
+                'wb_euclid_pairwise': h.new_tensor(float('nan')),
+                'wb_sinkhorn': h.new_tensor(float('nan')),
+                'wb_sliced_wasserstein': sliced_loss.detach(),
+                'wb_anchor': anchor.detach(),
+                'wb_state_direction': shape_loss.detach(),
+                'wb_state_direction_count': float(shape_count),
+            })
+            return raw_loss, anchor, stats
+
+        anchor = self._anchor_loss(prepared)
         pair_loss = self._euclidean_pairwise_loss(prepared)
         pot_score = self.potentials.forward_by_domain(prepared['b'], prepared['cancer'])
         pot_main = -pot_score.mean()
@@ -409,6 +589,8 @@ class GeneratedSupportWBLoss(nn.Module):
             'wb_loss': raw_loss.detach(),
             'wb_dual_obj': h.new_tensor(float('nan')),
             'wb_euclid_pairwise': pair_loss.detach(),
+            'wb_sinkhorn': h.new_tensor(float('nan')),
+            'wb_sliced_wasserstein': h.new_tensor(float('nan')),
             'wb_anchor': anchor.detach(),
             'wb_state_direction': shape_loss.detach(),
             'wb_state_direction_count': float(shape_count),

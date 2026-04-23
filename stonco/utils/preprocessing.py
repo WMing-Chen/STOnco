@@ -23,7 +23,7 @@ def build_node_features_early_fusion(Xp_gene, cfg, Xp_img=None, img_mask=None, p
         xs.extend([Xp_img, img_mask_col])
 
     x = np.hstack(xs).astype('float32')
-    if cfg.get('concat_lap_pe', True) and pe is not None:
+    if cfg.get('concat_lap_pe', False) and pe is not None:
         x = np.hstack([x, pe]).astype('float32')
     return x
 

@@ -27,7 +27,7 @@ def assemble_pyg(Xp: np.ndarray, xy: np.ndarray, y: np.ndarray, cfg: dict) -> Py
         )
     else:
         pe = None
-    if cfg.get('concat_lap_pe', True) and pe is not None:
+    if cfg.get('concat_lap_pe', False) and pe is not None:
         x = np.hstack([Xp, pe]).astype('float32')
     else:
         x = Xp.astype('float32')
@@ -162,7 +162,7 @@ def main():
     p.add_argument('--knn_k', type=int, default=6)
     p.add_argument('--gaussian_sigma_factor', type=float, default=1.0)
     p.add_argument('--lap_pe_dim', type=int, default=16)
-    p.add_argument('--concat_lap_pe', type=int, choices=[0, 1], default=1)
+    p.add_argument('--concat_lap_pe', type=int, choices=[0, 1], default=0)
     p.add_argument('--lap_pe_use_gaussian', type=int, choices=[0, 1], default=0)
     # 预处理
     p.add_argument('--use_pca', type=int, choices=[0, 1], default=1)
