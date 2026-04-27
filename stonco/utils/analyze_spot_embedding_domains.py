@@ -58,6 +58,13 @@ def _embedding_columns(df: pd.DataFrame, prefix: str) -> List[str]:
     return sorted(cols, key=sort_key)
 
 
+def _embedding_dim_from_col(col: str, prefix: str) -> int:
+    suffix = col[len(prefix):]
+    try:
+        return int(suffix)
+    except Exception as exc:
+        raise ValueError(f'Embedding column does not end with an integer dimension: {col}') from exc
+
 def _sorted_group_labels(values: Iterable[object], group_col: str) -> List[str]:
     labels = [str(v) for v in values]
 
@@ -386,6 +393,23 @@ def sample_per_group(df: pd.DataFrame, group_col: str, max_per_group: int, seed:
     return pd.concat(parts, axis=0).reset_index(drop=True)
 
 
+def select_extreme_activation_dims(df: pd.DataFrame, embed_cols: Sequence[str], prefix: str) -> tuple[List[int], pd.Series]:
+    mean_activation = df[list(embed_cols)].apply(pd.to_numeric, errors='coerce').mean(axis=0, numeric_only=True)
+    mean_activation = mean_activation.dropna()
+    if mean_activation.empty:
+        raise ValueError('Could not compute mean activation for any embedding dimensions')
+    if len(mean_activation) < 2:
+        raise ValueError('Need at least 2 embedding dimensions to auto-select strongest and weakest activations')
+
+    ordered = mean_activation.sort_values(ascending=False)
+    strongest_col = str(ordered.index[0])
+    weakest_col = str(ordered.index[-1])
+    selected_dims = [
+        _embedding_dim_from_col(strongest_col, prefix),
+        _embedding_dim_from_col(weakest_col, prefix),
+    ]
+    return selected_dims, ordered
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Analyze spot-level embedding domain statistics and plots.')
     parser.add_argument('--embeddings_csv', required=True, help='CSV produced by export_spot_embeddings.py')
@@ -393,11 +417,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--embedding_prefix', default='h_', help='Embedding column prefix. Default: h_')
     parser.add_argument('--group_cols', nargs='+', default=list(DEFAULT_GROUP_COLS), help='Columns used as domains for summary stats')
     parser.add_argument('--selected_dims', type=int, nargs='+', default=list(DEFAULT_SELECTED_DIMS), help='Embedding dimensions for focused plots')
+    parser.add_argument(
+        '--auto_select_extreme_dims',
+        action='store_true',
+        help='Automatically use the highest-mean and lowest-mean h_* dimensions across all spots for KDE and 2D comparison plots',
+    )
     parser.add_argument('--spot_kde_group_col', default='cancer_type', help='Group column used for spot-level KDE plots')
     parser.add_argument('--joint_scatter_group_col', default='cancer_type', help='Group column used for 2D scatter coloring')
     parser.add_argument('--joint_scatter_sample_caps', type=int, nargs='*', default=list(DEFAULT_JOINT_SCATTER_SAMPLE_CAPS), help='Balanced per-group sample caps for extra 2D scatter plots')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for sampling and jitter')
-    parser.add_argument('--formats', default='svg,png', help='Comma-separated output formats, e.g. svg,png')
+    parser.add_argument('--formats', default='svg', help='Comma-separated output formats, e.g. svg')
     return parser
 
 
@@ -405,7 +434,15 @@ def run_analysis(args: argparse.Namespace):
     out_dir = _ensure_out_dir(Path(args.out_dir) if args.out_dir else Path(args.embeddings_csv).resolve().parent)
     df = pd.read_csv(args.embeddings_csv)
     embed_cols = _embedding_columns(df, args.embedding_prefix)
-    selected_dims = [int(d) for d in args.selected_dims]
+    if args.auto_select_extreme_dims:
+        selected_dims, mean_activation = select_extreme_activation_dims(df, embed_cols, args.embedding_prefix)
+        print(
+            'Auto-selected dimensions by global mean activation:',
+            f'max={args.embedding_prefix}{selected_dims[0]} ({mean_activation.iloc[0]:.6f}),',
+            f'min={args.embedding_prefix}{selected_dims[1]} ({mean_activation.iloc[-1]:.6f})',
+        )
+    else:
+        selected_dims = [int(d) for d in args.selected_dims]
     if len(selected_dims) < 2:
         raise ValueError('selected_dims must contain at least 2 dimensions for joint scatter plotting')
     selected_cols = [f'{args.embedding_prefix}{d}' for d in selected_dims]
