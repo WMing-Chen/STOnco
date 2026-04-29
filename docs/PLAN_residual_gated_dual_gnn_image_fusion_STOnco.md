@@ -44,6 +44,52 @@ h_fused = h_gene + g ⊙ u_img
 - 当前 `z_clf` 仍然只是分类头内部表征，不作为主对齐空间；
 - gene 分支保持主干地位，image 分支只做增量修正，不采用对称融合。
 
+### 1.1 实现硬约束
+
+结合 STOnco 当前代码结构，本方案新增以下硬约束。后续实现必须满足这些约束后，才认为双分支方案真正接入完成。
+
+1. **新增统一 `model.encode(...)`**
+   - 所有共享表征 `h` 的来源必须走模型实例的 `model.encode(...)`；
+   - 外部训练、推理、导出、WB/MMD 代码禁止直接调用 `model.gnn(...)` 获取 `h`；
+   - early fusion 与 dual branch 都由 `encode(...)` 屏蔽内部差异；
+   - `forward(...)` 内部也必须通过 `encode(...)` 得到 `h` 后再接分类头和域头。
+
+2. **优化器参数组必须覆盖新模块**
+   - dual branch 模式下，optimizer 必须明确加入：
+     - `gnn_gene`
+     - `gnn_img`
+     - `fusion`
+     - `clf`
+     - `dom_slide/dom_cancer`
+   - 不能继续只依赖 `model.gnn.parameters()`。
+
+3. **`sampler.py` 必须支持所有 node-level 字段切片**
+   - static subgraph 训练必须同步切片：
+     - `x`
+     - `x_gene`
+     - `x_img`
+     - `img_mask`
+     - `pe_gene`
+     - `y`
+     - `pos`
+   - clone full graph 时也必须保留这些字段。
+
+4. **image branch 内部必须做 mask propagation**
+   - `img_mask=0` 不仅要让最终 `gate=0`；
+   - image branch 的输入和每层 hidden 都应按 `img_mask` 清零，避免缺失图像节点通过 GNN message passing 影响其他节点；
+   - 第一版采用节点级 hard mask，不做 image GNN 的边级 valid-valid 过滤。
+
+5. **checkpoint 必须按 `image_fusion_mode` 严格构建和校验**
+   - 默认使用 `strict=True` 加载 checkpoint；
+   - 不依赖 `strict=False` 静默兼容新旧模型；
+   - 推理、导出、可视化必须根据 `meta.json['cfg']['image_fusion_mode']` 构建对应结构；
+   - 模式不匹配、关键模块缺失或 unexpected/missing keys 异常时，应给出明确错误。
+
+6. **改动范围必须覆盖重复训练/评估路径**
+   - 除主训练路径外，`train.py` 内部的 kfold/LOCO 重复路径也必须同步；
+   - `eval_loco_checkpoints.py` 也必须同步走新模型构建与 `encode(...)` 路径；
+   - 本轮方案暂不把 `train_hpo.py` 纳入必改范围，后续另行处理。
+
 ---
 
 ## 2. 为什么选 residual gated fusion
@@ -53,7 +99,7 @@ h_fused = h_gene + g ⊙ u_img
 - 多癌种（>11）；
 - 多 batch / slide / center；
 - 500,000+ spots；
-- 图像特征来自 ResNet50 2048 维，天然容易携带癌种/中心/染色 shortcut；
+- 图像特征来自外部图像模型，例如 UNI、ResNet50 等，天然容易携带癌种/中心/染色 shortcut；
 - 现有 STOnco 已有 `slide/cancer GRL`、`MMD`、`WB`，这些模块已围绕 `h` 设计。
 
 采用 residual gated fusion 的原因：
@@ -204,6 +250,17 @@ data.pe_gene (optional)
 - 旧：组装单个 `data.x`
 - 新：组装 `data.x_gene` / `data.x_img` / `data.img_mask` / `data.pe_gene`
 
+图像特征输入维度不固定。  
+`X_img` 的原始维度由外部图像模型决定，例如 UNI、ResNet50 或其他 encoder；模型实际接收的是 `ImagePreprocessor.transform(...)` 后的 `Xp_img`。
+
+因此：
+
+```text
+img_in_dim = Xp_img.shape[1] = img_pp.out_dim()
+```
+
+而不是写死为 2048、1024、768 或某个固定值。
+
 ---
 
 ## 6. 图对象设计
@@ -243,9 +300,9 @@ data.cancer_dom
 data.pe_gene      # [N, Dpe]，若 gene 分支启用 LapPE
 ```
 
-### 6.2 是否保留 `data.x`
+### 6.2 `data.x` 兼容策略
 
-建议：
+已确认：
 
 - **保留 `data.x = data.x_gene` 作为兼容字段**；
 - 但模型前向不再依赖 `data.x`；
@@ -369,6 +426,20 @@ g = g * img_mask_col
 h_fused = h_gene
 ```
 
+但仅在 fusion 末端令 `g=0` 还不够。由于 image branch 使用 GNN，缺失图像节点即使输入为 0，也可能通过卷积 bias、归一化或邻居聚合产生非零 hidden，并进一步参与 message passing。
+
+因此第一版实现必须增加 image branch mask propagation：
+
+```text
+x_img_input = x_img * img_mask
+每层 image hidden 后继续 h_img_layer = h_img_layer * img_mask
+fusion 前 h_img = h_img * img_mask
+u_img = u_img * img_mask
+g = g * img_mask
+```
+
+这样至少保证缺失图像节点自身不会产生 image residual。第一版不做 image GNN 的边级 valid-valid 过滤；如果后续实验发现缺失模式仍明显影响有图像节点，再单独扩展。
+
 ### 7.5 gate 初始化
 
 建议 gate 初始偏保守，让训练初期更接近 gene-only：
@@ -381,7 +452,7 @@ h_fused = h_gene
 - 避免训练初期 image branch 直接影响主表征；
 - 降低 shortcut 风险。
 
-### 7.6 是否需要 `Proj`
+### 7.6 保留 `ImgProj`
 
 需要。
 
@@ -404,8 +475,11 @@ self.img_proj = nn.Linear(img_dim, gene_dim)
 原因：
 
 1. 训练、推理、导出、可视化都已经依赖这个类名；
-2. 现有 `load_state_dict(..., strict=False)` 机制已经具备一定兼容性；
+2. `meta.json['cfg']['image_fusion_mode']` 可以作为模型结构选择的唯一来源；
 3. 代码变更面更小。
+
+注意：继续使用同一个类名不等于允许 checkpoint 静默混用。  
+新旧模型必须通过 `image_fusion_mode` 明确区分，加载权重时也必须校验关键模块是否匹配。
 
 ### 8.2 新增配置开关
 
@@ -501,6 +575,66 @@ out['h_fused'] = h_fused
 - 老代码继续读 `out['h']`
 - 新代码可以明确读 `out['h_fused']`
 
+### 8.6 新增统一 `encode(...)` 作为共享表征唯一出口
+
+双分支实现后，`STOnco_Classifier` 必须新增：
+
+```python
+def encode(
+    self,
+    x=None,
+    edge_index=None,
+    edge_weight=None,
+    x_gene=None,
+    x_img=None,
+    img_mask=None,
+    pe_gene=None,
+    return_aux=False,
+):
+    ...
+```
+
+语义：
+
+1. `early_concat` 模式：
+   - 使用旧路径：`h = self.gnn(x, edge_index, edge_weight=edge_weight)`；
+   - `return_aux=True` 时至少返回 `{'h': h}`。
+2. `dual_branch_residual_gate` 模式：
+   - 使用 `x_gene/x_img/img_mask/pe_gene`；
+   - gene branch 得到 `h_gene`；
+   - image branch 在内部执行 mask propagation 后得到 `h_img`；
+   - fusion 得到 `h_fused`；
+   - 返回的主 `h` 必须等于 `h_fused`。
+
+`forward(...)` 内部必须先调用 `encode(...)`：
+
+```python
+h, enc_aux = self.encode(..., return_aux=True)
+logits, z_clf = self.clf(h, return_z=return_z)
+dom_logits = domain_heads(grad_reverse(h, ...))
+```
+
+这样：
+
+- classifier；
+- slide/cancer GRL；
+- MMD；
+- WB；
+- embedding 导出；
+- 其他显式需要 `h` 的路径；
+
+都能通过同一个入口拿到一致的共享表征。
+
+实现后，外部代码不应再通过 `model.gnn(...)` 获取 `h`。当前 WB potential 更新中直接调用 `model.gnn(batch.x, ...)` 的位置必须改为 `model.encode(...)`。
+
+建议模型暴露统一维度字段：
+
+```python
+self.encoder_out_dim = ...
+```
+
+外部所有原来读取 `model.gnn.out_dim` 的地方，应改为读取 `model.encoder_out_dim`。
+
 ---
 
 ## 9. Gene branch 与 Image branch 的建议配置
@@ -520,17 +654,23 @@ out['h_fused'] = h_fused
 建议默认：
 
 ```text
-img_use_pca = True
-img_pca_dim = 128 or 256
+img_use_pca = False
+img_pca_dim = 256  # 仅当显式开启 img_use_pca=1 时生效
 img_num_layers = 2
 img_gnn_hidden = [128, 64] 或 [128, 128]
 ```
 
 原因：
 
-1. image 特征原始维度高，分支更重时显存成本增长明显；
+1. image 特征原始维度由外部图像模型决定，默认保留预处理后的完整图像特征，避免默认 PCA 改变外部图像模型表征；
 2. image branch 在本方案中只提供 residual，不需要比 gene branch 更强；
-3. 多域场景下，较轻 image branch 更利于泛化。
+3. 若显存或速度压力较大，可显式开启 `img_use_pca=1` 并设置 `img_pca_dim=128/256`。
+
+实现要求：
+
+- 不在模型里固定 `in_dim_img`；
+- `in_dim_img` 必须来自 `Xp_img.shape[1]`、`img_pp.out_dim()` 或 `prepare_graphs(...)` 返回的 `input_dims['img_in_dim']`；
+- `img_pca_dim` 只是 PCA 开启时的推荐输出维度，不代表原始图像特征维度。
 
 ### 9.3 LapPE 的使用
 
@@ -617,6 +757,20 @@ return train_graphs, val_graphs, input_dims, n_domains_batch, n_domains_cancer
 
 - 双分支模型不再只有一个输入维度；
 - 若继续只返回 `in_dim`，会造成后续模型初始化含糊。
+- 图像输入维度由图像预处理输出动态决定，不应由配置或代码写死。
+
+推荐取值：
+
+```python
+gene_in_dim = int(Xp_gene.shape[1])
+img_in_dim = int(Xp_img.shape[1]) if use_image_features else None
+```
+
+或者在 image preprocessor 已 fit 后：
+
+```python
+img_in_dim = int(img_pp.out_dim())
+```
 
 ### 10.5 为减少迁移成本的备选方案
 
@@ -626,6 +780,41 @@ return train_graphs, val_graphs, input_dims, n_domains_batch, n_domains_cancer
 - 新增 `img_in_dim` 作为额外返回值
 
 但从长期维护看，`input_dims` 字典更清晰。
+
+### 10.6 subgraph sampler 必须同步支持双分支字段
+
+当前 `sampler.py` 的 static subgraph 逻辑只复制单输入字段：
+
+```text
+x
+edge_index
+edge_weight
+y
+pos
+slide/domain meta
+```
+
+双分支图对象上线后，`split_graph_into_subgraphs(...)` 与 `_clone_full_graph_as_subgraph(...)` 必须同步处理所有 node-level 字段：
+
+```text
+x
+x_gene
+x_img
+img_mask
+pe_gene
+y
+pos
+```
+
+要求：
+
+1. 对节点级 tensor 使用相同 `node_idx_t` 切片；
+2. 对图级 domain/meta 字段继续直接复制；
+3. 如果某个字段不存在，保持兼容，不报错；
+4. 切子图后 `data.x` 仍保持兼容语义，dual branch 下建议为 `data.x_gene`；
+5. 验证 batch 后 `batch.x_gene/batch.x_img/batch.img_mask` 的第一维与 `batch.y` 一致。
+
+否则在 `subgraph_mode=static` 下，训练会退回旧 `data.x` 语义，双分支模型无法稳定运行。
 
 ---
 
@@ -682,6 +871,32 @@ out = model(
 )
 ```
 
+建议训练侧封装一个小 helper，例如：
+
+```python
+def model_forward(model, batch, cfg, **kwargs):
+    if cfg['image_fusion_mode'] == 'dual_branch_residual_gate':
+        return model(
+            edge_index=batch.edge_index,
+            edge_weight=getattr(batch, 'edge_weight', None),
+            batch=getattr(batch, 'batch', None),
+            x_gene=batch.x_gene,
+            x_img=batch.x_img,
+            img_mask=batch.img_mask,
+            pe_gene=getattr(batch, 'pe_gene', None),
+            **kwargs,
+        )
+    return model(
+        batch.x,
+        batch.edge_index,
+        edge_weight=getattr(batch, 'edge_weight', None),
+        batch=getattr(batch, 'batch', None),
+        **kwargs,
+    )
+```
+
+主训练、验证、外部验证、kfold、LOCO 中所有前向都应复用同一 helper，避免局部路径遗漏。
+
 ### 11.3 对齐损失不改接口语义
 
 保持：
@@ -699,7 +914,46 @@ out['h'] == h_fused
 
 原有大部分逻辑无需重写，只要模型前向返回 `h_fused` 即可。
 
-### 11.4 训练监控建议新增
+但 WB 有一个额外约束：当前 potential 更新阶段直接调用 `model.gnn(...)` 计算 detached `h`。该路径必须改为：
+
+```python
+with torch.no_grad():
+    h_detached = model.encode(
+        x=batch.x,
+        x_gene=getattr(batch, 'x_gene', None),
+        x_img=getattr(batch, 'x_img', None),
+        img_mask=getattr(batch, 'img_mask', None),
+        pe_gene=getattr(batch, 'pe_gene', None),
+        edge_index=batch.edge_index,
+        edge_weight=getattr(batch, 'edge_weight', None),
+    )
+```
+
+也就是说，WB potential loss、WB model loss、MMD、GRL、classifier 必须全部基于同一个 `encode(...)` 产出的共享表征。
+
+### 11.4 optimizer 参数组
+
+当前 optimizer 的参数组围绕 `model.gnn/model.clf/domain/support_map` 构建。双分支后必须显式覆盖新模块。
+
+建议：
+
+```text
+early_concat:
+    gnn      -> model.gnn
+    clf      -> model.clf
+    dom      -> model.dom_slide/model.dom_cancer
+
+dual_branch_residual_gate:
+    gnn_gene -> model.gnn_gene
+    gnn_img  -> model.gnn_img
+    fusion   -> model.fusion
+    clf      -> model.clf
+    dom      -> model.dom_slide/model.dom_cancer
+```
+
+WB 的 `support_map` 与 `wb_module` 参数组保持现有设计，但其输入维度应从 `model.encoder_out_dim` 读取，而不是从 `model.gnn.out_dim` 读取。
+
+### 11.5 训练监控建议新增
 
 建议在训练日志中新增以下统计项：
 
@@ -747,6 +1001,8 @@ edge_weight
 gene_in_dim = g.x_gene.shape[1]
 img_in_dim  = g.x_img.shape[1] if cfg['use_image_features'] else None
 ```
+
+这里的 `img_in_dim` 仍然是预处理后的动态维度。推理时必须复用训练产物中的 `img_scaler.joblib` 和可选 `img_pca.joblib`，让 `g.x_img.shape[1]` 与训练时一致。
 
 ### 12.3 gene attribution 的改造
 
@@ -861,18 +1117,29 @@ image_fusion_mode = 'dual_branch_residual_gate'
 - `img_proj`
 - `fusion_gate`
 
-旧 checkpoint 无法严格匹配新模型。
+旧 checkpoint 无法严格匹配新模型。正式训练产物、推理、导出和可视化默认都应使用 `strict=True` 加载。这里不能把 `strict=False` 当作兼容策略，否则旧 checkpoint 可能在新双分支结构中静默加载，导致 image/fusion 模块随机初始化后继续推理。
 
-当前仓库已大量使用：
-
-```python
-load_state_dict(..., strict=False)
-```
-
-这有助于平滑迁移，但仍需在文档和 `meta.json` 中明确：
+要求：
 
 - 旧 gene-only / early-fusion checkpoint 不能直接当作新双分支模型推理使用；
 - 新 checkpoint 必须配合其自身 `cfg` 读取。
+- 推理、批推理、导出、可视化、LOCO checkpoint 评估必须先读取 `meta.json['cfg']['image_fusion_mode']`；
+- 构建模型后，默认 `model.load_state_dict(state_dict, strict=True)`；
+- 如果 key 不匹配，直接报错，要求使用与 checkpoint 同一 `image_fusion_mode` 的模型结构；
+- `strict=False` 只允许用于明确的迁移/调试脚本，不进入常规推理链路。
+
+建议新增一个统一加载 helper：
+
+```python
+def load_stonco_model_from_artifacts(artifacts_dir, cfg, input_dims, device):
+    model = build_model_from_cfg(cfg, input_dims)
+    model.load_state_dict(state_dict, strict=True)
+    return model
+```
+
+这样所有入口共享同一套 checkpoint 加载逻辑，避免某些脚本仍然静默加载错误结构。
+
+如果以后确实需要旧模型到新模型的迁移，应单独写显式 migration helper，并在 helper 内清楚打印或保存 missing/unexpected keys，而不是复用常规推理加载路径。
 
 ---
 
@@ -907,31 +1174,49 @@ fusion_gate_type = 'scalar'
 
 1. [stonco/core/models.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/models.py)
    - 新增 `ResidualGatedFusion`
+   - 新增统一 `encode(...)`
    - 扩展 `STOnco_Classifier`
+   - 新增 `encoder_out_dim`
 
 2. [stonco/core/train.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/train.py)
    - 新增配置项
    - 改 `assemble_pyg`
    - 改 `prepare_graphs`
    - 改训练/验证前向调用
+   - 改 optimizer param groups
+   - 改 WB potential 更新，禁止直接 `model.gnn(...)`
+   - 同步单次训练、kfold、LOCO 内部重复路径
 
-3. [stonco/core/infer.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/infer.py)
+3. [stonco/core/sampler.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/sampler.py)
+   - static subgraph 切片必须保留 `x_gene/x_img/img_mask/pe_gene`
+   - full graph clone 也必须保留双分支字段
+
+4. [stonco/core/infer.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/infer.py)
    - 改组图
    - 改模型构建
+   - 改 checkpoint 校验
    - 改 attribution
 
-4. [stonco/core/batch_infer.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/batch_infer.py)
+5. [stonco/core/batch_infer.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/batch_infer.py)
    - 改组图
    - 改模型调用
+   - 改 checkpoint 校验
 
-5. [stonco/utils/export_spot_embeddings.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/export_spot_embeddings.py)
+6. [stonco/utils/export_spot_embeddings.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/export_spot_embeddings.py)
    - 改组图
    - 改 forward
+   - 改 checkpoint 校验
    - 可选导出 gate
 
-6. [stonco/utils/visualize_prediction.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/visualize_prediction.py)
+7. [stonco/utils/visualize_prediction.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/visualize_prediction.py)
    - 改组图
    - 改 forward
+   - 改 checkpoint 校验
+
+8. [stonco/utils/eval_loco_checkpoints.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/eval_loco_checkpoints.py)
+   - 改组图和模型调用
+   - 复用 `InferenceEngine` 或统一模型加载 helper
+   - 禁止继续假设 `data_g.x` 是唯一输入
 
 ### 15.2 通常无需改动的文件
 
@@ -941,11 +1226,28 @@ fusion_gate_type = 'scalar'
 2. [stonco/utils/preprocessing.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/utils/preprocessing.py)
    - `ImagePreprocessor` 已可复用
 
+3. [stonco/core/train_hpo.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/train_hpo.py)
+   - 本轮先不纳入必改范围
+   - 后续若需要 HPO 支持双分支，再单独补齐返回值与配置搜索空间
+
 ---
 
-## 16. 第一版推荐的具体默认值
+## 16. 第一版推荐的具体配置
 
-建议默认配置：
+全局默认值仍建议保持兼容：
+
+```text
+use_image_features = 0
+image_fusion_mode = early_concat
+```
+
+原因：
+
+- 旧训练命令和旧 NPZ 可以继续运行；
+- 不会要求所有数据都立刻具备 `X_imgs/img_masks/img_feature_names`；
+- early fusion 仍可作为 baseline。
+
+启用双分支实验时，建议使用以下配置：
 
 ```text
 use_image_features = 1
@@ -957,8 +1259,8 @@ gene branch:
     num_layers = 当前配置
 
 image branch:
-    img_use_pca = 1
-    img_pca_dim = 128 或 256
+    img_use_pca = 0
+    img_pca_dim = 256  # 仅当显式开启 img_use_pca=1 时生效
     img_model = 跟随主干
     img_gnn_hidden = 128,64
     img_num_layers = 2
@@ -993,24 +1295,35 @@ WB         -> h_fused
 ### Phase 1: 模型与组图改造
 
 1. 新增 `ResidualGatedFusion`
-2. 扩展 `STOnco_Classifier`
-3. 新增双分支 `assemble_pyg_multimodal`
-4. 跑通训练前向
+2. 新增模型实例方法 `model.encode(...)`
+3. 扩展 `STOnco_Classifier`
+4. 新增双分支 `assemble_pyg_multimodal`
+5. 改 `sampler.py` 的 static subgraph 字段切片
+6. 跑通训练前向
 
-### Phase 2: 推理与导出改造
+### Phase 2: 训练主路径与 checkpoint 改造
+
+1. 改 optimizer param groups
+2. 改 WB potential 更新，统一走 `model.encode(...)`
+3. 改 `model.encoder_out_dim` 相关调用
+4. 新增/复用 checkpoint 严格校验 helper
+5. 同步 `train.py` 单次训练、kfold、LOCO 重复路径
+
+### Phase 3: 推理与导出改造
 
 1. 改 `infer.py`
 2. 改 `batch_infer.py`
 3. 改 `export_spot_embeddings.py`
 4. 改 `visualize_prediction.py`
+5. 改 `eval_loco_checkpoints.py`
 
-### Phase 3: 解释性与诊断
+### Phase 4: 解释性与诊断
 
 1. 重写 gene attribution 路径
 2. 新增 gate 统计
 3. 可选导出 gate 空间图
 
-### Phase 4: 实验与消融
+### Phase 5: 实验与消融
 
 至少比较：
 
@@ -1029,23 +1342,35 @@ WB         -> h_fused
 1. `img_mask=0` 时，`gate==0`
 2. `img_mask=0` 时，`h_fused == h_gene`
 3. batch 后 `x_gene/x_img/img_mask` shape 正确
+4. `model.forward(..., return_h=True)['h']` 与 `model.encode(...)` 输出一致
+5. 代码中不再存在用于获取共享表征的外部 `model.gnn(...)` 调用
 
 ### 18.2 训练行为
 
 1. `avg_gate_mean` 初期较小
 2. 随训练推进，`avg_gate_present` 可上升，但不应迅速饱和到 1
 3. `avg_gate_missing` 应接近 0
+4. dual branch 模式下 optimizer 参数组包含 image branch 与 fusion 参数
+5. WB potential loss 与 WB model loss 使用同一个 `h_fused` 空间
 
 ### 18.3 推理一致性
 
 1. 训练和推理对同一 slide 输出形状一致
 2. `export_spot_embeddings` 能导出 `h_fused`
 3. `visualize_prediction` 能正常画图
+4. `eval_loco_checkpoints.py` 能按 checkpoint 自身 `image_fusion_mode` 正确加载模型
+5. 模式不匹配 checkpoint 会明确报错，而不是静默随机初始化新模块
 
 ### 18.4 解释性
 
 1. gene attribution 仅依赖 `x_gene`
 2. image 分支值变化不会改变 gene attribution 的维度定义
+
+### 18.5 sampler 与重复训练路径
+
+1. `subgraph_mode=static` 下，子图保留 `x_gene/x_img/img_mask/pe_gene`
+2. kfold 路径能完成一次最小训练和保存
+3. LOCO 路径能完成一个癌种的最小训练和 per-slide 评估
 
 ---
 
@@ -1114,334 +1439,212 @@ WB         -> h_fused
 
 ---
 
-## 21. 实现前需确认的事项
+## 21. 已确认实现决策
 
-下面这些点是结合当前文档方案与 STOnco 现有代码后，真正会影响实现路径的确认项。  
-这些点建议你先逐条确认；确认后再开始改代码。
+本节记录最终确认的实现标准。后续代码实现以本节为准；如果前文仍有“建议”措辞，遇到冲突时以本节为准。
 
-### 21.1 是否保留 early fusion 作为并行模式
+### 21.1 模型与融合
 
-当前代码已经完整支持 `use_image_features=1` 的 early fusion 路径，训练、推理、embedding 导出和可视化都已经打通。
-
-需要确认：
-
-1. 是否要在本次实现中 **保留** 现有 early fusion，作为：
-   - baseline
-   - 兼容旧实验
-   - 配置可切换模式
-2. 还是直接用双分支方案替换现有 image fusion 路径？
-
-推荐：
-
-- **保留**
-- 增加 `image_fusion_mode`：
-  - `early_concat`
-  - `dual_branch_residual_gate`
-
-### 21.2 双分支模式下，`h_fused` 是否作为唯一主对齐空间
-
-当前 STOnco 的：
-
-- slide/cancer GRL
-- MMD
-- WB
-
-都是围绕当前 `h` 设计的。
-
-需要确认：
-
-1. 双分支方案中，是否明确规定：
+1. 保留现有类名 `STOnco_Classifier`，本轮不改名为 `STOnco`。
+2. 新增模型实例方法 `model.encode(...)`，作为共享表征 `h` 的唯一出口。
+3. `forward(...)` 内部也必须先调用 `encode(...)` 得到 `h`，再进入分类头和域头。
+4. 所有外部路径禁止直接调用 `model.gnn(...)` 获取共享表征。
+5. 双分支模式下：
    - `out['h'] = h_fused`
-   - 所有现有对齐模块默认继续吃 `h_fused`
-2. 第一版是否完全 **不** 对 `h_img` 单独做 GRL / MMD / WB？
-
-推荐：
-
-- **是**
-- 第一版只对 `h_fused` 做主对齐；
-- 不对 `h_img` 单独加 MMD/WB；
-- `h_img` 的单独对齐如果要做，放到第二阶段。
-
-### 21.3 `ClassifierHead` 是否继续保持现有结构，只把输入从 `h` 改成 `h_fused`
-
-当前 [models.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/models.py) 的分类头是：
-
-```text
-h -> ClassifierHead -> z_clf -> logits
-```
-
-需要确认：
-
-1. 是否保持 `ClassifierHead` 内部结构不变？
-2. 只是将输入从原来的 `h` 改为 `h_fused`？
-
-推荐：
-
-- **保持不变**
-- 只改输入，不改分类头结构；
-- `z_clf` 继续保持当前语义和导出逻辑。
-
-### 21.4 image branch 的 backbone 是否与 gene branch 同类型
-
-当前 `GNNBackbone` 支持：
-
-- `gatv2`
-- `gcn`
-- `sage`
-
-需要确认：
-
-1. image branch 是否默认与 gene branch 使用同一种 GNN 类型？
-2. 还是允许 image branch 独立指定 `img_model`？
-
-推荐：
-
-- 第一版实现上 **允许独立配置**
-- 默认值设为：`img_model = model`
-
-这样：
-
-- 默认情况下实现简单；
-- 后续若需要 image 用更轻模型，不必重构接口。
-
-### 21.5 image branch 的规模是否固定为“更轻”
-
-如果 image branch 直接复制 gene branch 的宽度和深度，显存和过拟合风险都会上升。
-
-需要确认：
-
-1. 第一版是否明确把 image branch 设为比 gene branch 更轻？
-2. 是否接受默认：
-   - `img_num_layers = 2`
-   - `img_gnn_hidden = [128, 64]`
-
-推荐：
-
-- **是**
-- 第一版就固定 image branch 更轻。
-
-### 21.6 LapPE 是否只给 gene branch
-
-当前代码中的 `LapPE` 是围绕单输入 `x` 拼接设计的。
-
-双分支后有两个选择：
-
-1. 只给 gene branch
-2. gene/image 两个分支都给
-
-需要确认：
-
-是否同意第一版：
-
-- gene branch 可继续使用 `LapPE`
-- image branch 不使用 `LapPE`
-
-推荐：
-
-- **同意**
-- 这是第一版最稳的做法。
-
-### 21.7 组图对象是否改为显式双输入字段
-
-当前很多代码路径默认 `data.x` 是唯一输入。
-
-双分支实现时有两个方案：
-
-1. 继续把两路信息塞进一个 `data.x`，在模型里再拆
-2. 图对象显式保存：
-   - `data.x_gene`
-   - `data.x_img`
-   - `data.img_mask`
-
-需要确认：
-
-是否接受第二种显式方案？
-
-推荐：
-
-- **接受**
-- 并且暂时保留 `data.x = data.x_gene` 作为兼容字段
-
-这能显著降低后续维护难度，也更适合 attribution。
-
-### 21.8 `prepare_graphs(...)` 的返回值是否允许改
-
-当前 `prepare_graphs(...)` 返回：
-
-```text
-train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer
-```
-
-双分支后不再只有一个输入维度。
-
-需要确认：
-
-1. 是否允许把返回值改成：
-   - `input_dims = {'gene_in_dim': ..., 'img_in_dim': ...}`
-2. 还是你希望尽量不改返回签名，只新增 `img_in_dim`？
-
-推荐：
-
-- **允许改成 `input_dims` 字典**
-
-这是比较干净的接口。
-
-### 21.9 gene attribution 是否继续“只解释 gene”
-
-当前 [infer.py](/apps/users/sky_luozhihui/STOnco/model/STOnco/stonco/core/infer.py) 的 attribution 实际上是假设 gene 特征在输入前段。
-
-双分支后，需要明确：
-
-1. 是否继续只输出 gene attribution？
-2. 是否不做 image attribution？
-
-推荐：
-
-- **继续只做 gene attribution**
-- 实现方式改为：只对 `x_gene` 求导，`x_img` 和 `img_mask` 视为常量输入
-
-这和你之前的要求最一致，也能保持现有解释性语义。
-
-### 21.10 embedding 导出时，是否只保留 `h_fused` 与 `z_clf`
-
-当前导出脚本主要围绕：
-
-- `h`
-- `z_clf`
-
-双分支后可选导出更多中间量：
-
-- `h_gene`
-- `h_img`
-- `gate`
-
-需要确认：
-
-第一版你希望：
-
-1. 只保留最小集：
-   - `h_fused`
-   - `z_clf`
-2. 还是同时把 `h_gene/h_img/gate` 也做成可选导出？
-
-推荐：
-
-- 第一版最少应支持：
-  - `h_fused`
-  - `z_clf`
-- 另外建议 **增加可选** 的 `gate` 导出
-
-因为 `gate` 对诊断 image shortcut 非常有价值。
-
-### 21.11 是否在训练日志里加入 gate 监控
-
-双分支 residual gate 最常见的问题有两个：
-
-1. `gate≈0`，image branch 白做
-2. `gate≈1`，image branch 过强
-
-需要确认：
-
-是否同意在训练日志和 `hist` 中增加这些指标：
-
-- `avg_gate_mean`
-- `avg_gate_present`
-- `avg_gate_missing`
-- `avg_img_residual_norm`
-
-推荐：
-
-- **同意**
-
-否则实现后不容易判断模型到底有没有正确使用图像分支。
-
-### 21.12 是否接受“第一版不做 image branch 辅助 loss”
-
-有时为了防止 image branch 学空，会给 `h_img` 加一个弱辅助分类头。
-
-但这样会扩大实现面，并引入新的权重超参。
-
-需要确认：
-
-第一版是否接受：
-
-- 不加 image auxiliary head
-- 不加 image auxiliary classification loss
-
-推荐：
-
-- **接受**
-- 先看 residual gate + 主任务 + 现有对齐是否足够。
-
-### 21.13 gate 的具体形式是否确认采用 scalar residual gate
-
-当前文档默认：
+   - `out['h_fused'] = h_fused`
+   - `h_fused` 是 GRL、MMD、WB 的唯一主对齐空间
+6. 第一版不对 `h_img` 单独加 GRL、MMD、WB。
+7. `ClassifierHead` 结构保持不变，只把输入从旧 `h` 改为 `h_fused`。
+8. gate 固定采用 scalar residual gate：
 
 ```text
 g: [N, 1]
-h_fused = h_gene + g ⊙ u_img
+h_fused = h_gene + g * u_img
 ```
 
-需要确认：
+9. gate MLP 最后一层 bias 负初始化，默认 `fusion_gate_bias_init = -2.0`。
+10. 第一版不做 image auxiliary head，也不做 image auxiliary classification loss。
 
-1. 第一版是否固定采用 scalar gate？
-2. 是否同意 gate MLP 最后一层 bias 负初始化，例如 `-2.0`？
+### 21.2 图像特征与 image branch
 
-推荐：
-
-- **固定采用 scalar gate**
-- **同意负 bias 初始化**
-
-这是当前最稳的第一版。
-
-### 21.14 对缺失图像的 hard masking 是否做成强约束
-
-当前文档默认：
+1. 图像特征来自外部图像模型，例如 UNI、ResNet50 或其他 encoder。
+2. 原始 `X_img` 维度不固定，不能在模型里写死 2048、1024、768 等维度。
+3. 模型实际使用的图像输入维度由图像预处理结果动态决定：
 
 ```text
-img_mask = 0 => g = 0 => h_fused = h_gene
+img_in_dim = Xp_img.shape[1] = img_pp.out_dim()
 ```
 
-需要确认：
+4. `img_pca_dim` 只是 PCA 开启时的输出维度配置，不代表原始图像特征维度。
+5. image branch 默认比 gene branch 更轻：
 
-是否把这个逻辑作为实现中的**强约束**，而不是让模型自己学？
+```text
+img_num_layers = 2
+img_gnn_hidden = [128, 64]
+```
 
-推荐：
+6. image branch 允许独立配置 `img_model`，默认 `img_model = model`。
+7. LapPE 第一版只给 gene branch；image branch 不使用 LapPE。
+8. 保留 `ImgProj`，即使 `h_gene` 与 `h_img` 同维也保留投影层。
 
-- **作为强约束**
+### 21.3 缺失图像与 mask
 
-否则会引入不必要的不确定性。
+1. `img_mask` 是图像模态有效性标记：
 
-### 21.15 是否按“分阶段实现”推进
+```text
+img_mask = 1  表示该 spot 有有效图像特征
+img_mask = 0  表示该 spot 缺失图像特征
+```
 
-结合当前代码体量，我建议实现顺序是：
+2. 对缺失图像执行节点级 hard masking，并作为强约束：
 
-1. `models.py + train.py`
-2. `infer.py + batch_infer.py`
-3. `export_spot_embeddings.py + visualize_prediction.py`
-4. attribution 与 gate 诊断
+```text
+img_mask = 0 => gate = 0
+img_mask = 0 => image residual = 0
+img_mask = 0 => h_fused = h_gene
+```
 
-需要确认：
+3. image branch 内部必须做 mask propagation：
 
-是否按这个顺序推进，而不是一次性铺开全部改动？
+```text
+x_img_input = x_img * img_mask
+每层 image hidden 后继续 h_img_layer = h_img_layer * img_mask
+fusion 前 h_img = h_img * img_mask
+u_img = u_img * img_mask
+g = g * img_mask
+```
 
-推荐：
+4. 第一版不做 image GNN 的边级 valid-valid 过滤。缺失节点自身必须被 hard mask；valid-invalid 边过滤留作后续增强。
 
-- **按阶段推进**
+### 21.4 数据对象与接口
 
----
+1. 双分支图对象显式保存：
 
-### 建议你最终确认的最小决策集
+```text
+data.x_gene
+data.x_img
+data.img_mask
+data.pe_gene  # optional
+```
 
-如果你想先快速拍板，至少请确认以下 8 条：
+2. 保留 `data.x = data.x_gene` 作为兼容字段，但新模型前向不依赖 `data.x`。
+3. `prepare_graphs(...)` 返回值改为 `input_dims` 字典：
 
-1. 保留 early fusion 作为并行模式，新增 `image_fusion_mode`
-2. 第一版只把 `GRL / MMD / WB` 放在 `h_fused`
-3. `ClassifierHead` 结构不改，只改输入为 `h_fused`
-4. image branch 比 gene branch 更轻
-5. `LapPE` 只给 gene branch
-6. 图对象改为 `x_gene/x_img/img_mask` 显式字段，并保留 `data.x=data.x_gene` 兼容
-7. attribution 继续只解释 gene
-8. gate 采用 scalar residual gate，并对缺失图像做 hard masking
+```python
+input_dims = {
+    'gene_in_dim': int(...),
+    'img_in_dim': int(...) or None,
+}
+```
 
-待你确认这些点后，再开始代码实现。
+4. `sampler.py` 的 static subgraph 和 full graph clone 必须保留所有 node-level 字段：
+
+```text
+x
+x_gene
+x_img
+img_mask
+pe_gene
+y
+pos
+```
+
+### 21.5 训练、导出与解释性
+
+1. optimizer 参数组必须显式覆盖：
+
+```text
+gnn_gene
+gnn_img
+fusion
+clf
+dom_slide/dom_cancer
+```
+
+2. WB potential 更新必须改走 `model.encode(...)`，不能再直接调用 `model.gnn(...)`。
+3. WB、MMD、GRL、classifier、embedding 导出必须使用同一个 `h_fused` 空间。
+4. embedding 导出第一版至少支持：
+
+```text
+h_fused
+z_clf
+```
+
+5. `gate` 做成可选导出，用于诊断 image shortcut。
+6. gene attribution 继续只解释 gene：
+   - 只对 `x_gene` 求导
+   - `x_img` 和 `img_mask` 作为常量输入
+   - 第一版不做 image attribution
+7. 训练日志和 `hist` 增加 gate 诊断指标：
+
+```text
+avg_gate_mean
+avg_gate_present
+avg_gate_missing
+avg_img_residual_norm
+```
+
+### 21.6 兼容与 checkpoint
+
+1. 保留 early fusion 作为并行 baseline，通过 `image_fusion_mode` 切换：
+
+```text
+early_concat
+dual_branch_residual_gate
+```
+
+2. 全局默认保持兼容：
+
+```text
+use_image_features = 0
+image_fusion_mode = early_concat
+```
+
+3. 启用双分支时显式配置：
+
+```text
+use_image_features = 1
+image_fusion_mode = dual_branch_residual_gate
+```
+
+4. 常规训练产物、推理、导出、可视化默认使用：
+
+```python
+model.load_state_dict(state_dict, strict=True)
+```
+
+5. 旧 early-fusion/gene-only checkpoint 只能按其自身 `image_fusion_mode` 加载，不自动升级为 dual branch。
+6. `strict=False` 只允许用于单独的迁移/调试 helper，不进入常规链路。
+
+### 21.7 本轮范围
+
+本轮必须覆盖：
+
+1. `models.py`
+2. `train.py`
+3. `sampler.py`
+4. `infer.py`
+5. `batch_infer.py`
+6. `export_spot_embeddings.py`
+7. `visualize_prediction.py`
+8. `eval_loco_checkpoints.py`
+
+`train.py` 内部的单次训练、kfold、LOCO 重复路径都必须同步。
+
+本轮明确不处理：
+
+```text
+train_hpo.py
+```
+
+因此本轮不保证 HPO 路径在 dual branch 模式下可用，后续单独适配。
+
+### 21.8 实现顺序
+
+按阶段推进：
+
+1. `models.py + train.py + sampler.py`
+2. 统一 checkpoint 加载校验
+3. `infer.py + batch_infer.py`
+4. `export_spot_embeddings.py + visualize_prediction.py + eval_loco_checkpoints.py`
+5. attribution 与 gate 诊断

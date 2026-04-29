@@ -1,7 +1,7 @@
 import argparse, os, numpy as np, torch
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
-from stonco.utils.utils import load_json, load_model_state_dict, normalize_gnn_config
-from .models import STOnco_Classifier
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_feature_fields, get_image_fusion_mode
+from stonco.utils.utils import load_json, normalize_gnn_config, normalize_gnn_hidden
+from .model_utils import build_stonco_model_from_cfg, graph_input_dims, load_model_strict, model_forward_kwargs
 from torch_geometric.data import Data as PyGData
 import pandas as pd
 
@@ -32,19 +32,35 @@ class InferenceEngine:
         self.cfg['dom_dropout'] = float(self.cfg['dropout'] if self.cfg.get('dom_dropout', None) is None else self.cfg['dom_dropout'])
         self.cfg.setdefault('clf_hidden', [256, 128, 64])
         self.cfg.setdefault('use_image_features', False)
-        self.cfg.setdefault('img_use_pca', True)
+        self.cfg.setdefault('image_fusion_mode', 'early_concat')
+        self.cfg.setdefault('img_use_pca', False)
         self.cfg.setdefault('img_pca_dim', 256)
+        self.cfg.setdefault('img_gnn_hidden', [128, 64])
+        self.cfg.setdefault('img_num_layers', 2)
+        self.cfg.setdefault('img_model', self.cfg.get('model', 'gatv2'))
+        self.cfg.setdefault('img_heads', self.cfg.get('heads', 4))
+        self.cfg.setdefault('img_dropout', self.cfg.get('gnn_dropout', self.cfg.get('dropout', 0.3)))
+        self.cfg.setdefault('fusion_gate_hidden', 128)
+        self.cfg.setdefault('fusion_dropout', 0.0)
         clf_hidden = self.cfg.get('clf_hidden', [256, 128, 64])
         if isinstance(clf_hidden, str):
             clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
         self.cfg['clf_hidden'] = [int(x) for x in clf_hidden]
         self.cfg.setdefault('clf_latent_dim', int(self.cfg['clf_hidden'][-1]))
         self.cfg = normalize_gnn_config(self.cfg)
+        self.cfg['image_fusion_mode'] = get_image_fusion_mode(self.cfg)
+        img_hidden, img_layers = normalize_gnn_hidden(
+            gnn_hidden=self.cfg.get('img_gnn_hidden', [128, 64]),
+            num_layers=self.cfg.get('img_num_layers', 2),
+            default_gnn_hidden=(128, 64),
+        )
+        self.cfg['img_gnn_hidden'] = [int(v) for v in img_hidden]
+        self.cfg['img_num_layers'] = int(img_layers)
 
         self.pp = Preprocessor.load(artifacts_dir)
         self.img_pp = None
         if bool(self.cfg.get('use_image_features', False)):
-            self.img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(self.cfg.get('img_use_pca', True)))
+            self.img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(self.cfg.get('img_use_pca', False)))
         self.device = torch.device(device) if isinstance(device, str) else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
         # 构建一个dummy图以确定输入维度
@@ -58,19 +74,8 @@ class InferenceEngine:
                 clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
             clf_hidden = [int(x) for x in clf_hidden]
             self.cfg['clf_latent_dim'] = int(clf_hidden[-1])
-            m = STOnco_Classifier(
-                in_dim=in_dim,
-                hidden=self.cfg['GNN_hidden'],
-                num_layers=self.cfg['num_layers'],
-                dropout=self.cfg['dropout'],
-                gnn_dropout=self.cfg.get('gnn_dropout', self.cfg.get('dropout', 0.3)),
-                clf_dropout=self.cfg.get('clf_dropout', self.cfg.get('dropout', 0.3)),
-                dom_dropout=self.cfg.get('dom_dropout', self.cfg.get('dropout', 0.3)),
-                model=self.cfg['model'],
-                heads=self.cfg.get('heads', 4),
-                clf_hidden=clf_hidden,
-            )
-            _ = m.load_state_dict(load_model_state_dict(self.artifacts_dir, map_location=self.device), strict=False)
+            m = build_stonco_model_from_cfg(in_dim, self.cfg)
+            load_model_strict(m, self.artifacts_dir, map_location=self.device)
             self.model = m.to(self.device)
             self.model.eval()
         return self.model
@@ -84,28 +89,36 @@ class InferenceEngine:
                            use_gaussian_weights=self.cfg.get('lap_pe_use_gaussian', False))
         else:
             pe = None
-        x = build_node_features_early_fusion(Xp_gene, self.cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
-        data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
-        data.num_nodes = x.shape[0]
+        fields = build_node_feature_fields(Xp_gene, self.cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+        data = PyGData(x=torch.from_numpy(fields['x']).float(), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
+        if 'x_gene' in fields:
+            data.x_gene = torch.from_numpy(fields['x_gene']).float()
+        if 'x_img' in fields:
+            data.x_img = torch.from_numpy(fields['x_img']).float()
+        if 'img_mask' in fields:
+            data.img_mask = torch.from_numpy(fields['img_mask']).float()
+        if 'pe_gene' in fields:
+            data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+        data.num_nodes = fields['x'].shape[0]
         return data
 
     def predict_proba(self, g: PyGData) -> np.ndarray:
         g = g.to(self.device)
-        self.build_model_if_needed(g.x.shape[1])
+        self.build_model_if_needed(graph_input_dims(g))
         with torch.no_grad():
-            out = self.model(g.x, g.edge_index, batch=getattr(g, 'batch', None), edge_weight=getattr(g, 'edge_weight', None))
+            out = self.model(**model_forward_kwargs(g))
             probs = torch.sigmoid(out['logits']).detach().cpu().numpy()
         return probs
 
     def compute_gene_attr_for_graph(self, g: PyGData, method: str = 'ig', ig_steps: int = 50) -> np.ndarray:
         # 仅对基因特征部分求导（考虑PCA反投影）
-        self.build_model_if_needed(g.x.shape[1])
+        self.build_model_if_needed(graph_input_dims(g))
         device = self.device
         pp = self.pp
         use_pca = bool(getattr(pp, 'use_pca', True) and getattr(pp, 'pca', None) is not None)
         feat_dim_gene = (int(pp.pca.n_components_) if use_pca else len(pp.hvg))
         gx = g.to(device)
-        x = gx.x
+        x = gx.x_gene if hasattr(gx, 'x_gene') else gx.x
         edge_index = gx.edge_index
         edge_weight = getattr(gx, 'edge_weight', None)
         x_in = x.detach().clone()
@@ -119,7 +132,10 @@ class InferenceEngine:
                 alpha = float(s) / float(steps)
                 x_step = baseline + delta * alpha
                 x_step = x_step.detach().requires_grad_(True)
-                out = self.model(x_step, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight)
+                if hasattr(gx, 'x_gene'):
+                    out = self.model(gx.x, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight, x_gene=x_step, x_img=gx.x_img, img_mask=gx.img_mask, pe_gene=getattr(gx, 'pe_gene', None))
+                else:
+                    out = self.model(x_step, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight)
                 logits = out['logits']
                 loss = logits.sum()
                 grad = torch.autograd.grad(loss, x_step, retain_graph=False)[0]
@@ -129,7 +145,10 @@ class InferenceEngine:
             attr_feat_graph = attr_feat.abs().mean(dim=0)
         else:
             x_sal = x_in.detach().clone().requires_grad_(True)
-            out = self.model(x_sal, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight)
+            if hasattr(gx, 'x_gene'):
+                out = self.model(gx.x, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight, x_gene=x_sal, x_img=gx.x_img, img_mask=gx.img_mask, pe_gene=getattr(gx, 'pe_gene', None))
+            else:
+                out = self.model(x_sal, edge_index, batch=getattr(gx, 'batch', None), edge_weight=edge_weight)
             logits = out['logits']
             loss = logits.sum()
             grad = torch.autograd.grad(loss, x_sal, retain_graph=False)[0]
@@ -155,9 +174,17 @@ def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
-    data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
-    data.num_nodes = x.shape[0]
+    fields = build_node_feature_fields(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+    data = PyGData(x=torch.from_numpy(fields['x']).float(), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float())
+    if 'x_gene' in fields:
+        data.x_gene = torch.from_numpy(fields['x_gene']).float()
+    if 'x_img' in fields:
+        data.x_img = torch.from_numpy(fields['x_img']).float()
+    if 'img_mask' in fields:
+        data.img_mask = torch.from_numpy(fields['img_mask']).float()
+    if 'pe_gene' in fields:
+        data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+    data.num_nodes = fields['x'].shape[0]
     return data
 
 def main():

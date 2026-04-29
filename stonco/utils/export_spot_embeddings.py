@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from stonco.utils.utils import load_json, load_model_state_dict, normalize_gnn_config
+from stonco.utils.preprocessing import build_node_feature_fields, get_image_fusion_mode
+from stonco.utils.utils import load_json, normalize_gnn_config, normalize_gnn_hidden
+from stonco.core.model_utils import build_stonco_model_from_cfg, graph_input_dims, load_model_strict, model_forward_kwargs
 
 
 def _resolve_batch_id(sample_id: str, id2batch: dict) -> str:
@@ -40,7 +42,7 @@ def _assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.nda
     import torch
     from torch_geometric.data import Data as PyGData
 
-    from stonco.utils.preprocessing import GraphBuilder, build_node_features_early_fusion
+    from stonco.utils.preprocessing import GraphBuilder
 
     gb = GraphBuilder(knn_k=int(cfg['knn_k']), gaussian_sigma_factor=float(cfg['gaussian_sigma_factor']))
     edge_index, edge_weight, _ = gb.build_knn(xy)
@@ -54,13 +56,21 @@ def _assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.nda
         )
     else:
         pe = None
-    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+    fields = build_node_feature_fields(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
-        x=torch.from_numpy(x),
+        x=torch.from_numpy(fields['x']).float(),
         edge_index=torch.from_numpy(edge_index).long(),
         edge_weight=torch.from_numpy(edge_weight).float(),
     )
-    data.num_nodes = x.shape[0]
+    if 'x_gene' in fields:
+        data.x_gene = torch.from_numpy(fields['x_gene']).float()
+    if 'x_img' in fields:
+        data.x_img = torch.from_numpy(fields['x_img']).float()
+    if 'img_mask' in fields:
+        data.img_mask = torch.from_numpy(fields['img_mask']).float()
+    if 'pe_gene' in fields:
+        data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+    data.num_nodes = fields['x'].shape[0]
     return data
 
 
@@ -179,8 +189,6 @@ def run_export(args: argparse.Namespace) -> str:
     from stonco.utils.preprocessing import ImagePreprocessor, Preprocessor
     import torch
 
-    from stonco.core.models import STOnco_Classifier
-
     has_any_input = any([
         args.train_npz is not None,
         bool(args.npz),
@@ -218,21 +226,37 @@ def run_export(args: argparse.Namespace) -> str:
     cfg['dom_dropout'] = float(cfg['dropout'] if cfg.get('dom_dropout', None) is None else cfg['dom_dropout'])
     cfg.setdefault('clf_hidden', [256, 128, 64])
     cfg.setdefault('use_image_features', False)
-    cfg.setdefault('img_use_pca', True)
+    cfg.setdefault('image_fusion_mode', 'early_concat')
+    cfg.setdefault('img_use_pca', False)
     cfg.setdefault('img_pca_dim', 256)
+    cfg.setdefault('img_gnn_hidden', [128, 64])
+    cfg.setdefault('img_num_layers', 2)
+    cfg.setdefault('img_model', cfg.get('model', 'gatv2'))
+    cfg.setdefault('img_heads', cfg.get('heads', 4))
+    cfg.setdefault('img_dropout', cfg.get('gnn_dropout', cfg.get('dropout', 0.3)))
+    cfg.setdefault('fusion_gate_hidden', 128)
+    cfg.setdefault('fusion_dropout', 0.0)
     clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
     if isinstance(clf_hidden, str):
         clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
     cfg['clf_hidden'] = [int(x) for x in clf_hidden]
     cfg.setdefault('clf_latent_dim', int(cfg['clf_hidden'][-1]))
     cfg = normalize_gnn_config(cfg)
+    cfg['image_fusion_mode'] = get_image_fusion_mode(cfg)
+    img_hidden, img_layers = normalize_gnn_hidden(
+        gnn_hidden=cfg.get('img_gnn_hidden', [128, 64]),
+        num_layers=cfg.get('img_num_layers', 2),
+        default_gnn_hidden=(128, 64),
+    )
+    cfg['img_gnn_hidden'] = [int(v) for v in img_hidden]
+    cfg['img_num_layers'] = int(img_layers)
 
     pp = Preprocessor.load(artifacts_dir)
     use_image_features = bool(cfg.get('use_image_features', False))
     img_pp = None
     expected_img_feature_names = None
     if use_image_features:
-        img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', True)))
+        img_pp = ImagePreprocessor.load(artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', False)))
         expected_img_feature_names = img_pp.feature_names
         if not expected_img_feature_names:
             raise ValueError('use_image_features=1 but artifacts_dir/img_feature_names.txt is missing or empty.')
@@ -289,22 +313,10 @@ def run_export(args: argparse.Namespace) -> str:
                 g = _assemble_pyg(Xp_gene, xy, cfg).to(device)
 
             if model is None:
-                in_dim = int(g.x.shape[1])
                 clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
                 cfg['clf_latent_dim'] = int(clf_hidden[-1])
-                m = STOnco_Classifier(
-                    in_dim=in_dim,
-                    hidden=cfg['GNN_hidden'],
-                    num_layers=int(cfg['num_layers']),
-                    dropout=float(cfg['dropout']),
-                    gnn_dropout=float(cfg.get('gnn_dropout', cfg.get('dropout', 0.3))),
-                    clf_dropout=float(cfg.get('clf_dropout', cfg.get('dropout', 0.3))),
-                    dom_dropout=float(cfg.get('dom_dropout', cfg.get('dropout', 0.3))),
-                    model=str(cfg['model']),
-                    heads=int(cfg.get('heads', 4)),
-                    clf_hidden=clf_hidden,
-                )
-                _ = m.load_state_dict(load_model_state_dict(artifacts_dir, map_location=device), strict=False)
+                m = build_stonco_model_from_cfg(graph_input_dims(g), cfg)
+                load_model_strict(m, artifacts_dir, map_location=device)
                 model = m.to(device)
                 model.eval()
 
@@ -312,10 +324,7 @@ def run_export(args: argparse.Namespace) -> str:
                 need_z = (args.embed_source in ('z_clf', 'z64'))
                 need_h = (args.embed_source == 'h')
                 out = model(
-                    g.x,
-                    g.edge_index,
-                    batch=getattr(g, 'batch', None),
-                    edge_weight=getattr(g, 'edge_weight', None),
+                    **model_forward_kwargs(g),
                     return_z=need_z,
                     return_h=need_h,
                 )

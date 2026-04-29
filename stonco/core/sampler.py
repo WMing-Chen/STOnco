@@ -340,6 +340,7 @@ def split_graph_into_subgraphs(graph, knn_k, gaussian_sigma_factor, target_spots
             edge_weight=torch.from_numpy(edge_weight).float(),
             y=graph.y[node_idx_t].clone(),
         )
+        _copy_node_level_fields(graph, sub, node_idx_t)
         sub.num_nodes = int(node_idx_t.numel())
         sub.pos = torch.from_numpy(coords_sub).float()
         sub.slide_id = f"{parent_slide_id}__sg{idx:03d}"
@@ -360,6 +361,7 @@ def _clone_full_graph_as_subgraph(graph, parent_slide_id, idx):
         edge_weight=graph.edge_weight.clone() if hasattr(graph, 'edge_weight') and graph.edge_weight is not None else None,
         y=graph.y.clone(),
     )
+    _copy_node_level_fields(graph, cloned, None)
     cloned.num_nodes = int(graph.num_nodes if hasattr(graph, 'num_nodes') else graph.x.size(0))
     cloned.pos = graph.pos.clone()
     cloned.slide_id = f"{parent_slide_id}__sg{idx:03d}"
@@ -370,6 +372,18 @@ def _clone_full_graph_as_subgraph(graph, parent_slide_id, idx):
     if hasattr(graph, 'cancer_dom'):
         cloned.cancer_dom = graph.cancer_dom.clone()
     return cloned
+
+
+def _copy_node_level_fields(src, dst, node_idx_t=None):
+    for name in ('x_gene', 'x_img', 'img_mask', 'pe_gene'):
+        if not hasattr(src, name):
+            continue
+        value = getattr(src, name)
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            copied = value.clone() if node_idx_t is None else value[node_idx_t].clone()
+            setattr(dst, name, copied)
 
 
 def _partition_spatial_indices(coords, target_spots=1000, min_spots=300):

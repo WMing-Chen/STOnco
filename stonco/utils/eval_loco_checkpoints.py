@@ -4,8 +4,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-
 from stonco.core.infer import InferenceEngine
 from stonco.utils.utils import load_json
 
@@ -170,17 +168,7 @@ def _predict_probs_for_slide(engine: InferenceEngine, slide: dict, gene_names: l
     else:
         data_g = engine.assemble_pyg(Xp_gene, slide["xy"])
 
-    data_g = data_g.to(engine.device)
-    engine.build_model_if_needed(data_g.x.shape[1])
-    with torch.no_grad():
-        out = engine.model(
-            data_g.x,
-            data_g.edge_index,
-            batch=getattr(data_g, "batch", None),
-            edge_weight=getattr(data_g, "edge_weight", None),
-        )
-        probs = torch.sigmoid(out["logits"]).detach().cpu().numpy()
-    return probs
+    return engine.predict_proba(data_g)
 
 
 def main():
@@ -189,7 +177,7 @@ def main():
     p.add_argument("--train_npz", required=True)
     p.add_argument("--epochs", default="50,100", help="Comma-separated checkpoint epochs, e.g. 50,100")
     p.add_argument("--out_dir", default=None, help="Default: <run_dir>/loco_eval/checkpoint_eval_<epochs>")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default=None)
     p.add_argument("--num_threads", type=int, default=None)
     p.add_argument("--cancers", default=None, help="Optional comma-separated cancer fold subset, e.g. BRCA,CRC")
     p.add_argument("--skip_if_complete", action="store_true", help="Skip if output summary already exists.")

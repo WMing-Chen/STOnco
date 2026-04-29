@@ -5,9 +5,8 @@ import numpy as np
 import torch
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder, build_node_features_early_fusion
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, build_node_feature_fields
 from stonco.utils.utils import load_json
-from .models import STOnco_Classifier
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 from stonco.utils.plot_accuracy_bars import plot_accuracy_bars
 # 新增：导入推理引擎
@@ -24,13 +23,21 @@ def assemble_pyg(Xp_gene: np.ndarray, xy: np.ndarray, cfg: dict, Xp_img: np.ndar
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+    fields = build_node_feature_fields(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
-        x=torch.from_numpy(x),
+        x=torch.from_numpy(fields['x']).float(),
         edge_index=torch.from_numpy(edge_index).long(),
         edge_weight=torch.from_numpy(edge_weight).float(),
     )
-    data.num_nodes = x.shape[0]
+    if 'x_gene' in fields:
+        data.x_gene = torch.from_numpy(fields['x_gene']).float()
+    if 'x_img' in fields:
+        data.x_img = torch.from_numpy(fields['x_img']).float()
+    if 'img_mask' in fields:
+        data.img_mask = torch.from_numpy(fields['img_mask']).float()
+    if 'pe_gene' in fields:
+        data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+    data.num_nodes = fields['x'].shape[0]
     return data
 
 # 新增：基于文件列表的 Dataset，将 NPZ 读取、预处理与图构建放入 __getitem__，以便 DataLoader 多进程并行

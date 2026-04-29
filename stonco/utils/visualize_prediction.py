@@ -31,9 +31,9 @@ from torch_geometric.data import Data as PyGData
 # 新增：读取验证集坐标与标签
 import pandas as pd
 
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
-from stonco.core.models import STOnco_Classifier
-from stonco.utils.utils import load_model_state_dict, load_json, normalize_gnn_config
+from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_feature_fields, get_image_fusion_mode
+from stonco.core.model_utils import build_stonco_model_from_cfg, graph_input_dims, load_model_strict, model_forward_kwargs
+from stonco.utils.utils import load_json, normalize_gnn_config, normalize_gnn_hidden
 
 
 def transform_xy(
@@ -90,13 +90,21 @@ def assemble_pyg(Xp_gene, xy, cfg, Xp_img=None, img_mask=None):
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+    fields = build_node_feature_fields(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
     data = PyGData(
-        x=torch.from_numpy(x),
+        x=torch.from_numpy(fields['x']).float(),
         edge_index=torch.from_numpy(edge_index).long(),
         edge_weight=torch.from_numpy(edge_weight).float(),
     )
-    data.num_nodes = x.shape[0]
+    if 'x_gene' in fields:
+        data.x_gene = torch.from_numpy(fields['x_gene']).float()
+    if 'x_img' in fields:
+        data.x_img = torch.from_numpy(fields['x_img']).float()
+    if 'img_mask' in fields:
+        data.img_mask = torch.from_numpy(fields['img_mask']).float()
+    if 'pe_gene' in fields:
+        data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+    data.num_nodes = fields['x'].shape[0]
     return data
 
 
@@ -298,14 +306,30 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     cfg.setdefault('use_edge_attr', False)
     cfg.setdefault('clf_hidden', [256, 128, 64])
     cfg.setdefault('use_image_features', False)
-    cfg.setdefault('img_use_pca', True)
+    cfg.setdefault('image_fusion_mode', 'early_concat')
+    cfg.setdefault('img_use_pca', False)
     cfg.setdefault('img_pca_dim', 256)
+    cfg.setdefault('img_gnn_hidden', [128, 64])
+    cfg.setdefault('img_num_layers', 2)
+    cfg.setdefault('img_model', cfg.get('model', 'gatv2'))
+    cfg.setdefault('img_heads', cfg.get('heads', 4))
+    cfg.setdefault('img_dropout', cfg.get('gnn_dropout', cfg.get('dropout', 0.3)))
+    cfg.setdefault('fusion_gate_hidden', 128)
+    cfg.setdefault('fusion_dropout', 0.0)
     clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
     if isinstance(clf_hidden, str):
         clf_hidden = [int(x.strip()) for x in clf_hidden.split(',') if x.strip() != '']
     cfg['clf_hidden'] = [int(x) for x in clf_hidden]
     cfg.setdefault('clf_latent_dim', int(cfg['clf_hidden'][-1]))
     cfg = normalize_gnn_config(cfg)
+    cfg['image_fusion_mode'] = get_image_fusion_mode(cfg)
+    img_hidden, img_layers = normalize_gnn_hidden(
+        gnn_hidden=cfg.get('img_gnn_hidden', [128, 64]),
+        num_layers=cfg.get('img_num_layers', 2),
+        default_gnn_hidden=(128, 64),
+    )
+    cfg['img_gnn_hidden'] = [int(v) for v in img_hidden]
+    cfg['img_num_layers'] = int(img_layers)
 
     # 若单切片 npz 无 y，尝试从验证集目录读取 true_label
     if y is None and args.val_root is not None:
@@ -321,7 +345,7 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     pp = Preprocessor.load(args.artifacts_dir)
     Xp_gene = pp.transform(X, gene_names)
     if bool(cfg.get('use_image_features', False)):
-        img_pp = ImagePreprocessor.load(args.artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', True)))
+        img_pp = ImagePreprocessor.load(args.artifacts_dir, img_use_pca=bool(cfg.get('img_use_pca', False)))
         expected = img_pp.feature_names
         if not expected:
             raise ValueError('use_image_features=1 but artifacts_dir/img_feature_names.txt is missing or empty.')
@@ -339,31 +363,19 @@ def visualize_slide(X, xy, gene_names, sid, y, cfg, args, out_svg, X_img=None, i
     else:
         data_g = assemble_pyg(Xp_gene, xy, cfg)
 
-    # 构建与加载模型（统一使用 SpotoncoGNNClassifier）
+    # 构建与加载模型
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    in_dim = data_g.x.shape[1]
     clf_hidden = cfg.get('clf_hidden', [256, 128, 64])
     cfg['clf_latent_dim'] = int(clf_hidden[-1])
-    model = STOnco_Classifier(
-        in_dim=in_dim,
-        hidden=cfg['GNN_hidden'],
-        num_layers=cfg['num_layers'],
-        dropout=cfg['dropout'],
-        gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
-        clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
-        dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
-        model=cfg['model'],
-        heads=cfg.get('heads', 4),
-        clf_hidden=clf_hidden,
-    )
-    _ = model.load_state_dict(load_model_state_dict(args.artifacts_dir, map_location=device), strict=False)
+    model = build_stonco_model_from_cfg(graph_input_dims(data_g), cfg)
+    load_model_strict(model, args.artifacts_dir, map_location=device)
     model = model.to(device)
     model.eval()
 
     # 预测概率
     with torch.no_grad():
         g = data_g.to(device)
-        out = model(g.x, g.edge_index, batch=getattr(g, 'batch', None), edge_weight=getattr(g, 'edge_weight', None))
+        out = model(**model_forward_kwargs(g))
         logits = out['logits']
         probs = torch.sigmoid(logits).cpu().numpy()
     pred = (probs >= args.threshold).astype(int)

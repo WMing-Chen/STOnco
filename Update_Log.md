@@ -1,5 +1,45 @@
 # Update Log
 
+## 2026-04-28
+
+- 更新内容：双分支图像融合训练曲线新增 `image_fusion_metrics.svg`。
+- 代码影响：
+  - 开启残差门控双 GNN 图像融合且 gate/residual 诊断有有效值时，训练结束会自动保存 2x2 图像诊断图
+  - 子图依次为 `avg_gate_mean`、`avg_gate_present`、`avg_gate_missing`、`avg_img_residual_norm`
+  - 单次训练、KFold、LOCO 和额外 epoch checkpoint 的曲线保存路径均同步支持；非双分支或指标全为 NaN 时不生成空图
+
+## 2026-04-28 00:16:00 CST
+
+- 更新内容：新增残差门控双 GNN 图像融合路径，并保留 early-fusion / gene-only 兼容路径。
+- 代码影响：
+  - `STOnco_Classifier` 新增统一 `encode(...)` 接口；`forward(...)` 内部也通过 `encode(...)` 获取共享表征 `h`，外部训练、推理、导出和 WB/MMD 路径不再直接调用 `model.gnn(...)` 获取 `h`
+  - 新增 `image_fusion_mode={early_concat,dual_branch_residual_gate}`；双分支模式使用 `x_gene -> gnn_gene`、`x_img -> gnn_img`、`ResidualGatedFusion` 得到 `h_fused`
+  - image branch 做节点级 hard mask propagation：`img_mask=0` 时图像输入、image hidden、gate 与 image residual 均为 0，模型退化为 gene-only 表征
+  - `train.py` 的单次训练、KFold、LOCO 路径同步支持双分支输入维度和模型构建；optimizer param groups 显式覆盖 `gnn_gene/gnn_img/fusion/clf/domain`
+  - WB potential 更新阶段改为调用 `model.encode(...)`，不再绕过模型结构直接调用 `model.gnn(...)`
+  - `sampler.py` 的 static subgraph 切片同步保留 `x_gene/x_img/img_mask/pe_gene`
+  - 推理、批推理、embedding 导出、预测可视化和 LOCO checkpoint 评估按 `meta.json:cfg.image_fusion_mode` 构建模型，并默认 `strict=True` 加载 checkpoint
+  - 图像预处理默认改为不使用 PCA：`img_use_pca=0`；如需降维需显式传 `--img_use_pca 1 --img_pca_dim N`
+  - `loss_components.csv` 新增门控诊断列：`avg_gate_mean`、`avg_gate_present`、`avg_gate_missing`、`avg_img_residual_norm`
+- 涉及文件：
+  - `stonco/core/models.py`
+  - `stonco/core/model_utils.py`
+  - `stonco/core/train.py`
+  - `stonco/core/sampler.py`
+  - `stonco/core/infer.py`
+  - `stonco/core/batch_infer.py`
+  - `stonco/utils/preprocessing.py`
+  - `stonco/utils/export_spot_embeddings.py`
+  - `stonco/utils/visualize_prediction.py`
+  - `stonco/utils/eval_loco_checkpoints.py`
+  - `docs/PLAN_residual_gated_dual_gnn_image_fusion_STOnco.md`
+  - `docs/Tutorial.md`
+- 说明：
+  - 当前保留类名 `STOnco_Classifier`，未改名为 `STOnco`
+  - 双分支第一版使用 scalar residual gate，不启用 vector gate、image auxiliary loss 或 image-specific MMD/WB
+  - `train_hpo.py` 本轮未同步该双分支改造
+  - 已完成模型级 smoke test、图组装/sampler smoke test、1 epoch dual-branch 训练 smoke test 和 strict checkpoint 推理 smoke test
+
 ## 2026-04-18 13:35:58 CST
 
 - 更新内容：完成 generated-support WB 的 `sinkhorn_divergence` 主损失落地，并补充 LOCO embedding 可视化与三角形高亮诊断脚本。

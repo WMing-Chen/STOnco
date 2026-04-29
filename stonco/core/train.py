@@ -1,6 +1,16 @@
 import argparse, os, numpy as np, torch, math, itertools, shutil
-from stonco.utils.preprocessing import Preprocessor, GraphBuilder, ImagePreprocessor, build_node_features_early_fusion
-from .models import STOnco_Classifier
+from stonco.utils.preprocessing import (
+    Preprocessor,
+    GraphBuilder,
+    ImagePreprocessor,
+    build_node_feature_fields,
+    get_image_fusion_mode,
+)
+from .model_utils import (
+    build_stonco_model_from_cfg as _build_stonco_model_from_cfg,
+    graph_input_dims as _graph_input_dims,
+    model_forward_kwargs as _shared_model_forward_kwargs,
+)
 from .wb_potentials import GeneratedSupportMap, GeneratedSupportWBLoss
 from .sampler import (
     CancerBalancedBatchSampler,
@@ -8,7 +18,7 @@ from .sampler import (
     normalize_sampler_config,
     summarize_batches,
 )
-from stonco.utils.utils import normalize_gnn_config, save_model, save_json, load_json
+from stonco.utils.utils import normalize_gnn_config, normalize_gnn_hidden, save_model, save_json, load_json
 from torch_geometric.data import Data as PyGData, DataLoader as PyGDataLoader
 import torch.nn.functional as F
 import torch.nn as nn
@@ -200,6 +210,7 @@ def _save_extra_epoch_checkpoints(
             if hist_epoch is not None and len(hist_epoch.get('avg_total_loss', [])) > 0:
                 if save_train_curves:
                     _plot_train_metrics(hist_epoch, epoch_dir)
+                    _plot_image_fusion_metrics(hist_epoch, epoch_dir)
                     _plot_domain_diagnostics(hist_epoch, epoch_dir, **domain_plot_kwargs)
                     if bool(cfg.get('use_wb_align', False)):
                         _plot_wb_train_metrics(hist_epoch, epoch_dir)
@@ -297,11 +308,47 @@ def assemble_pyg(Xp_gene, xy, y, cfg, Xp_img=None, img_mask=None):
                        use_gaussian_weights=cfg.get('lap_pe_use_gaussian', False))
     else:
         pe = None
-    x = build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
-    data = PyGData(x=torch.from_numpy(x), edge_index=torch.from_numpy(edge_index).long(), edge_weight=torch.from_numpy(edge_weight).float(), y=torch.from_numpy(y).long())
-    data.num_nodes = x.shape[0]
+    fields = build_node_feature_fields(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)
+    data = PyGData(
+        x=torch.from_numpy(fields['x']).float(),
+        edge_index=torch.from_numpy(edge_index).long(),
+        edge_weight=torch.from_numpy(edge_weight).float(),
+        y=torch.from_numpy(y).long(),
+    )
+    if 'x_gene' in fields:
+        data.x_gene = torch.from_numpy(fields['x_gene']).float()
+    if 'x_img' in fields:
+        data.x_img = torch.from_numpy(fields['x_img']).float()
+    if 'img_mask' in fields:
+        data.img_mask = torch.from_numpy(fields['img_mask']).float()
+    if 'pe_gene' in fields:
+        data.pe_gene = torch.from_numpy(fields['pe_gene']).float()
+    data.num_nodes = fields['x'].shape[0]
     data.pos = torch.from_numpy(np.asarray(xy)).float()
     return data
+
+
+def _infer_input_dims_from_graph(graph):
+    return _graph_input_dims(graph)
+
+
+def _normalize_input_dims(input_dims):
+    if isinstance(input_dims, dict):
+        return dict(input_dims)
+    return {'gene_in_dim': int(input_dims), 'img_in_dim': None, 'x_in_dim': int(input_dims)}
+
+
+def _model_forward_kwargs(graph):
+    return _shared_model_forward_kwargs(graph)
+
+
+def _make_stonco_model(input_dims, cfg, n_domains_batch=None, n_domains_cancer=None):
+    return _build_stonco_model_from_cfg(
+        _normalize_input_dims(input_dims),
+        cfg,
+        n_domains_slide=n_domains_batch,
+        n_domains_cancer=n_domains_cancer,
+    )
 
 def eval_logits(logits, y, return_predictions=False):
     """计算验证指标，支持binary classification
@@ -361,9 +408,17 @@ def main():
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader数据加载工作进程数')
     parser.add_argument('--use_pca', type=int, choices=[0, 1], default=None, help='是否使用PCA（1/0）')
     # 新增：图像特征早期融合（方案1）
-    parser.add_argument('--use_image_features', type=int, choices=[0, 1], default=None, help='是否启用图像特征早期融合（1/0）')
-    parser.add_argument('--img_use_pca', type=int, choices=[0, 1], default=None, help='图像特征是否使用PCA降维（1/0）')
+    parser.add_argument('--use_image_features', type=int, choices=[0, 1], default=None, help='是否启用图像特征（1/0）')
+    parser.add_argument('--image_fusion_mode', choices=['early_concat', 'dual_branch_residual_gate'], default=None, help='图像融合模式')
+    parser.add_argument('--img_use_pca', type=int, choices=[0, 1], default=None, help='图像特征是否使用PCA降维（1/0，默认0）')
     parser.add_argument('--img_pca_dim', type=int, default=None, help='图像特征PCA维度（默认256，仅当 img_use_pca=1 生效）')
+    parser.add_argument('--img_gnn_hidden', default=None, help='Image GNN每层隐藏维度，默认：128,64')
+    parser.add_argument('--img_num_layers', type=int, default=None, help='Image GNN层数，默认2')
+    parser.add_argument('--img_model', choices=['gatv2', 'sage', 'gcn'], default=None, help='Image GNN主干；不传则跟随 --model')
+    parser.add_argument('--img_heads', type=int, default=None, help='Image GNN GATv2 heads；不传则跟随 --heads')
+    parser.add_argument('--img_dropout', type=float, default=None, help='Image GNN dropout；不传则跟随 gnn_dropout')
+    parser.add_argument('--fusion_gate_hidden', type=int, default=None, help='Residual gate MLP hidden维度')
+    parser.add_argument('--fusion_dropout', type=float, default=None, help='Residual gate MLP dropout')
     # 新增：HVG数量控制（支持数值或'all'；默认'all'表示使用全部基因）
     parser.add_argument('--n_hvg', default='all', help="高变基因数量，或'all'使用全部基因（默认'all'）")
     # 新增：从JSON加载配置（支持meta风格或扁平字典）
@@ -503,8 +558,16 @@ def main():
            'use_pca': False,
            # 方案1：早期融合（默认关闭以保持旧行为）
            'use_image_features': False,
-           'img_use_pca': True,
+           'image_fusion_mode': 'early_concat',
+           'img_use_pca': False,
            'img_pca_dim': 256,
+           'img_gnn_hidden': [128, 64],
+           'img_num_layers': 2,
+           'img_model': None,
+           'img_heads': None,
+           'img_dropout': None,
+           'fusion_gate_hidden': 128,
+           'fusion_dropout': 0.0,
            'concat_lap_pe': False,
            'lap_pe_use_gaussian': False,
            # 分类头/域头
@@ -624,10 +687,26 @@ def main():
         cfg['use_pca'] = bool(args.use_pca)
     if getattr(args, 'use_image_features', None) is not None:
         cfg['use_image_features'] = bool(args.use_image_features)
+    if getattr(args, 'image_fusion_mode', None) is not None:
+        cfg['image_fusion_mode'] = str(args.image_fusion_mode)
     if getattr(args, 'img_use_pca', None) is not None:
         cfg['img_use_pca'] = bool(args.img_use_pca)
     if getattr(args, 'img_pca_dim', None) is not None:
         cfg['img_pca_dim'] = int(args.img_pca_dim)
+    if getattr(args, 'img_gnn_hidden', None) is not None:
+        cfg['img_gnn_hidden'] = args.img_gnn_hidden
+    if getattr(args, 'img_num_layers', None) is not None:
+        cfg['img_num_layers'] = int(args.img_num_layers)
+    if getattr(args, 'img_model', None) is not None:
+        cfg['img_model'] = str(args.img_model)
+    if getattr(args, 'img_heads', None) is not None:
+        cfg['img_heads'] = int(args.img_heads)
+    if getattr(args, 'img_dropout', None) is not None:
+        cfg['img_dropout'] = float(args.img_dropout)
+    if getattr(args, 'fusion_gate_hidden', None) is not None:
+        cfg['fusion_gate_hidden'] = int(args.fusion_gate_hidden)
+    if getattr(args, 'fusion_dropout', None) is not None:
+        cfg['fusion_dropout'] = float(args.fusion_dropout)
     # 新增：覆盖 HVG 数量（字符串'all'或可解析为整数的字符串/整数）
     if getattr(args, 'n_hvg', None) is not None:
         cfg['n_hvg'] = args.n_hvg
@@ -1005,6 +1084,26 @@ def main():
     if cfg['plateau_cooldown'] < 0:
         raise ValueError(f"cfg['plateau_cooldown'] must be >= 0, got: {cfg['plateau_cooldown']}")
     cfg = normalize_gnn_config(cfg)
+    cfg['image_fusion_mode'] = get_image_fusion_mode(cfg)
+    if cfg['image_fusion_mode'] == 'dual_branch_residual_gate' and not bool(cfg.get('use_image_features', False)):
+        raise ValueError("image_fusion_mode='dual_branch_residual_gate' requires use_image_features=1")
+    img_hidden, img_layers = normalize_gnn_hidden(
+        gnn_hidden=cfg.get('img_gnn_hidden', [128, 64]),
+        num_layers=cfg.get('img_num_layers', 2),
+        default_gnn_hidden=(128, 64),
+    )
+    cfg['img_gnn_hidden'] = [int(v) for v in img_hidden]
+    cfg['img_num_layers'] = int(img_layers)
+    if cfg.get('img_model', None) is None:
+        cfg['img_model'] = cfg.get('model', 'gatv2')
+    if cfg.get('img_heads', None) is None:
+        cfg['img_heads'] = int(cfg.get('heads', 4))
+    cfg['img_heads'] = int(cfg['img_heads'])
+    if cfg.get('img_dropout', None) is None:
+        cfg['img_dropout'] = cfg.get('gnn_dropout', cfg.get('dropout', 0.3))
+    cfg['img_dropout'] = float(cfg['img_dropout'])
+    cfg['fusion_gate_hidden'] = int(cfg.get('fusion_gate_hidden', 128))
+    cfg['fusion_dropout'] = float(cfg.get('fusion_dropout', 0.0))
     cfg = normalize_sampler_config(cfg)
     args._save_epoch_checkpoints = _normalize_save_epoch_checkpoints(getattr(args, 'save_epoch_checkpoints', None))
     invalid_save_epochs = [ep for ep in args._save_epoch_checkpoints if int(ep) > int(cfg.get('epochs', 0))]
@@ -1103,7 +1202,7 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
 
     img_pp = None
     if use_image_features:
-        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', False), img_pca_dim=cfg.get('img_pca_dim', 256))
         img_pp.fit([s['X_img'] for s in slides], [s['img_mask'] for s in slides])
         if save_preprocessor_dir is not None:
             img_pp.save(save_preprocessor_dir, img_feature_names=img_feature_names)
@@ -1124,7 +1223,15 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
         data_g.cancer_dom = torch.tensor(cancer_to_idx[ctype], dtype=torch.long)
         pyg_graphs.append(data_g)
 
-    in_dim = pyg_graphs[0].x.shape[1]
+    first_graph = pyg_graphs[0]
+    gene_in_dim = int(first_graph.x_gene.shape[1]) if hasattr(first_graph, 'x_gene') else int(first_graph.x.shape[1])
+    if hasattr(first_graph, 'pe_gene') and first_graph.pe_gene is not None:
+        gene_in_dim += int(first_graph.pe_gene.shape[1])
+    input_dims = {
+        'gene_in_dim': gene_in_dim,
+        'img_in_dim': int(first_graph.x_img.shape[1]) if hasattr(first_graph, 'x_img') else None,
+        'x_in_dim': int(first_graph.x.shape[1]),
+    }
 
     n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
     n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
@@ -1147,7 +1254,7 @@ def prepare_graphs(args, cfg, save_preprocessor_dir=None):
     setattr(args, '_train_ids', list(train_ids))
     setattr(args, '_val_ids', list(val_ids))
 
-    return train_graphs, val_graphs, in_dim, n_domains_batch, n_domains_cancer
+    return train_graphs, val_graphs, input_dims, n_domains_batch, n_domains_cancer
 
 
 def _build_external_val_graphs(args, cfg, preprocessor_dir):
@@ -1175,7 +1282,7 @@ def _build_external_val_graphs(args, cfg, preprocessor_dir):
     expected_img_feature_names = None
     if use_image_features:
         try:
-            img_pp = ImagePreprocessor.load(preprocessor_dir, img_use_pca=cfg.get('img_use_pca', True))
+            img_pp = ImagePreprocessor.load(preprocessor_dir, img_use_pca=cfg.get('img_use_pca', False))
             expected_img_feature_names = img_pp.feature_names
             if not expected_img_feature_names:
                 raise ValueError('img_feature_names.txt is missing or empty.')
@@ -1500,17 +1607,7 @@ def train_and_validate(
         generator.manual_seed(int(base_seed) + int(seed_offset))
         return generator
 
-    model = STOnco_Classifier(
-        in_dim=in_dim,
-        hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
-        clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
-        dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
-        clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
-        domain_hidden=int(cfg.get('dom_hidden', 64)),
-        use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
-        use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
-    )
+    model = _make_stonco_model(in_dim, cfg, n_domains_batch=n_domains_batch, n_domains_cancer=n_domains_cancer)
     model = model.to(device)
     use_wb_align = bool(cfg.get('use_wb_align', False))
     support_map = None
@@ -1520,13 +1617,13 @@ def train_and_validate(
         if n_domains_cancer is None or int(n_domains_cancer) <= 0:
             raise ValueError('use_wb_align=1 requires n_domains_cancer; prepare_graphs must return it when WB is enabled.')
         support_map = GeneratedSupportMap(
-            model.gnn.out_dim,
+            model.encoder_out_dim,
             hidden=int(cfg.get('wb_support_hidden', 128)),
             dropout=float(cfg.get('wb_support_dropout', 0.0)),
         ).to(device)
         wb_module = GeneratedSupportWBLoss(
             n_domains=int(n_domains_cancer),
-            in_dim=model.gnn.out_dim,
+            in_dim=model.encoder_out_dim,
             loss_type=str(cfg.get('wb_loss_type', 'euclidean_pairwise')),
             potential_hidden=int(cfg.get('wb_potential_hidden', 128)),
             spots_per_graph=int(cfg.get('wb_spots_per_graph', 64)),
@@ -1565,7 +1662,12 @@ def train_and_validate(
         })
 
     main_param_groups = []
-    _add_param_group(main_param_groups, 'gnn', model.gnn.parameters(), 'gnn_lr', 'gnn_weight_decay')
+    if get_image_fusion_mode(cfg) == 'dual_branch_residual_gate':
+        _add_param_group(main_param_groups, 'gnn_gene', model.gnn_gene.parameters(), 'gnn_lr', 'gnn_weight_decay')
+        _add_param_group(main_param_groups, 'gnn_img', model.gnn_img.parameters(), 'gnn_lr', 'gnn_weight_decay')
+        _add_param_group(main_param_groups, 'fusion', model.fusion.parameters(), 'gnn_lr', 'gnn_weight_decay')
+    else:
+        _add_param_group(main_param_groups, 'gnn', model.gnn.parameters(), 'gnn_lr', 'gnn_weight_decay')
     _add_param_group(main_param_groups, 'clf', model.clf.parameters(), 'clf_lr', 'clf_weight_decay')
     domain_params = []
     if model.dom_slide is not None:
@@ -1806,6 +1908,10 @@ def train_and_validate(
         'avg_wb_state_direction': [],
         'avg_wb_active_cancers': [],
         'avg_wb_active_spots': [],
+        'avg_gate_mean': [],
+        'avg_gate_present': [],
+        'avg_gate_missing': [],
+        'avg_img_residual_norm': [],
         'wb_lambda': [],
         'train_batch_domain_acc': [],
         'train_cancer_domain_acc': [],
@@ -1916,6 +2022,14 @@ def train_and_validate(
         cnt_wb_euclid = 0
         cnt_wb_sinkhorn = 0
         cnt_wb_sliced = 0
+        tot_gate_mean = 0.0
+        tot_gate_present = 0.0
+        tot_gate_missing = 0.0
+        tot_img_residual_norm = 0.0
+        cnt_gate_mean = 0
+        cnt_gate_present = 0
+        cnt_gate_missing = 0
+        cnt_img_residual_norm = 0
         batch_losses = []
         num_batches = 0
         train_correct = 0
@@ -1937,11 +2051,8 @@ def train_and_validate(
                     _set_requires_grad(wb_module.potential_parameters(), True)
                     opt_pot.zero_grad()
                     with torch.no_grad():
-                        h_detached = model.gnn(
-                            batch.x,
-                            batch.edge_index,
-                            edge_weight=getattr(batch, 'edge_weight', None),
-                        )
+                        enc_kwargs = _model_forward_kwargs(batch)
+                        h_detached = model.encode(**{k: v for k, v in enc_kwargs.items() if k != 'batch'})
                         b_detached = support_map(h_detached).detach()
                     dom_nodes_wb = batch.cancer_dom[batch.batch]
                     pot_loss, pot_stats = wb_module.potential_loss(
@@ -1995,14 +2106,13 @@ def train_and_validate(
                     cancer_delay_steps,
                     cancer_warmup_steps,
                 )
+            forward_kwargs = _model_forward_kwargs(batch)
             out = model(
-                batch.x,
-                batch.edge_index,
-                batch=getattr(batch, 'batch', None),
-                edge_weight=getattr(batch, 'edge_weight', None),
+                **forward_kwargs,
                 grl_beta_slide=grl_beta_slide,
                 grl_beta_cancer=grl_beta_cancer,
                 return_h=bool(cfg.get('use_mmd', False) or cfg.get('use_wb_align', False)),
+                return_fusion_stats=(get_image_fusion_mode(cfg) == 'dual_branch_residual_gate'),
             )
             global_step += 1
 
@@ -2100,6 +2210,25 @@ def train_and_validate(
                         tot_wb_sliced += wb_sliced
                         cnt_wb_sliced += 1
                     cnt_wb += 1
+            if get_image_fusion_mode(cfg) == 'dual_branch_residual_gate':
+                stats = out.get('fusion_stats', None)
+                if isinstance(stats, dict) and 'gate' in stats:
+                    with torch.no_grad():
+                        gate = stats['gate'].detach().view(-1)
+                        mask_img = batch.img_mask.detach().view(-1).to(device=gate.device, dtype=torch.bool) if hasattr(batch, 'img_mask') else torch.ones_like(gate, dtype=torch.bool)
+                        residual = stats.get('img_residual', None)
+                        tot_gate_mean += float(gate.mean().item())
+                        cnt_gate_mean += 1
+                        if bool(mask_img.any().item()):
+                            tot_gate_present += float(gate[mask_img].mean().item())
+                            cnt_gate_present += 1
+                        missing_mask = ~mask_img
+                        if bool(missing_mask.any().item()):
+                            tot_gate_missing += float(gate[missing_mask].mean().item())
+                            cnt_gate_missing += 1
+                        if residual is not None:
+                            tot_img_residual_norm += float(residual.detach().norm(dim=1).mean().item())
+                            cnt_img_residual_norm += 1
             batch_losses.append(float(loss_total.item()))
             num_batches += 1
 
@@ -2131,6 +2260,10 @@ def train_and_validate(
         avg_wb_active_cancers = (tot_wb_active_cancers / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_active_spots = (tot_wb_active_spots / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_lambda = (tot_wb_lambda / max(1, num_batches)) if use_wb_align else float('nan')
+        avg_gate_mean = (tot_gate_mean / cnt_gate_mean) if cnt_gate_mean > 0 else float('nan')
+        avg_gate_present = (tot_gate_present / cnt_gate_present) if cnt_gate_present > 0 else float('nan')
+        avg_gate_missing = (tot_gate_missing / cnt_gate_missing) if cnt_gate_missing > 0 else float('nan')
+        avg_img_residual_norm = (tot_img_residual_norm / cnt_img_residual_norm) if cnt_img_residual_norm > 0 else float('nan')
         if use_wb_align and avg_wb_lambda > 0 and cnt_wb == 0:
             print(
                 f"[WB] Warning: epoch {epoch} produced no valid WB batches. "
@@ -2162,6 +2295,10 @@ def train_and_validate(
         hist['avg_wb_state_direction'].append(avg_wb_state)
         hist['avg_wb_active_cancers'].append(avg_wb_active_cancers)
         hist['avg_wb_active_spots'].append(avg_wb_active_spots)
+        hist['avg_gate_mean'].append(avg_gate_mean)
+        hist['avg_gate_present'].append(avg_gate_present)
+        hist['avg_gate_missing'].append(avg_gate_missing)
+        hist['avg_img_residual_norm'].append(avg_img_residual_norm)
         hist['wb_lambda'].append(avg_wb_lambda)
         hist['train_batch_domain_acc'].append(train_batch_domain_acc)
         hist['train_cancer_domain_acc'].append(train_cancer_domain_acc)
@@ -2205,10 +2342,7 @@ def train_and_validate(
             for vb in val_loader:
                 vb = vb.to(device)
                 out_v = model(
-                    vb.x,
-                    vb.edge_index,
-                    batch=getattr(vb, 'batch', None),
-                    edge_weight=getattr(vb, 'edge_weight', None),
+                    **_model_forward_kwargs(vb),
                     return_h=bool(cfg.get('use_mmd', False) or (cfg.get('use_wb_align', False) and cfg.get('wb_eval_loss', False))),
                 )
                 (
@@ -2282,10 +2416,7 @@ def train_and_validate(
             for g in extra_val_graphs:
                 vg = g.to(device)
                 out_v = model(
-                    vg.x,
-                    vg.edge_index,
-                    batch=getattr(vg, 'batch', None),
-                    edge_weight=getattr(vg, 'edge_weight', None),
+                    **_model_forward_kwargs(vg),
                     return_h=bool(cfg.get('use_mmd', False) or (cfg.get('use_wb_align', False) and cfg.get('wb_eval_loss', False))),
                 )
                 (
@@ -2428,9 +2559,9 @@ def train_and_validate(
                     f"{plateau_metric} is not finite: {monitored_metric}"
                 )
         lr_by_name = {str(group.get('name', f'group_{i}')): float(group['lr']) for i, group in enumerate(opt.param_groups)}
-        current_lr = lr_by_name.get('gnn', float(opt.param_groups[0]['lr']) if opt.param_groups else float('nan'))
+        current_lr = lr_by_name.get('gnn', lr_by_name.get('gnn_gene', float(opt.param_groups[0]['lr']) if opt.param_groups else float('nan')))
         hist['lr'].append(current_lr)
-        hist['lr_gnn'].append(lr_by_name.get('gnn', float('nan')))
+        hist['lr_gnn'].append(lr_by_name.get('gnn', lr_by_name.get('gnn_gene', float('nan'))))
         hist['lr_clf'].append(lr_by_name.get('clf', float('nan')))
         hist['lr_dom'].append(lr_by_name.get('dom', float('nan')))
         hist['lr_wb_support'].append(lr_by_name.get('wb_support', float('nan')))
@@ -2543,6 +2674,10 @@ def _save_loss_components_csv(hist, out_dir):
         'avg_wb_state_direction': hist.get('avg_wb_state_direction', [float('nan')] * n_epochs),
         'avg_wb_active_cancers': hist.get('avg_wb_active_cancers', [float('nan')] * n_epochs),
         'avg_wb_active_spots': hist.get('avg_wb_active_spots', [float('nan')] * n_epochs),
+        'avg_gate_mean': hist.get('avg_gate_mean', [float('nan')] * n_epochs),
+        'avg_gate_present': hist.get('avg_gate_present', [float('nan')] * n_epochs),
+        'avg_gate_missing': hist.get('avg_gate_missing', [float('nan')] * n_epochs),
+        'avg_img_residual_norm': hist.get('avg_img_residual_norm', [float('nan')] * n_epochs),
         'wb_lambda': hist.get('wb_lambda', [float('nan')] * n_epochs),
         'train_batch_domain_acc': hist.get('train_batch_domain_acc', [float('nan')] * n_epochs),
         'train_cancer_domain_acc': hist.get('train_cancer_domain_acc', [float('nan')] * n_epochs),
@@ -2703,6 +2838,67 @@ def _plot_train_metrics(hist, out_dir):
     fig2.savefig(out_val_svg, format='svg', dpi=150)
     plt.close(fig2)
     return out_lr_svg, out_train_svg, out_train_val_loss_svg, out_val_svg
+
+
+def _plot_image_fusion_metrics(hist, out_dir):
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0:
+        return None
+
+    metrics = [
+        ('avg_gate_mean', 'avg_gate_mean'),
+        ('avg_gate_present', 'avg_gate_present'),
+        ('avg_gate_missing', 'avg_gate_missing'),
+        ('avg_img_residual_norm', 'avg_img_residual_norm'),
+    ]
+
+    def _has_finite(key):
+        values = hist.get(key, None)
+        if values is None:
+            return False
+        arr = pd.Series(values, dtype='float64').to_numpy()
+        return bool(np.isfinite(arr).any())
+
+    if not any(_has_finite(key) for key, _ in metrics):
+        return None
+
+    epochs = list(range(1, n_epochs + 1))
+    line_color = '#1f3a5f'
+    do_smooth = n_epochs > 100
+    smooth_window = 10
+    raw_alpha = 0.35
+    raw_lw = 0.6
+    smooth_lw = 1.4
+
+    def _values(key):
+        values = list(hist.get(key, [float('nan')] * n_epochs))
+        if len(values) < n_epochs:
+            values = values + [float('nan')] * (n_epochs - len(values))
+        return values[:n_epochs]
+
+    def _plot_neurips(ax, values, title):
+        series = pd.Series(values, dtype='float64')
+        if do_smooth:
+            ax.plot(epochs, series.values, color=line_color, linewidth=raw_lw, alpha=raw_alpha)
+            smooth = series.rolling(window=smooth_window, min_periods=1).mean()
+            ax.plot(epochs, smooth.values, color=line_color, linewidth=smooth_lw)
+        else:
+            ax.plot(epochs, series.values, color=line_color, linewidth=smooth_lw)
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7.5), sharex=True)
+    for ax, (key, title) in zip(axes.flatten(), metrics):
+        _plot_neurips(ax, _values(key), title)
+    for ax in axes[0]:
+        ax.tick_params(labelbottom=True)
+    fig.tight_layout()
+    out_svg = os.path.join(out_dir, 'image_fusion_metrics.svg')
+    fig.savefig(out_svg, format='svg', dpi=150)
+    plt.close(fig)
+    return out_svg
 
 
 def _plot_wb_train_metrics(hist, out_dir):
@@ -2990,17 +3186,7 @@ def run_single_training(args, cfg, device):
     )
 
     # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
-    model = STOnco_Classifier(
-        in_dim=in_dim,
-        hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-        gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
-        clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
-        dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
-        clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
-        domain_hidden=int(cfg.get('dom_hidden', 64)),
-        use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
-        use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
-    )
+    model = _make_stonco_model(in_dim, cfg, n_domains_batch=n_domains_batch, n_domains_cancer=n_domains_cancer)
     save_last = bool(getattr(args, 'save_last', False))
     completed_full_epochs = bool(best.get('completed_full_epochs', False))
     last_state = best.get('last_state', None)
@@ -3081,6 +3267,9 @@ def run_single_training(args, cfg, device):
                 print('Saved training/validation loss figure to', out_train_val_loss_svg)
             if out_val_svg:
                 print('Saved validation metrics figure to', out_val_svg)
+            out_img_svg = _plot_image_fusion_metrics(hist, args.artifacts_dir)
+            if out_img_svg:
+                print('Saved image fusion diagnostics figure to', out_img_svg)
             out_dom_svg = _plot_domain_diagnostics(
                 hist,
                 args.artifacts_dir,
@@ -3117,11 +3306,11 @@ def run_single_training(args, cfg, device):
 
             def compute_graph_attr(g):
                 # 输入张量拷贝并开启梯度
-                x = g.x.to(device)
-                edge_index = g.edge_index.to(device)
-                edge_weight = getattr(g, 'edge_weight', None)
-                if edge_weight is not None:
-                    edge_weight = edge_weight.to(device)
+                gd = g.to(device)
+                dual_mode = get_image_fusion_mode(cfg) == 'dual_branch_residual_gate' and hasattr(gd, 'x_gene')
+                x = gd.x_gene if dual_mode else gd.x
+                edge_index = gd.edge_index
+                edge_weight = getattr(gd, 'edge_weight', None)
                 x_in = x.detach().clone()
                 # 基线：仅对基因维度设为0，PE部分保持原值
                 baseline = x_in.detach().clone()
@@ -3135,7 +3324,19 @@ def run_single_training(args, cfg, device):
                         alpha = float(s) / float(steps)
                         x_step = baseline + delta * alpha
                         x_step = x_step.detach().requires_grad_(True)
-                        out = model(x_step, edge_index, batch=getattr(g, 'batch', None), edge_weight=edge_weight)
+                        if dual_mode:
+                            out = model(
+                                gd.x,
+                                edge_index,
+                                batch=getattr(gd, 'batch', None),
+                                edge_weight=edge_weight,
+                                x_gene=x_step,
+                                x_img=gd.x_img,
+                                img_mask=gd.img_mask,
+                                pe_gene=getattr(gd, 'pe_gene', None),
+                            )
+                        else:
+                            out = model(x_step, edge_index, batch=getattr(gd, 'batch', None), edge_weight=edge_weight)
                         logits = out['logits']
                         loss = logits.sum()
                         grad = torch.autograd.grad(loss, x_step, retain_graph=False)[0]
@@ -3146,7 +3347,19 @@ def run_single_training(args, cfg, device):
                     attr_feat_graph = attr_feat.abs().mean(dim=0)  # (F_gene,)
                 else:  # saliency
                     x_sal = x_in.detach().clone().requires_grad_(True)
-                    out = model(x_sal, edge_index, batch=getattr(g, 'batch', None), edge_weight=edge_weight)
+                    if dual_mode:
+                        out = model(
+                            gd.x,
+                            edge_index,
+                            batch=getattr(gd, 'batch', None),
+                            edge_weight=edge_weight,
+                            x_gene=x_sal,
+                            x_img=gd.x_img,
+                            img_mask=gd.img_mask,
+                            pe_gene=getattr(gd, 'pe_gene', None),
+                        )
+                    else:
+                        out = model(x_sal, edge_index, batch=getattr(gd, 'batch', None), edge_weight=edge_weight)
                     logits = out['logits']
                     loss = logits.sum()
                     grad = torch.autograd.grad(loss, x_sal, retain_graph=False)[0]
@@ -3244,7 +3457,7 @@ def run_kfold_training(args, cfg, device):
 
     img_pp = None
     if use_image_features:
-        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+        img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', False), img_pca_dim=cfg.get('img_pca_dim', 256))
         img_pp.fit([s['X_img'] for s in slides], [s['img_mask'] for s in slides])
 
     pyg_graphs = []
@@ -3262,7 +3475,15 @@ def run_kfold_training(args, cfg, device):
         data_g.cancer_dom = torch.tensor(cancer_to_idx[ctype], dtype=torch.long)
         pyg_graphs.append(data_g)
 
-    in_dim = pyg_graphs[0].x.shape[1]
+    first_graph = pyg_graphs[0]
+    gene_in_dim = int(first_graph.x_gene.shape[1]) if hasattr(first_graph, 'x_gene') else int(first_graph.x.shape[1])
+    if hasattr(first_graph, 'pe_gene') and first_graph.pe_gene is not None:
+        gene_in_dim += int(first_graph.pe_gene.shape[1])
+    in_dim = {
+        'gene_in_dim': gene_in_dim,
+        'img_in_dim': int(first_graph.x_img.shape[1]) if hasattr(first_graph, 'x_img') else None,
+        'x_in_dim': int(first_graph.x.shape[1]),
+    }
 
     n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
     n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
@@ -3331,6 +3552,9 @@ def run_kfold_training(args, cfg, device):
                     print(f'[KFold] Saved training/validation loss figure to {out_train_val_loss_svg}')
                 if out_val_svg:
                     print(f'[KFold] Saved validation metrics figure to {out_val_svg}')
+                out_img_svg = _plot_image_fusion_metrics(hist, fold_dir)
+                if out_img_svg:
+                    print(f'[KFold] Saved image fusion diagnostics figure to {out_img_svg}')
                 out_dom_svg = _plot_domain_diagnostics(
                     hist,
                     fold_dir,
@@ -3358,17 +3582,7 @@ def run_kfold_training(args, cfg, device):
                 print(f'[KFold] Warning: failed to save loss components CSV: {e}')
 
         # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
-        model = STOnco_Classifier(
-            in_dim=in_dim,
-            hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
-            clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
-            dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
-            clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
-            domain_hidden=int(cfg.get('dom_hidden', 64)),
-            use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
-            use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
-        )
+        model = _make_stonco_model(in_dim, cfg, n_domains_batch=n_domains_batch, n_domains_cancer=n_domains_cancer)
         save_last = bool(getattr(args, 'save_last', False))
         completed_full_epochs = bool(best.get('completed_full_epochs', False))
         last_state = best.get('last_state', None)
@@ -3687,7 +3901,7 @@ def run_loco_training(args, cfg, device):
 
         img_pp = None
         if use_image_features:
-            img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', True), img_pca_dim=cfg.get('img_pca_dim', 256))
+            img_pp = ImagePreprocessor(img_use_pca=cfg.get('img_use_pca', False), img_pca_dim=cfg.get('img_pca_dim', 256))
             img_pp.fit([s['X_img'] for s in slides_train], [s['img_mask'] for s in slides_train])
             try:
                 img_pp.save(loco_dir, img_feature_names=img_feature_names)
@@ -3722,7 +3936,15 @@ def run_loco_training(args, cfg, device):
         train_graphs = build_graph_list(train_ids)
         val_graphs = build_graph_list(val_ids)
 
-        in_dim = train_graphs[0].x.shape[1]
+        first_graph = train_graphs[0]
+        gene_in_dim = int(first_graph.x_gene.shape[1]) if hasattr(first_graph, 'x_gene') else int(first_graph.x.shape[1])
+        if hasattr(first_graph, 'pe_gene') and first_graph.pe_gene is not None:
+            gene_in_dim += int(first_graph.pe_gene.shape[1])
+        in_dim = {
+            'gene_in_dim': gene_in_dim,
+            'img_in_dim': int(first_graph.x_img.shape[1]) if hasattr(first_graph, 'x_img') else None,
+            'x_in_dim': int(first_graph.x.shape[1]),
+        }
         n_domains_batch = len(batch_to_idx) if cfg.get('use_domain_adv_slide', False) else None
         n_domains_cancer = len(cancer_to_idx) if (cfg.get('use_domain_adv_cancer', False) or cfg.get('use_wb_align', False)) else None
 
@@ -3758,6 +3980,9 @@ def run_loco_training(args, cfg, device):
                     print(f'[LOCO] Saved training/validation loss figure to {out_train_val_loss_svg}')
                 if out_val_svg:
                     print(f'[LOCO] Saved validation metrics figure to {out_val_svg}')
+                out_img_svg = _plot_image_fusion_metrics(hist, loco_dir)
+                if out_img_svg:
+                    print(f'[LOCO] Saved image fusion diagnostics figure to {out_img_svg}')
                 out_dom_svg = _plot_domain_diagnostics(
                     hist,
                     loco_dir,
@@ -3785,17 +4010,7 @@ def run_loco_training(args, cfg, device):
                 print(f'[LOCO] Warning: failed to save loss components CSV: {e}')
 
         # 保存模型：默认保存最优到 model.pt；若 --save_last 且实际跑满 epochs，则用最后一个 epoch 覆盖 model.pt，并额外保存 best 到 model_best.pt
-        model = STOnco_Classifier(
-            in_dim=in_dim,
-            hidden=cfg['GNN_hidden'], num_layers=cfg['num_layers'], dropout=cfg['dropout'], model=cfg['model'], heads=cfg['heads'],
-            gnn_dropout=cfg.get('gnn_dropout', cfg.get('dropout', 0.3)),
-            clf_dropout=cfg.get('clf_dropout', cfg.get('dropout', 0.3)),
-            dom_dropout=cfg.get('dom_dropout', cfg.get('dropout', 0.3)),
-            clf_hidden=cfg.get('clf_hidden', [256, 128, 64]),
-            domain_hidden=int(cfg.get('dom_hidden', 64)),
-            use_domain_adv_slide=cfg.get('use_domain_adv_slide', False), n_domains_slide=n_domains_batch,
-            use_domain_adv_cancer=cfg.get('use_domain_adv_cancer', False), n_domains_cancer=n_domains_cancer
-        )
+        model = _make_stonco_model(in_dim, cfg, n_domains_batch=n_domains_batch, n_domains_cancer=n_domains_cancer)
         save_last = bool(getattr(args, 'save_last', False))
         completed_full_epochs = bool(best.get('completed_full_epochs', False))
         last_state = best.get('last_state', None)
@@ -3869,12 +4084,7 @@ def run_loco_training(args, cfg, device):
             with torch.no_grad():
                 for g in val_graphs:
                     vg = g.to(device)
-                    out_v = model(
-                        vg.x,
-                        vg.edge_index,
-                        batch=getattr(vg, 'batch', None),
-                        edge_weight=getattr(vg, 'edge_weight', None),
-                    )
+                    out_v = model(**_model_forward_kwargs(vg))
                     logits_v = out_v['logits']
                     m_slide = eval_logits(logits_v, vg.y)
                     y_np = vg.y.detach().cpu().numpy()

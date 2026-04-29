@@ -1,6 +1,6 @@
 # STOnco: Visium 空间转录组 GNN 分类与域自适应
 
-本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）、可选的双域对抗（癌种域 + 批次域）、MMD 对齐，以及 generated-support Wasserstein barycenter（WB）多癌种 latent 对齐。
+本项目基于 PyTorch Geometric，面向 10x Visium 空间转录组的肿瘤/非肿瘤二分类任务，提供从数据准备 → 训练（含双域自适应）→ 多阶段超参数优化（HPO）→ 推理与可视化的完整工具链。核心模型采用统一的 STOnco_Classifier，支持多种 GNN 主干（GATv2 / GraphSAGE / GCN）、拉普拉斯位置编码（LapPE）、可选图像特征融合（early concat 或 residual gated dual GNN）、可选的双域对抗（癌种域 + 批次域）、MMD 对齐，以及 generated-support Wasserstein barycenter（WB）多癌种 latent 对齐。
 
 ---
 
@@ -8,7 +8,7 @@
 
 - prepare_data.py：从 CSV（exp + coordinates）构建训练/单样本/验证 NPZ
 - preprocessing.py：预处理器与图构建（HVG 选择、标准化、可选 PCA，KNN 图 + 高斯边权，LapPE）
-- models.py：STOnco_Classifier（GNN 主干 + 分类头 + 可选双域对抗头）
+- models.py：STOnco_Classifier（统一 `encode(...)`，GNN 主干/双分支图像融合 + 分类头 + 可选双域对抗头）
 - train.py：训练与验证（单次、癌种分层、k-fold 按癌种、LOCO 留一癌种评估）
 - train_hpo.py：三阶段 HPO 流水线（含多种子复评/重打分）
 - infer.py：单切片 NPZ 推理（输出预测 CSV；可选保存基因重要性 CSV）
@@ -105,8 +105,10 @@ python -m stonco.core.train \
   --use_domain_adv_slide 1 --use_domain_adv_cancer 1 \
   --epochs 80 --early_patience 20 --batch_size_graphs 2 \
   --save_loss_components 1
-# （可选）启用图像特征早期融合（方案1）：在训练命令后追加
-#   --use_image_features 1 --img_use_pca 1 --img_pca_dim 256
+# （可选）启用残差门控双 GNN 图像融合：在训练命令后追加
+#   --use_image_features 1 --image_fusion_mode dual_branch_residual_gate \
+#   --img_use_pca 0 --img_gnn_hidden 128,64 --img_num_layers 2
+# 如需对图像特征显式降维，可改为追加 --img_use_pca 1 --img_pca_dim 256
 # （可选）启用学习率调度：默认 `--lr_scheduler none`
 #   --lr_scheduler warmup_cosine --lr_warmup_epochs 10 --min_lr_ratio 0.01
 # （可选）使用 plateau：建议关闭早停或显著增大 early_patience
@@ -262,8 +264,8 @@ python -m stonco.utils.run_embedding_analysis_pipeline \
     - img_feature_names：长度 2048 的列表（与训练产物中的 img_feature_names.txt 一致）
 
 说明：
-- 本次更新将图像特征作为“早期融合”节点特征的一部分：`x = [Xp_gene, Xp_img, img_mask, (LapPE)]`。
-- 是否启用由训练时 `meta.json:cfg.use_image_features` 决定；推理/批推理/可视化/导出 embedding 会自动读取 cfg 保持一致。
+- 图像特征支持两种融合模式：`early_concat` 使用 `x = [Xp_gene, Xp_img, img_mask, (LapPE)]`；`dual_branch_residual_gate` 使用 `x_gene/x_img/img_mask/(pe_gene)` 经模型内部 `encode(...)` 融合为 `h_fused`。
+- 是否启用由训练时 `meta.json:cfg.use_image_features` 和 `meta.json:cfg.image_fusion_mode` 决定；推理/批推理/可视化/导出 embedding 会自动读取 cfg 保持一致。
 
 从 CSV 构建 NPZ 的约定（见 prepare_data.py）：
 - exp.csv：首列必须为 Barcode，其余列为基因（列名即基因名）；数值列会转为浮点，缺失置 0。
@@ -465,10 +467,14 @@ python -m stonco.core.train \
 - 预处理：
   - --use_pca {0,1}（可选 PCA；默认关闭）
   - --n_hvg N 或 'all'（默认 'all' 表示使用所有基因）
-  - 图像特征早期融合（方案1，可选）：
-    - --use_image_features {0,1}（默认 0，保持 gene-only 行为；启用后节点输入为 `gene → image → img_mask → (LapPE)`）
-    - --img_use_pca {0,1}（默认 1，对 2048 维图像特征做 PCA 降维）
+  - 图像特征融合（可选）：
+    - --use_image_features {0,1}（默认 0，保持 gene-only 行为）
+    - --image_fusion_mode {early_concat,dual_branch_residual_gate}（默认 `early_concat`；推荐双分支实验显式使用 `dual_branch_residual_gate`）
+    - `early_concat`：节点输入为 `gene → image → img_mask → (LapPE)`
+    - `dual_branch_residual_gate`：图对象保存 `x_gene/x_img/img_mask/(pe_gene)`，模型内部经 `model.encode(...)` 得到 `h_fused`
+    - --img_use_pca {0,1}（默认 0，不对图像特征做 PCA；显式传 1 时才做 PCA）
     - --img_pca_dim（默认 256，仅当 --img_use_pca 1 生效；若有效 spot 数（img_mask==1）小于该值会直接报错）
+    - --img_gnn_hidden / --img_num_layers / --img_model / --img_heads / --img_dropout：双分支 image branch 配置；第一版推荐 `--img_gnn_hidden 128,64 --img_num_layers 2`
 - 训练 sampler / 子图：
   - `--sampler_mode {random,cancer_balanced,cancer_balanced_subgraph}`（默认 `random`）
   - `--sampler_k_cancers`：每个 batch 优先采样的癌种数 `K`
@@ -562,7 +568,8 @@ python -m stonco.core.train \
   - --config_json 从 JSON 加载一组超参（支持扁平或 {"cfg": {...}} 格式）
   - --val_sample_dir 外部验证 NPZ 目录（单切片），验证指标与内部验证合并计算
   - --save_loss_components 0/1（默认 1）：保存 Loss 组件曲线 CSV 到 artifacts_dir/loss_components.csv
-  - --save_train_curves 0/1（默认 1）：保存 `lr.svg`、`train_loss.svg`、`train_val_loss.svg` 与 `train_val_metrics.svg`
+    - 双分支图像融合会额外记录 `avg_gate_mean`、`avg_gate_present`、`avg_gate_missing`、`avg_img_residual_norm`
+  - --save_train_curves 0/1（默认 1）：保存 `lr.svg`、`train_loss.svg`、`train_val_loss.svg` 与 `train_val_metrics.svg`；残差门控双分支图像融合会额外保存 `image_fusion_metrics.svg`
   - --save_last 0/1（默认 1；也兼容不带值的 `--save_last`）：若训练实际跑满 `--epochs`，则用最后一个 epoch 覆盖 `artifacts_dir/model.pt`；同时额外保存最优模型到 `artifacts_dir/model_best.pt`。默认 `--early_patience 0`，因此默认会跑满；若显式开启早停且提前结束，则 `model.pt` 回退为最优模型
   - --save_epoch_checkpoints：额外保存指定 epoch 的模型快照，例如 `--epochs 300 --save_epoch_checkpoints 100 200` 会在训练结束后额外写出 `epoch_checkpoints/epoch_100/` 与 `epoch_checkpoints/epoch_200/`；每个 `epoch_XXX/` 会保存与常规训练目录一致的核心文件布局（`model.pt`、`meta.json`、预处理器文件，以及按该轮截断的曲线/`loss_components.csv`）；若训练因早停未跑到某个请求轮次，会在日志中提示未保存
   - 解释性输出（默认开启，可用 --no_explain 关闭）：--explain_saliency/--no_explain，--explain_method {ig,saliency}（默认 ig），--ig_steps（默认 50）；若开启，将在训练结束后基于 `artifacts_dir/model.pt` 对应的模型计算总体基因重要性并保存 CSV（默认 artifacts_dir/per_gene_saliency.csv）
@@ -581,6 +588,7 @@ python -m stonco.core.train \
   - `train_loss.svg`：`3x3`，包含训练损失组件和 `train_accuracy`
   - `train_val_loss.svg`：`3x3`，包含训练/验证损失对照和 `accuracy`
   - `train_val_metrics.svg`：`2x2`，包含 `val_accuracy/val_macro_f1/val_auroc/val_auprc`
+  - `image_fusion_metrics.svg`：残差门控双分支图像融合且 gate/residual 诊断有有效值时额外保存，`2x2` 展示 `avg_gate_mean`、`avg_gate_present`、`avg_gate_missing`、`avg_img_residual_norm`
   - `wb_train_loss.svg`：启用 WB 时额外保存，包含 `avg_total_loss`、`avg_task_loss`、`avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_sinkhorn`、`avg_wb_anchor`、`wb_lambda`、active cancers/spots 等 WB diagnostics；图中子图会按当前 loss 类型和可用曲线自动布局
 - Loss 组件：`loss_components.csv` 保留 `lr` 列，并新增 `lr_gnn`、`lr_clf`、`lr_dom`、`lr_wb_support`、`lr_wb_potential`；继续保存训练/验证损失及 `val_*` 指标；启用 WB 时额外包含 `avg_wb_loss`、`avg_wb_potential_loss`、`avg_wb_dual_obj`、`avg_wb_euclid_pairwise`、`avg_wb_sinkhorn`、`avg_wb_anchor`、`avg_wb_active_cancers`、`avg_wb_active_spots`、`wb_lambda` 等列；若 `--wb_eval_loss 1`，还会记录对应 validation WB diagnostics，例如 `val_avg_wb_loss` 与 `val_avg_wb_sinkhorn`
 - 命名更新：此前文档中的 `Var_risk/var_risk` 已统一更名为 `batch_loss_variance`，含义不变，仍表示每个 epoch 内 mini-batch 总损失的方差。
@@ -637,8 +645,9 @@ python -m stonco.core.train \
 
 ```
 
-启用图像特征早期融合（方案1）时，在上述任意训练命令后追加：
-- `--use_image_features 1 --img_use_pca 1 --img_pca_dim 256`
+启用残差门控双 GNN 图像融合时，在上述任意训练命令后追加：
+- `--use_image_features 1 --image_fusion_mode dual_branch_residual_gate --img_use_pca 0 --img_gnn_hidden 128,64 --img_num_layers 2`
+- 默认不对图像特征做 PCA；如需降维，显式追加 `--img_use_pca 1 --img_pca_dim 256`
 提示：
 - 若不显式传 `--GNN_hidden`，当前默认主干宽度为 `256,128,64`
 - 若想保留旧版“所有层都是 128”的写法，应改为 `--GNN_hidden 128 --num_layers 3`
@@ -893,7 +902,7 @@ python -m stonco.core.infer \
   - 单切片 NPZ：包含 X, xy, gene_names（以及可选 barcodes、y、sample_id）。
   - 数据集 NPZ：包含 Xs/xys（多张切片），可通过 `--index` 选择第几张（默认 0）。
 - 若训练 cfg 启用了图像特征（`meta.json:cfg.use_image_features=1`）：
-  - 推理会加载 `artifacts_dir` 下的 `img_scaler.joblib` +（可选）`img_pca.joblib`，并按 `x=[Xp_gene, Xp_img, img_mask, (LapPE)]` 构图。
+  - 推理会加载 `artifacts_dir` 下的 `img_scaler.joblib` +（可选）`img_pca.joblib`，并按 `meta.json:cfg.image_fusion_mode` 构图；`early_concat` 使用拼接节点特征，`dual_branch_residual_gate` 使用 `x_gene/x_img/img_mask/(pe_gene)`。
   - 输入 NPZ 若包含 `X_img/img_mask`（或数据集 NPZ 的 `X_imgs/img_masks`），则必须同时包含 `img_feature_names`，并与 `artifacts_dir/img_feature_names.txt` 完全一致；否则直接报错。
   - 输入 NPZ 不含 image keys 时会自动兜底为 `X_img=0, img_mask=0`（可运行，但等价于该输入“无图像信息”）。
 - 输出 CSV 列：`spot_idx, x, y, p_tumor`；默认写到 `preds.csv`，或按 `--out_csv` 指定的路径保存（自动创建目录）。
@@ -1111,7 +1120,7 @@ python -m stonco.utils.export_spot_embeddings \
 - 至少提供一个输入源：`--train_npz` 和/或 `--npz` 和/或 `--npz_glob`
 - `--subset` 只对 `--train_npz` 生效，对 `--npz/--npz_glob` 会忽略
 - 导出 CSV 会额外写入 `embed_source`、`embed_dim` 与 `clf_latent_dim` 三列，便于后续区分来源和维度
-- 若 `meta.json:cfg.use_image_features=1`，导出 embedding 时会加载图像预处理器（`img_scaler.joblib` + 可选 `img_pca.joblib`），并按 `x=[Xp_gene, Xp_img, img_mask, (LapPE)]` 构图。
+- 若 `meta.json:cfg.use_image_features=1`，导出 embedding 时会加载图像预处理器（`img_scaler.joblib` + 可选 `img_pca.joblib`），并按 `meta.json:cfg.image_fusion_mode` 构图；`h` 对应当前模型的共享表征，双分支下为 `h_fused`。
 - 输入 NPZ 若包含 `X_img/img_mask`（或训练 NPZ 的 `X_imgs/img_masks`），必须同时提供 `img_feature_names` 且与训练产物一致；否则直接报错。若缺失 image keys，则自动兜底为 `X_img=0, img_mask=0`。
 - 若模型的 `clf_latent_dim != 64`，则：
   - `--embed_source z_clf` 正常可用

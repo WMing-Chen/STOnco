@@ -28,6 +28,48 @@ def build_node_features_early_fusion(Xp_gene, cfg, Xp_img=None, img_mask=None, p
     return x
 
 
+def get_image_fusion_mode(cfg):
+    mode = str(cfg.get('image_fusion_mode', 'early_concat')).strip().lower()
+    if mode not in {'early_concat', 'dual_branch_residual_gate'}:
+        raise ValueError(
+            "image_fusion_mode must be one of 'early_concat' or 'dual_branch_residual_gate', "
+            f"got: {cfg.get('image_fusion_mode')}"
+        )
+    return mode
+
+
+def build_node_feature_fields(Xp_gene, cfg, Xp_img=None, img_mask=None, pe=None):
+    """Build node-level arrays for both early-fusion and dual-branch modes."""
+    mode = get_image_fusion_mode(cfg)
+    Xp_gene = np.asarray(Xp_gene, dtype=np.float32)
+    if mode == 'early_concat':
+        return {'x': build_node_features_early_fusion(Xp_gene, cfg, Xp_img=Xp_img, img_mask=img_mask, pe=pe)}
+
+    if not bool(cfg.get('use_image_features', False)):
+        raise ValueError("image_fusion_mode='dual_branch_residual_gate' requires use_image_features=1")
+    if Xp_img is None or img_mask is None:
+        raise ValueError("dual_branch_residual_gate requires Xp_img and img_mask")
+
+    Xp_img = np.asarray(Xp_img, dtype=np.float32)
+    img_mask = np.asarray(img_mask).reshape(-1).astype(np.float32)
+    if Xp_img.ndim != 2:
+        raise ValueError(f'Xp_img must be 2D, got shape={Xp_img.shape}')
+    if Xp_img.shape[0] != Xp_gene.shape[0]:
+        raise ValueError(f'Xp_img row mismatch: {Xp_img.shape[0]} vs n_spots={Xp_gene.shape[0]}')
+    if img_mask.shape[0] != Xp_gene.shape[0]:
+        raise ValueError(f'img_mask length mismatch: {img_mask.shape[0]} vs n_spots={Xp_gene.shape[0]}')
+
+    fields = {
+        'x': Xp_gene.astype(np.float32),
+        'x_gene': Xp_gene.astype(np.float32),
+        'x_img': Xp_img.astype(np.float32),
+        'img_mask': img_mask.astype(np.float32),
+    }
+    if cfg.get('concat_lap_pe', False) and pe is not None:
+        fields['pe_gene'] = np.asarray(pe, dtype=np.float32)
+    return fields
+
+
 class Preprocessor:
     def __init__(self, n_hvg=2000, norm_target=1e4, do_log1p=True, pca_dim=64, zclip=5.0, use_pca=True):
         self.n_hvg = n_hvg
@@ -134,7 +176,7 @@ class Preprocessor:
         return inst
 
 class ImagePreprocessor:
-    def __init__(self, img_use_pca=True, img_pca_dim=256):
+    def __init__(self, img_use_pca=False, img_pca_dim=256):
         self.use_pca = bool(img_use_pca)
         self.pca_dim = int(img_pca_dim)
         self.scaler = StandardScaler()
@@ -222,7 +264,7 @@ class ImagePreprocessor:
             joblib.dump(self.pca, os.path.join(artifacts_dir, 'img_pca.joblib'))
 
     @classmethod
-    def load(cls, artifacts_dir, img_use_pca=True):
+    def load(cls, artifacts_dir, img_use_pca=False):
         scaler_path = os.path.join(artifacts_dir, 'img_scaler.joblib')
         if not os.path.exists(scaler_path):
             raise FileNotFoundError(f'img_scaler.joblib not found in artifacts_dir: {artifacts_dir}')
