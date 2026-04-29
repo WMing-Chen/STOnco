@@ -11,7 +11,7 @@ from .model_utils import (
     graph_input_dims as _graph_input_dims,
     model_forward_kwargs as _shared_model_forward_kwargs,
 )
-from .wb_potentials import GeneratedSupportMap, GeneratedSupportWBLoss
+from .wb_potentials import GeneratedSupportMap, GeneratedSupportWBLoss, PriorSupportGenerator
 from .sampler import (
     CancerBalancedBatchSampler,
     build_training_subgraphs,
@@ -214,6 +214,7 @@ def _save_extra_epoch_checkpoints(
                     _plot_domain_diagnostics(hist_epoch, epoch_dir, **domain_plot_kwargs)
                     if bool(cfg.get('use_wb_align', False)):
                         _plot_wb_train_metrics(hist_epoch, epoch_dir)
+                        _plot_wb_support_diagnostics(hist_epoch, epoch_dir, cfg=cfg)
                 if save_loss_components:
                     _save_loss_components_csv(hist_epoch, epoch_dir)
 
@@ -481,10 +482,12 @@ def main():
     parser.add_argument('--mmd_max_pairs', type=int, default=None, help='每个 batch 最多计算多少个域对')
     parser.add_argument('--mmd_spots_per_slide', type=int, default=None, help='每张切片最多抽取多少个 spot 参与 MMD；<=0 表示使用全部 spot')
 
-    # 新增：generated-support Wasserstein barycenter 对齐
-    parser.add_argument('--use_wb_align', type=int, choices=[0, 1], default=None, help='启用/关闭 generated-support WB 对齐（1/0）')
-    parser.add_argument('--wb_loss_type', choices=['dual_potential', 'euclidean_pairwise', 'sinkhorn_divergence', 'sliced_wasserstein'], default=None, help='WB loss 类型')
-    parser.add_argument('--wb_support_mode', choices=['generated_support'], default=None, help='WB support 生成方式；第一版仅支持 generated_support')
+    # 新增：Wasserstein/MMD barycenter 对齐
+    parser.add_argument('--use_wb_align', type=int, choices=[0, 1], default=None, help='启用/关闭 WB barycenter 对齐（1/0）')
+    parser.add_argument('--wb_loss_type', choices=['dual_potential', 'euclidean_pairwise', 'sinkhorn_divergence', 'sliced_wasserstein', 'mmd'], default=None, help='WB loss 类型')
+    parser.add_argument('--wb_support_mode', choices=['generated_support', 'prior_generator'], default=None, help='WB support 生成方式')
+    parser.add_argument('--wb_prior_type', choices=['normal', 'uniform'], default=None, help='prior_generator 的 z prior 类型')
+    parser.add_argument('--wb_prior_dim', type=int, default=None, help='prior_generator 的 z 维度')
     parser.add_argument('--lambda_wb', type=float, default=None, help='WB loss 最大权重')
     parser.add_argument('--wb_warmup_epochs', type=int, default=None, help='WB loss 开始前 warmup epoch 数')
     parser.add_argument('--wb_ramp_epochs', type=int, default=None, help='WB loss 从0 ramp到lambda_wb的 epoch 数')
@@ -598,10 +601,12 @@ def main():
                'mmd_sigma': None,
                'mmd_max_pairs': 8,
                'mmd_spots_per_slide': 0,
-               # 新增：generated-support Wasserstein barycenter 默认配置
+               # 新增：Wasserstein/MMD barycenter 默认配置
                'use_wb_align': False,
                'wb_loss_type': 'euclidean_pairwise',
                'wb_support_mode': 'generated_support',
+               'wb_prior_type': 'normal',
+               'wb_prior_dim': 128,
                'lambda_wb': 0.01,
                'wb_warmup_epochs': 10,
                'wb_ramp_epochs': 20,
@@ -826,6 +831,10 @@ def main():
         cfg['wb_loss_type'] = str(args.wb_loss_type)
     if getattr(args, 'wb_support_mode', None) is not None:
         cfg['wb_support_mode'] = str(args.wb_support_mode)
+    if getattr(args, 'wb_prior_type', None) is not None:
+        cfg['wb_prior_type'] = str(args.wb_prior_type)
+    if getattr(args, 'wb_prior_dim', None) is not None:
+        cfg['wb_prior_dim'] = int(args.wb_prior_dim)
     if getattr(args, 'lambda_wb', None) is not None:
         cfg['lambda_wb'] = float(args.lambda_wb)
     if getattr(args, 'wb_warmup_epochs', None) is not None:
@@ -948,14 +957,27 @@ def main():
     cfg['mmd_spots_per_slide'] = int(cfg.get('mmd_spots_per_slide', 0))
     cfg['use_wb_align'] = bool(cfg.get('use_wb_align', False))
     cfg['wb_loss_type'] = str(cfg.get('wb_loss_type', 'euclidean_pairwise')).lower()
-    if cfg['wb_loss_type'] not in {'dual_potential', 'euclidean_pairwise', 'sinkhorn_divergence', 'sliced_wasserstein'}:
+    if cfg['wb_loss_type'] not in {'dual_potential', 'euclidean_pairwise', 'sinkhorn_divergence', 'sliced_wasserstein', 'mmd'}:
         raise ValueError(
             "cfg['wb_loss_type'] must be dual_potential, euclidean_pairwise, "
-            f"sinkhorn_divergence, or sliced_wasserstein, got: {cfg['wb_loss_type']}"
+            f"sinkhorn_divergence, sliced_wasserstein, or mmd, got: {cfg['wb_loss_type']}"
         )
     cfg['wb_support_mode'] = str(cfg.get('wb_support_mode', 'generated_support')).lower()
-    if cfg['wb_support_mode'] != 'generated_support':
-        raise ValueError("First WB implementation only supports cfg['wb_support_mode']='generated_support'")
+    if cfg['wb_support_mode'] not in {'generated_support', 'prior_generator'}:
+        raise ValueError("cfg['wb_support_mode'] must be generated_support or prior_generator")
+    cfg['wb_prior_type'] = str(cfg.get('wb_prior_type', 'normal')).lower()
+    if cfg['wb_prior_type'] not in {'normal', 'uniform'}:
+        raise ValueError(f"cfg['wb_prior_type'] must be normal or uniform, got: {cfg['wb_prior_type']}")
+    cfg['wb_prior_dim'] = int(cfg.get('wb_prior_dim', 128))
+    if cfg['wb_prior_dim'] <= 0:
+        raise ValueError(f"cfg['wb_prior_dim'] must be > 0, got: {cfg['wb_prior_dim']}")
+    if cfg['wb_support_mode'] == 'prior_generator' and cfg['wb_loss_type'] not in {'sinkhorn_divergence', 'sliced_wasserstein', 'mmd'}:
+        raise ValueError(
+            "cfg['wb_support_mode']=prior_generator supports only "
+            "wb_loss_type=sinkhorn_divergence/sliced_wasserstein/mmd"
+        )
+    if cfg['wb_loss_type'] == 'mmd' and cfg['wb_support_mode'] != 'prior_generator':
+        raise ValueError("cfg['wb_loss_type']=mmd is only allowed with cfg['wb_support_mode']=prior_generator")
     cfg['lambda_wb'] = float(cfg.get('lambda_wb', 0.01))
     cfg['wb_warmup_epochs'] = int(cfg.get('wb_warmup_epochs', 10))
     cfg['wb_ramp_epochs'] = int(cfg.get('wb_ramp_epochs', 20))
@@ -1012,6 +1034,8 @@ def main():
             ignored_keys.append('wb_sinkhorn_iters')
         if ignored_keys:
             print("[WB] wb_loss_type=sliced_wasserstein ignores " + ", ".join(ignored_keys) + ".")
+    if cfg['wb_support_mode'] == 'prior_generator':
+        print("[WB] wb_support_mode=prior_generator: pointwise anchor is disabled and logged as wb_anchor=0.")
     cfg['best_metric'] = str(cfg.get('best_metric', 'val_macro_f1')).lower()
     if cfg['best_metric'] not in {'val_macro_f1', 'val_auprc', 'val_accuracy', 'val_auroc', 'val_avg_total_loss'}:
         raise ValueError(
@@ -1032,7 +1056,7 @@ def main():
             )
     if cfg['use_wb_align'] and str(cfg.get('sampler_mode', 'random')).lower() != 'cancer_balanced':
         print(
-            "[WB] Warning: generated-support WB benefits from multi-cancer batches. "
+            "[WB] Warning: WB barycenter alignment benefits from multi-cancer batches. "
             "Recommended: --batch_size_graphs 8 --sampler_mode cancer_balanced --sampler_k_cancers 4 --sampler_m_per_cancer 2."
         )
     if cfg.get('sampler_seed', None) is None:
@@ -1596,7 +1620,7 @@ def train_and_validate(
             return default
 
     def _make_wb_eval_generator(seed_offset):
-        if str(cfg.get('wb_loss_type', '')).lower() != 'sliced_wasserstein':
+        if str(cfg.get('wb_loss_type', '')).lower() != 'sliced_wasserstein' and str(cfg.get('wb_support_mode', '')).lower() != 'prior_generator':
             return None
         base_seed = int(cfg.get('sampler_seed', 42)) + 104729
         gen_device = 'cuda' if str(device).startswith('cuda') else 'cpu'
@@ -1616,20 +1640,34 @@ def train_and_validate(
     if use_wb_align:
         if n_domains_cancer is None or int(n_domains_cancer) <= 0:
             raise ValueError('use_wb_align=1 requires n_domains_cancer; prepare_graphs must return it when WB is enabled.')
-        support_map = GeneratedSupportMap(
-            model.encoder_out_dim,
-            hidden=int(cfg.get('wb_support_hidden', 128)),
-            dropout=float(cfg.get('wb_support_dropout', 0.0)),
-        ).to(device)
+        wb_support_mode = str(cfg.get('wb_support_mode', 'generated_support')).lower()
+        if wb_support_mode == 'prior_generator':
+            support_map = PriorSupportGenerator(
+                model.encoder_out_dim,
+                prior_dim=int(cfg.get('wb_prior_dim', 128)),
+                hidden=int(cfg.get('wb_support_hidden', 128)),
+                dropout=float(cfg.get('wb_support_dropout', 0.0)),
+                prior_type=str(cfg.get('wb_prior_type', 'normal')),
+            ).to(device)
+        else:
+            support_map = GeneratedSupportMap(
+                model.encoder_out_dim,
+                hidden=int(cfg.get('wb_support_hidden', 128)),
+                dropout=float(cfg.get('wb_support_dropout', 0.0)),
+            ).to(device)
         wb_module = GeneratedSupportWBLoss(
             n_domains=int(n_domains_cancer),
             in_dim=model.encoder_out_dim,
             loss_type=str(cfg.get('wb_loss_type', 'euclidean_pairwise')),
+            support_mode=str(cfg.get('wb_support_mode', 'generated_support')),
             potential_hidden=int(cfg.get('wb_potential_hidden', 128)),
             spots_per_graph=int(cfg.get('wb_spots_per_graph', 64)),
             spots_per_cancer=int(cfg.get('wb_spots_per_cancer', 0)),
             support_size=int(cfg.get('wb_support_size', 128)),
             sw_num_projections=int(cfg.get('wb_sw_num_projections', 64)),
+            mmd_num_kernels=int(cfg.get('mmd_num_kernels', 5)),
+            mmd_kernel_mul=float(cfg.get('mmd_kernel_mul', 2.0)),
+            mmd_sigma=cfg.get('mmd_sigma', None),
             min_cancers=int(cfg.get('wb_min_cancers', 2)),
             min_spots=int(cfg.get('wb_min_spots', 2)),
             regularizer=str(cfg.get('wb_regularizer', 'l2')),
@@ -1649,6 +1687,15 @@ def train_and_validate(
                 lr=float(cfg.get('wb_potential_lr', 1e-4)),
                 weight_decay=float(cfg.get('wb_potential_weight_decay', 0.0)),
             )
+
+    def _make_wb_support(h, generator=None):
+        if str(cfg.get('wb_support_mode', 'generated_support')).lower() == 'prior_generator':
+            n_support = int(cfg.get('wb_support_size', 128))
+            if n_support <= 0:
+                n_support = int(h.size(0))
+            n_support = max(1, n_support)
+            return support_map.sample(n_support, device=h.device, dtype=h.dtype, generator=generator)
+        return support_map(h)
 
     def _add_param_group(groups, name, params, lr_key, weight_decay_key):
         param_list = [p for p in list(params) if p.requires_grad]
@@ -1904,10 +1951,17 @@ def train_and_validate(
         'avg_wb_euclid_pairwise': [],
         'avg_wb_sinkhorn': [],
         'avg_wb_sliced_wasserstein': [],
+        'avg_wb_mmd': [],
         'avg_wb_anchor': [],
         'avg_wb_state_direction': [],
         'avg_wb_active_cancers': [],
         'avg_wb_active_spots': [],
+        'avg_wb_support_norm': [],
+        'avg_wb_support_std': [],
+        'avg_wb_h_norm': [],
+        'avg_wb_h_std': [],
+        'avg_wb_mean_gap': [],
+        'avg_wb_std_gap': [],
         'avg_gate_mean': [],
         'avg_gate_present': [],
         'avg_gate_missing': [],
@@ -1931,10 +1985,17 @@ def train_and_validate(
         'val_avg_wb_loss': [],
         'val_avg_wb_sinkhorn': [],
         'val_avg_wb_sliced_wasserstein': [],
+        'val_avg_wb_mmd': [],
         'val_avg_wb_anchor': [],
         'val_avg_wb_state_direction': [],
         'val_avg_wb_active_cancers': [],
         'val_avg_wb_active_spots': [],
+        'val_avg_wb_support_norm': [],
+        'val_avg_wb_support_std': [],
+        'val_avg_wb_h_norm': [],
+        'val_avg_wb_h_std': [],
+        'val_avg_wb_mean_gap': [],
+        'val_avg_wb_std_gap': [],
         'val_batch_loss_variance': [],
         'val_accuracy': [],
         'val_macro_f1': [],
@@ -2011,10 +2072,17 @@ def train_and_validate(
         tot_wb_euclid = 0.0
         tot_wb_sinkhorn = 0.0
         tot_wb_sliced = 0.0
+        tot_wb_mmd = 0.0
         tot_wb_anchor = 0.0
         tot_wb_state = 0.0
         tot_wb_active_cancers = 0.0
         tot_wb_active_spots = 0.0
+        tot_wb_support_norm = 0.0
+        tot_wb_support_std = 0.0
+        tot_wb_h_norm = 0.0
+        tot_wb_h_std = 0.0
+        tot_wb_mean_gap = 0.0
+        tot_wb_std_gap = 0.0
         tot_wb_lambda = 0.0
         cnt_wb = 0
         cnt_wb_potential = 0
@@ -2022,6 +2090,7 @@ def train_and_validate(
         cnt_wb_euclid = 0
         cnt_wb_sinkhorn = 0
         cnt_wb_sliced = 0
+        cnt_wb_mmd = 0
         tot_gate_mean = 0.0
         tot_gate_present = 0.0
         tot_gate_missing = 0.0
@@ -2053,7 +2122,7 @@ def train_and_validate(
                     with torch.no_grad():
                         enc_kwargs = _model_forward_kwargs(batch)
                         h_detached = model.encode(**{k: v for k, v in enc_kwargs.items() if k != 'batch'})
-                        b_detached = support_map(h_detached).detach()
+                        b_detached = _make_wb_support(h_detached).detach()
                     dom_nodes_wb = batch.cancer_dom[batch.batch]
                     pot_loss, pot_stats = wb_module.potential_loss(
                         h=h_detached.detach(),
@@ -2149,7 +2218,8 @@ def train_and_validate(
                     raise ValueError("WB is enabled but model output does not contain 'h'.")
                 if not hasattr(batch, 'cancer_dom') or not hasattr(batch, 'batch'):
                     raise ValueError('use_wb_align=1 requires batch.cancer_dom and batch.batch for per-spot cancer labels.')
-                b_wb = support_map(h)
+                wb_train_generator = _make_wb_eval_generator(global_step) if str(cfg.get('wb_support_mode', '')).lower() == 'prior_generator' else None
+                b_wb = _make_wb_support(h, generator=wb_train_generator)
                 dom_nodes_wb = batch.cancer_dom[batch.batch]
                 loss_wb, loss_wb_anchor, wb_stats = wb_module.model_loss(
                     h=h,
@@ -2157,6 +2227,7 @@ def train_and_validate(
                     cancer_dom=dom_nodes_wb,
                     graph_nodes=getattr(batch, 'batch', None),
                     y=getattr(batch, 'y', None),
+                    generator=wb_train_generator,
                 )
                 loss_total = loss_total + float(wb_lambda_t) * (
                     loss_wb + float(cfg.get('wb_anchor_weight', 0.5)) * loss_wb_anchor
@@ -2209,6 +2280,28 @@ def train_and_validate(
                     if np.isfinite(wb_sliced):
                         tot_wb_sliced += wb_sliced
                         cnt_wb_sliced += 1
+                    wb_mmd = _stat_to_float(wb_stats, 'wb_mmd', default=float('nan'))
+                    if np.isfinite(wb_mmd):
+                        tot_wb_mmd += wb_mmd
+                        cnt_wb_mmd += 1
+                    wb_support_norm = _stat_to_float(wb_stats, 'wb_support_norm', default=float('nan'))
+                    if np.isfinite(wb_support_norm):
+                        tot_wb_support_norm += wb_support_norm
+                    wb_support_std = _stat_to_float(wb_stats, 'wb_support_std', default=float('nan'))
+                    if np.isfinite(wb_support_std):
+                        tot_wb_support_std += wb_support_std
+                    wb_h_norm = _stat_to_float(wb_stats, 'wb_h_norm', default=float('nan'))
+                    if np.isfinite(wb_h_norm):
+                        tot_wb_h_norm += wb_h_norm
+                    wb_h_std = _stat_to_float(wb_stats, 'wb_h_std', default=float('nan'))
+                    if np.isfinite(wb_h_std):
+                        tot_wb_h_std += wb_h_std
+                    wb_mean_gap = _stat_to_float(wb_stats, 'wb_mean_gap', default=float('nan'))
+                    if np.isfinite(wb_mean_gap):
+                        tot_wb_mean_gap += wb_mean_gap
+                    wb_std_gap = _stat_to_float(wb_stats, 'wb_std_gap', default=float('nan'))
+                    if np.isfinite(wb_std_gap):
+                        tot_wb_std_gap += wb_std_gap
                     cnt_wb += 1
             if get_image_fusion_mode(cfg) == 'dual_branch_residual_gate':
                 stats = out.get('fusion_stats', None)
@@ -2255,10 +2348,17 @@ def train_and_validate(
         avg_wb_euclid = (tot_wb_euclid / cnt_wb_euclid) if cnt_wb_euclid > 0 else float('nan')
         avg_wb_sinkhorn = (tot_wb_sinkhorn / cnt_wb_sinkhorn) if cnt_wb_sinkhorn > 0 else float('nan')
         avg_wb_sliced = (tot_wb_sliced / cnt_wb_sliced) if cnt_wb_sliced > 0 else float('nan')
+        avg_wb_mmd = (tot_wb_mmd / cnt_wb_mmd) if cnt_wb_mmd > 0 else float('nan')
         avg_wb_anchor = (tot_wb_anchor / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_state = (tot_wb_state / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_active_cancers = (tot_wb_active_cancers / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_active_spots = (tot_wb_active_spots / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_support_norm = (tot_wb_support_norm / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_support_std = (tot_wb_support_std / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_h_norm = (tot_wb_h_norm / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_h_std = (tot_wb_h_std / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_mean_gap = (tot_wb_mean_gap / cnt_wb) if cnt_wb > 0 else float('nan')
+        avg_wb_std_gap = (tot_wb_std_gap / cnt_wb) if cnt_wb > 0 else float('nan')
         avg_wb_lambda = (tot_wb_lambda / max(1, num_batches)) if use_wb_align else float('nan')
         avg_gate_mean = (tot_gate_mean / cnt_gate_mean) if cnt_gate_mean > 0 else float('nan')
         avg_gate_present = (tot_gate_present / cnt_gate_present) if cnt_gate_present > 0 else float('nan')
@@ -2291,10 +2391,17 @@ def train_and_validate(
         hist['avg_wb_euclid_pairwise'].append(avg_wb_euclid)
         hist['avg_wb_sinkhorn'].append(avg_wb_sinkhorn)
         hist['avg_wb_sliced_wasserstein'].append(avg_wb_sliced)
+        hist['avg_wb_mmd'].append(avg_wb_mmd)
         hist['avg_wb_anchor'].append(avg_wb_anchor)
         hist['avg_wb_state_direction'].append(avg_wb_state)
         hist['avg_wb_active_cancers'].append(avg_wb_active_cancers)
         hist['avg_wb_active_spots'].append(avg_wb_active_spots)
+        hist['avg_wb_support_norm'].append(avg_wb_support_norm)
+        hist['avg_wb_support_std'].append(avg_wb_support_std)
+        hist['avg_wb_h_norm'].append(avg_wb_h_norm)
+        hist['avg_wb_h_std'].append(avg_wb_h_std)
+        hist['avg_wb_mean_gap'].append(avg_wb_mean_gap)
+        hist['avg_wb_std_gap'].append(avg_wb_std_gap)
         hist['avg_gate_mean'].append(avg_gate_mean)
         hist['avg_gate_present'].append(avg_gate_present)
         hist['avg_gate_missing'].append(avg_gate_missing)
@@ -2328,13 +2435,21 @@ def train_and_validate(
         val_tot_wb = 0.0
         val_tot_wb_sinkhorn = 0.0
         val_tot_wb_sliced = 0.0
+        val_tot_wb_mmd = 0.0
         val_tot_wb_anchor = 0.0
         val_tot_wb_state = 0.0
         val_tot_wb_active_cancers = 0.0
         val_tot_wb_active_spots = 0.0
+        val_tot_wb_support_norm = 0.0
+        val_tot_wb_support_std = 0.0
+        val_tot_wb_h_norm = 0.0
+        val_tot_wb_h_std = 0.0
+        val_tot_wb_mean_gap = 0.0
+        val_tot_wb_std_gap = 0.0
         val_cnt_wb = 0
         val_cnt_wb_sinkhorn = 0
         val_cnt_wb_sliced = 0
+        val_cnt_wb_mmd = 0
         val_num_batches = 0
         val_batch_losses = []
         val_wb_eval_idx = 0
@@ -2361,7 +2476,7 @@ def train_and_validate(
                     if h_v is not None and hasattr(vb, 'cancer_dom') and hasattr(vb, 'batch'):
                         wb_eval_generator = _make_wb_eval_generator(val_wb_eval_idx)
                         val_wb_eval_idx += 1
-                        b_v = support_map(h_v)
+                        b_v = _make_wb_support(h_v, generator=wb_eval_generator)
                         val_loss_wb, val_loss_wb_anchor, val_wb_stats = wb_module.model_loss(
                             h=h_v,
                             b=b_v,
@@ -2387,8 +2502,30 @@ def train_and_validate(
                             if np.isfinite(val_sliced):
                                 val_tot_wb_sliced += val_sliced
                                 val_cnt_wb_sliced += 1
+                            val_mmd = _stat_to_float(val_wb_stats, 'wb_mmd', default=float('nan'))
+                            if np.isfinite(val_mmd):
+                                val_tot_wb_mmd += val_mmd
+                                val_cnt_wb_mmd += 1
                             val_tot_wb_active_cancers += _stat_to_float(val_wb_stats, 'wb_active_cancers', default=0.0)
                             val_tot_wb_active_spots += _stat_to_float(val_wb_stats, 'wb_active_spots', default=0.0)
+                            val_support_norm = _stat_to_float(val_wb_stats, 'wb_support_norm', default=float('nan'))
+                            if np.isfinite(val_support_norm):
+                                val_tot_wb_support_norm += val_support_norm
+                            val_support_std = _stat_to_float(val_wb_stats, 'wb_support_std', default=float('nan'))
+                            if np.isfinite(val_support_std):
+                                val_tot_wb_support_std += val_support_std
+                            val_h_norm = _stat_to_float(val_wb_stats, 'wb_h_norm', default=float('nan'))
+                            if np.isfinite(val_h_norm):
+                                val_tot_wb_h_norm += val_h_norm
+                            val_h_std = _stat_to_float(val_wb_stats, 'wb_h_std', default=float('nan'))
+                            if np.isfinite(val_h_std):
+                                val_tot_wb_h_std += val_h_std
+                            val_mean_gap = _stat_to_float(val_wb_stats, 'wb_mean_gap', default=float('nan'))
+                            if np.isfinite(val_mean_gap):
+                                val_tot_wb_mean_gap += val_mean_gap
+                            val_std_gap = _stat_to_float(val_wb_stats, 'wb_std_gap', default=float('nan'))
+                            if np.isfinite(val_std_gap):
+                                val_tot_wb_std_gap += val_std_gap
                             val_cnt_wb += 1
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
@@ -2435,7 +2572,7 @@ def train_and_validate(
                     if h_v is not None and hasattr(vg, 'cancer_dom') and hasattr(vg, 'batch'):
                         wb_eval_generator = _make_wb_eval_generator(val_wb_eval_idx)
                         val_wb_eval_idx += 1
-                        b_v = support_map(h_v)
+                        b_v = _make_wb_support(h_v, generator=wb_eval_generator)
                         val_loss_wb, val_loss_wb_anchor, val_wb_stats = wb_module.model_loss(
                             h=h_v,
                             b=b_v,
@@ -2461,8 +2598,30 @@ def train_and_validate(
                             if np.isfinite(val_sliced):
                                 val_tot_wb_sliced += val_sliced
                                 val_cnt_wb_sliced += 1
+                            val_mmd = _stat_to_float(val_wb_stats, 'wb_mmd', default=float('nan'))
+                            if np.isfinite(val_mmd):
+                                val_tot_wb_mmd += val_mmd
+                                val_cnt_wb_mmd += 1
                             val_tot_wb_active_cancers += _stat_to_float(val_wb_stats, 'wb_active_cancers', default=0.0)
                             val_tot_wb_active_spots += _stat_to_float(val_wb_stats, 'wb_active_spots', default=0.0)
+                            val_support_norm = _stat_to_float(val_wb_stats, 'wb_support_norm', default=float('nan'))
+                            if np.isfinite(val_support_norm):
+                                val_tot_wb_support_norm += val_support_norm
+                            val_support_std = _stat_to_float(val_wb_stats, 'wb_support_std', default=float('nan'))
+                            if np.isfinite(val_support_std):
+                                val_tot_wb_support_std += val_support_std
+                            val_h_norm = _stat_to_float(val_wb_stats, 'wb_h_norm', default=float('nan'))
+                            if np.isfinite(val_h_norm):
+                                val_tot_wb_h_norm += val_h_norm
+                            val_h_std = _stat_to_float(val_wb_stats, 'wb_h_std', default=float('nan'))
+                            if np.isfinite(val_h_std):
+                                val_tot_wb_h_std += val_h_std
+                            val_mean_gap = _stat_to_float(val_wb_stats, 'wb_mean_gap', default=float('nan'))
+                            if np.isfinite(val_mean_gap):
+                                val_tot_wb_mean_gap += val_mean_gap
+                            val_std_gap = _stat_to_float(val_wb_stats, 'wb_std_gap', default=float('nan'))
+                            if np.isfinite(val_std_gap):
+                                val_tot_wb_std_gap += val_std_gap
                             val_cnt_wb += 1
                 logits_v = out_v['logits']
                 val_logits_list.append(logits_v.cpu())
@@ -2506,10 +2665,17 @@ def train_and_validate(
         val_avg_wb = (val_tot_wb / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_avg_wb_sinkhorn = (val_tot_wb_sinkhorn / val_cnt_wb_sinkhorn) if val_cnt_wb_sinkhorn > 0 else float('nan')
         val_avg_wb_sliced = (val_tot_wb_sliced / val_cnt_wb_sliced) if val_cnt_wb_sliced > 0 else float('nan')
+        val_avg_wb_mmd = (val_tot_wb_mmd / val_cnt_wb_mmd) if val_cnt_wb_mmd > 0 else float('nan')
         val_avg_wb_anchor = (val_tot_wb_anchor / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_avg_wb_state = (val_tot_wb_state / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_avg_wb_active_cancers = (val_tot_wb_active_cancers / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_avg_wb_active_spots = (val_tot_wb_active_spots / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_support_norm = (val_tot_wb_support_norm / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_support_std = (val_tot_wb_support_std / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_h_norm = (val_tot_wb_h_norm / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_h_std = (val_tot_wb_h_std / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_mean_gap = (val_tot_wb_mean_gap / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
+        val_avg_wb_std_gap = (val_tot_wb_std_gap / val_cnt_wb) if val_cnt_wb > 0 else float('nan')
         val_batch_loss_variance = float(np.mean([(v - val_avg_total) ** 2 for v in val_batch_losses])) if val_batch_losses else float('nan')
         val_accuracy = float(np.nanmean(per_slide_acc)) if per_slide_acc else float('nan')
         hist['val_avg_total_loss'].append(val_avg_total)
@@ -2524,10 +2690,17 @@ def train_and_validate(
         hist['val_avg_wb_loss'].append(val_avg_wb)
         hist['val_avg_wb_sinkhorn'].append(val_avg_wb_sinkhorn)
         hist['val_avg_wb_sliced_wasserstein'].append(val_avg_wb_sliced)
+        hist['val_avg_wb_mmd'].append(val_avg_wb_mmd)
         hist['val_avg_wb_anchor'].append(val_avg_wb_anchor)
         hist['val_avg_wb_state_direction'].append(val_avg_wb_state)
         hist['val_avg_wb_active_cancers'].append(val_avg_wb_active_cancers)
         hist['val_avg_wb_active_spots'].append(val_avg_wb_active_spots)
+        hist['val_avg_wb_support_norm'].append(val_avg_wb_support_norm)
+        hist['val_avg_wb_support_std'].append(val_avg_wb_support_std)
+        hist['val_avg_wb_h_norm'].append(val_avg_wb_h_norm)
+        hist['val_avg_wb_h_std'].append(val_avg_wb_h_std)
+        hist['val_avg_wb_mean_gap'].append(val_avg_wb_mean_gap)
+        hist['val_avg_wb_std_gap'].append(val_avg_wb_std_gap)
         hist['val_batch_loss_variance'].append(val_batch_loss_variance)
         hist['val_accuracy'].append(val_accuracy)
         hist['val_macro_f1'].append(m.get('macro_f1', float('nan')))
@@ -2670,10 +2843,17 @@ def _save_loss_components_csv(hist, out_dir):
         'avg_wb_euclid_pairwise': hist.get('avg_wb_euclid_pairwise', [float('nan')] * n_epochs),
         'avg_wb_sinkhorn': hist.get('avg_wb_sinkhorn', [float('nan')] * n_epochs),
         'avg_wb_sliced_wasserstein': hist.get('avg_wb_sliced_wasserstein', [float('nan')] * n_epochs),
+        'avg_wb_mmd': hist.get('avg_wb_mmd', [float('nan')] * n_epochs),
         'avg_wb_anchor': hist.get('avg_wb_anchor', [float('nan')] * n_epochs),
         'avg_wb_state_direction': hist.get('avg_wb_state_direction', [float('nan')] * n_epochs),
         'avg_wb_active_cancers': hist.get('avg_wb_active_cancers', [float('nan')] * n_epochs),
         'avg_wb_active_spots': hist.get('avg_wb_active_spots', [float('nan')] * n_epochs),
+        'avg_wb_support_norm': hist.get('avg_wb_support_norm', [float('nan')] * n_epochs),
+        'avg_wb_support_std': hist.get('avg_wb_support_std', [float('nan')] * n_epochs),
+        'avg_wb_h_norm': hist.get('avg_wb_h_norm', [float('nan')] * n_epochs),
+        'avg_wb_h_std': hist.get('avg_wb_h_std', [float('nan')] * n_epochs),
+        'avg_wb_mean_gap': hist.get('avg_wb_mean_gap', [float('nan')] * n_epochs),
+        'avg_wb_std_gap': hist.get('avg_wb_std_gap', [float('nan')] * n_epochs),
         'avg_gate_mean': hist.get('avg_gate_mean', [float('nan')] * n_epochs),
         'avg_gate_present': hist.get('avg_gate_present', [float('nan')] * n_epochs),
         'avg_gate_missing': hist.get('avg_gate_missing', [float('nan')] * n_epochs),
@@ -2695,10 +2875,17 @@ def _save_loss_components_csv(hist, out_dir):
         'val_avg_wb_loss': hist.get('val_avg_wb_loss', [float('nan')] * n_epochs),
         'val_avg_wb_sinkhorn': hist.get('val_avg_wb_sinkhorn', [float('nan')] * n_epochs),
         'val_avg_wb_sliced_wasserstein': hist.get('val_avg_wb_sliced_wasserstein', [float('nan')] * n_epochs),
+        'val_avg_wb_mmd': hist.get('val_avg_wb_mmd', [float('nan')] * n_epochs),
         'val_avg_wb_anchor': hist.get('val_avg_wb_anchor', [float('nan')] * n_epochs),
         'val_avg_wb_state_direction': hist.get('val_avg_wb_state_direction', [float('nan')] * n_epochs),
         'val_avg_wb_active_cancers': hist.get('val_avg_wb_active_cancers', [float('nan')] * n_epochs),
         'val_avg_wb_active_spots': hist.get('val_avg_wb_active_spots', [float('nan')] * n_epochs),
+        'val_avg_wb_support_norm': hist.get('val_avg_wb_support_norm', [float('nan')] * n_epochs),
+        'val_avg_wb_support_std': hist.get('val_avg_wb_support_std', [float('nan')] * n_epochs),
+        'val_avg_wb_h_norm': hist.get('val_avg_wb_h_norm', [float('nan')] * n_epochs),
+        'val_avg_wb_h_std': hist.get('val_avg_wb_h_std', [float('nan')] * n_epochs),
+        'val_avg_wb_mean_gap': hist.get('val_avg_wb_mean_gap', [float('nan')] * n_epochs),
+        'val_avg_wb_std_gap': hist.get('val_avg_wb_std_gap', [float('nan')] * n_epochs),
         'val_accuracy': hist.get('val_accuracy', [float('nan')] * n_epochs),
         'val_macro_f1': hist.get('val_macro_f1', [float('nan')] * n_epochs),
         'val_auroc': hist.get('val_auroc', [float('nan')] * n_epochs),
@@ -2948,6 +3135,7 @@ def _plot_wb_train_metrics(hist, out_dir):
         ('avg_wb_anchor', 'val_avg_wb_anchor', 'wb_anchor', True),
         ('avg_wb_sinkhorn', 'val_avg_wb_sinkhorn', 'wb_sinkhorn', False),
         ('avg_wb_sliced_wasserstein', 'val_avg_wb_sliced_wasserstein', 'wb_sliced_wasserstein', False),
+        ('avg_wb_mmd', 'val_avg_wb_mmd', 'wb_mmd', False),
         ('avg_wb_potential_loss', None, 'wb_potential_loss', False),
         ('avg_wb_dual_obj', None, 'wb_dual_obj', False),
         ('avg_wb_euclid_pairwise', None, 'wb_euclid_pairwise', False),
@@ -2984,6 +3172,61 @@ def _plot_wb_train_metrics(hist, out_dir):
     return out_svg
 
 
+def _plot_wb_support_diagnostics(hist, out_dir, cfg=None):
+    cfg = dict(cfg or {})
+    if not bool(cfg.get('use_wb_align', False)):
+        return None
+    if str(cfg.get('wb_support_mode', '')).lower() != 'prior_generator':
+        return None
+    n_epochs = len(hist.get('avg_total_loss', []))
+    if n_epochs == 0:
+        return None
+    required = [
+        'avg_wb_support_norm',
+        'avg_wb_support_std',
+        'avg_wb_h_norm',
+        'avg_wb_h_std',
+        'avg_wb_mean_gap',
+        'avg_wb_std_gap',
+    ]
+    if not any(np.isfinite(pd.Series(hist.get(k, [float('nan')] * n_epochs), dtype='float64').to_numpy()).any() for k in required):
+        return None
+
+    epochs = list(range(1, n_epochs + 1))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.2), sharex=True)
+    panels = [
+        (
+            axes[0],
+            [('avg_wb_support_norm', 'support_norm', '#1f3a5f'), ('avg_wb_h_norm', 'h_norm', '#d97757')],
+            'norm',
+        ),
+        (
+            axes[1],
+            [('avg_wb_support_std', 'support_std', '#1f3a5f'), ('avg_wb_h_std', 'h_std', '#d97757')],
+            'std',
+        ),
+        (
+            axes[2],
+            [('avg_wb_mean_gap', 'mean_gap', '#5b8a72'), ('avg_wb_std_gap', 'std_gap', '#8f63a2')],
+            'gap',
+        ),
+    ]
+    for ax, series_specs, title in panels:
+        for key, label, color in series_specs:
+            values = pd.Series(hist.get(key, [float('nan')] * n_epochs), dtype='float64')
+            ax.plot(epochs, values.values, color=color, linewidth=1.4, label=label)
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
+        ax.legend(loc='best', fontsize=8, frameon=False)
+    fig.tight_layout()
+    out_svg = os.path.join(out_dir, 'wb_support_diagnostics.svg')
+    fig.savefig(out_svg, format='svg', dpi=150)
+    plt.close(fig)
+    return out_svg
+
+
 def _count_seen_domains(graphs):
     batch_seen = {int(g.bat_dom.item()) for g in graphs if hasattr(g, 'bat_dom')}
     cancer_seen = {int(g.cancer_dom.item()) for g in graphs if hasattr(g, 'cancer_dom')}
@@ -3001,6 +3244,10 @@ def _save_wb_artifacts(best, out_dir):
     potentials_path = os.path.join(out_dir, 'wb_potentials_last.pt')
     config_path = os.path.join(out_dir, 'wb_config.json')
     torch.save(best['wb_support_map_last'], support_path)
+    if str(dict(best.get('wb_config', {}) or {}).get('wb_support_mode', '')).lower() == 'prior_generator':
+        prior_generator_path = os.path.join(out_dir, 'wb_prior_generator_last.pt')
+        torch.save(best['wb_support_map_last'], prior_generator_path)
+        paths.append(prior_generator_path)
     torch.save(best['wb_potentials_last'], potentials_path)
     save_json(dict(best.get('wb_config', {}) or {}), config_path)
     paths.extend([support_path, potentials_path, config_path])
@@ -3284,6 +3531,9 @@ def run_single_training(args, cfg, device):
                 out_wb_svg = _plot_wb_train_metrics(hist, args.artifacts_dir)
                 if out_wb_svg:
                     print('Saved WB diagnostics figure to', out_wb_svg)
+                out_wb_support_svg = _plot_wb_support_diagnostics(hist, args.artifacts_dir, cfg=cfg)
+                if out_wb_support_svg:
+                    print('Saved WB support diagnostics figure to', out_wb_support_svg)
 
         if getattr(args, 'save_loss_components', 0):
             csv_path = _save_loss_components_csv(hist, args.artifacts_dir)
@@ -3569,6 +3819,9 @@ def run_kfold_training(args, cfg, device):
                     out_wb_svg = _plot_wb_train_metrics(hist, fold_dir)
                     if out_wb_svg:
                         print(f'[KFold] Saved WB diagnostics figure to {out_wb_svg}')
+                    out_wb_support_svg = _plot_wb_support_diagnostics(hist, fold_dir, cfg=cfg)
+                    if out_wb_support_svg:
+                        print(f'[KFold] Saved WB support diagnostics figure to {out_wb_support_svg}')
             except Exception as e:
                 print(f'[KFold] Warning: failed to save training curves: {e}')
 
@@ -3997,6 +4250,9 @@ def run_loco_training(args, cfg, device):
                     out_wb_svg = _plot_wb_train_metrics(hist, loco_dir)
                     if out_wb_svg:
                         print(f'[LOCO] Saved WB diagnostics figure to {out_wb_svg}')
+                    out_wb_support_svg = _plot_wb_support_diagnostics(hist, loco_dir, cfg=cfg)
+                    if out_wb_support_svg:
+                        print(f'[LOCO] Saved WB support diagnostics figure to {out_wb_support_svg}')
             except Exception as e:
                 print(f'[LOCO] Warning: failed to save training curves: {e}')
 

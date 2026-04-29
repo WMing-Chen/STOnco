@@ -7,7 +7,7 @@ This note is a paper figure drafting spec synchronized with the current code:
 - Training data assembly and losses: `stonco/core/train.py`
 - Inference path: `stonco/core/infer.py`, `stonco/core/batch_infer.py`
 
-The current implementation is no longer a fixed "GATv2 only + LapPE shown but not concatenated" architecture. The model is a configurable GNN framework with optional image-feature early fusion, optional LapPE concatenation, optional dual-domain adversarial heads, and optional MMD alignment on the shared GNN representation.
+The current implementation is no longer a fixed "GATv2 only + LapPE shown but not concatenated" architecture. The model is a configurable GNN framework with optional image-feature fusion, optional LapPE concatenation, optional dual-domain adversarial heads, and optional MMD alignment on the shared GNN representation.
 
 ---
 
@@ -22,18 +22,20 @@ Default training configuration in `stonco/core/train.py`:
 | GATv2 heads | `4` | used only when `model='gatv2'` |
 | Gene PCA | off (`use_pca=False`) | if on, gene dim becomes `pca_dim` |
 | HVG count | `n_hvg='all'` | integer top-HVG count or all genes |
-| Image early fusion | off | if on, append processed image features and an `img_mask` column |
+| Image fusion | off | if on, choose `early_concat` or `dual_branch_residual_gate` |
 | LapPE | off (`lap_pe_dim=0`) | if `lap_pe_dim>0`, compute PE; append only when `concat_lap_pe=True` |
 | LapPE weights | unweighted | can use Gaussian edge weights via `lap_pe_use_gaussian=True` |
-| Slide/batch domain head | on in training | disabled if `use_domain_adv_slide=False` or no domain count |
-| Cancer-type domain head | on in training | disabled if `use_domain_adv_cancer=False` or no domain count |
+| Slide/batch domain head | off by default | enabled only if `use_domain_adv_slide=True` and a domain count is available |
+| Cancer-type domain head | off by default | enabled only if `use_domain_adv_cancer=True` and a domain count is available |
 | MMD alignment | off | if on, applies pairwise multi-domain RBF MMD on `h` |
+
+Current code default for `image_fusion_mode` is `early_concat`.
 
 Figure recommendation:
 
 - Draw the main path as gene features -> graph -> GNN -> tumor probability.
 - Draw image features, LapPE, domain heads, and MMD as optional/config-controlled branches.
-- For a default-config figure, hide image fusion, hide LapPE, hide MMD, keep both domain heads for training.
+- For a default-config figure, hide image fusion, hide LapPE, hide MMD, and hide both domain heads.
 
 ---
 
@@ -288,10 +290,16 @@ h -- GRL(beta_cancer) -> Cancer-Type DomainHead -> dom_logits_cancer in R^(N x K
 
 The two heads are independent parallel classifiers attached to the same shared node embedding `h`.
 
+Current code behavior:
+
+- Both domain heads are disabled unless explicitly enabled in config and the corresponding domain count is known.
+- The cancer-domain head is also used when `use_wb_align=True`, because the WB path needs cancer-domain labels.
+
 Inference note:
 
 - Inference constructs the model for the task path and loads weights with `strict=False`.
 - Domain heads are not needed for prediction.
+- When `image_fusion_mode='dual_branch_residual_gate'`, inference must provide `x_gene`, `x_img`, and `img_mask`.
 
 ### 4.4 Optional Return of Shared Embedding
 
@@ -419,6 +427,7 @@ because MMD is off by default.
 
 **(b) STOnco encoder and task head**
 
+- `x` for `early_concat`, or `(x_gene, x_img, img_mask)` for `dual_branch_residual_gate`
 - `x, edge_index, optional edge_weight -> configurable GNN backbone -> h`
 - `h -> classifier MLP -> logits -> p_tumor`
 
@@ -427,6 +436,7 @@ because MMD is off by default.
 - `h -> GRL(beta_slide) -> slide/batch domain head -> CE`
 - `h -> GRL(beta_cancer) -> cancer-type domain head -> CE`
 - Optional `h -> multi-domain RBF MMD`
+- Optional `h -> generated-support WB` when `use_wb_align=True`
 - Combine enabled losses into `L_total`
 
 ---
@@ -446,6 +456,7 @@ Suggested English labels:
 - **GRL**: "Gradient Reversal Layer"
 - **Domain heads**: "Slide/Batch domain classifier", "Cancer-type domain classifier"
 - **MMD**: "Optional multi-domain RBF MMD on h"
+- **WB**: "Optional generated-support Wasserstein barycenter alignment on h"
 
 Caption note:
 

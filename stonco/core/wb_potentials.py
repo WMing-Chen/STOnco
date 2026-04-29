@@ -34,6 +34,46 @@ class GeneratedSupportMap(nn.Module):
         return h + self.net(self.norm(h))
 
 
+class PriorSupportGenerator(nn.Module):
+    """Generator for an independent shared barycenter support sample b = G(z)."""
+
+    def __init__(self, in_dim, prior_dim=128, hidden=128, dropout=0.0, prior_type='normal'):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.prior_dim = int(prior_dim)
+        self.prior_type = str(prior_type).lower()
+        if self.prior_dim <= 0:
+            raise ValueError(f'wb_prior_dim must be > 0, got: {prior_dim}')
+        if self.prior_type not in {'normal', 'uniform'}:
+            raise ValueError(f"wb_prior_type must be normal or uniform, got: {prior_type}")
+        self.net = nn.Sequential(
+            nn.Linear(self.prior_dim, int(hidden)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden), int(hidden)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden), self.in_dim),
+        )
+
+    def sample_prior(self, n, device=None, dtype=None, generator=None):
+        n = int(n)
+        if n <= 0:
+            raise ValueError(f'prior support sample size must be > 0, got: {n}')
+        device = device if device is not None else next(self.parameters()).device
+        dtype = dtype if dtype is not None else next(self.parameters()).dtype
+        if self.prior_type == 'uniform':
+            return torch.empty(n, self.prior_dim, device=device, dtype=dtype).uniform_(-1.0, 1.0, generator=generator)
+        return torch.randn(n, self.prior_dim, device=device, dtype=dtype, generator=generator)
+
+    def forward(self, z):
+        return self.net(z)
+
+    def sample(self, n, device=None, dtype=None, generator=None):
+        z = self.sample_prior(n, device=device, dtype=dtype, generator=generator)
+        return self.forward(z)
+
+
 class SinglePotentialBank(nn.Module):
     """Scalar potential bank for euclidean_pairwise generated-support loss."""
 
@@ -117,11 +157,16 @@ class GeneratedSupportWBLoss(nn.Module):
         potential_constraint_weight=0.01,
         sinkhorn_iters=50,
         sw_num_projections=64,
+        support_mode='generated_support',
+        mmd_num_kernels=5,
+        mmd_kernel_mul=2.0,
+        mmd_sigma=None,
     ):
         super().__init__()
         self.n_domains = int(n_domains)
         self.in_dim = int(in_dim)
         self.loss_type = str(loss_type).lower()
+        self.support_mode = str(support_mode).lower()
         self.spots_per_graph = int(spots_per_graph)
         self.spots_per_cancer = int(spots_per_cancer)
         self.support_size = int(support_size)
@@ -136,17 +181,30 @@ class GeneratedSupportWBLoss(nn.Module):
         self.potential_constraint_weight = float(potential_constraint_weight)
         self.sinkhorn_iters = max(1, int(sinkhorn_iters))
         self.sw_num_projections = max(1, int(sw_num_projections))
+        self.mmd_num_kernels = max(1, int(mmd_num_kernels))
+        self.mmd_kernel_mul = float(mmd_kernel_mul)
+        self.mmd_sigma = None if mmd_sigma is None else float(mmd_sigma)
+
+        if self.support_mode not in {'generated_support', 'prior_generator'}:
+            raise ValueError(f"wb_support_mode must be generated_support or prior_generator, got: {support_mode}")
+        if self.support_mode == 'prior_generator' and self.loss_type not in {'sinkhorn_divergence', 'sliced_wasserstein', 'mmd'}:
+            raise ValueError(
+                "prior_generator supports only sinkhorn_divergence, sliced_wasserstein, or mmd, "
+                f"got: {loss_type}"
+            )
+        if self.loss_type == 'mmd' and self.support_mode != 'prior_generator':
+            raise ValueError("wb_loss_type=mmd is only supported when wb_support_mode=prior_generator")
 
         if self.loss_type == 'euclidean_pairwise':
             self.potentials = SinglePotentialBank(self.n_domains, self.in_dim, hidden=potential_hidden)
         elif self.loss_type == 'dual_potential':
             self.potentials = DualPotentialBank(self.n_domains, self.in_dim, hidden=potential_hidden)
-        elif self.loss_type in {'sinkhorn_divergence', 'sliced_wasserstein'}:
+        elif self.loss_type in {'sinkhorn_divergence', 'sliced_wasserstein', 'mmd'}:
             self.potentials = None
         else:
             raise ValueError(
                 "wb_loss_type must be dual_potential, euclidean_pairwise, "
-                f"sinkhorn_divergence, or sliced_wasserstein, got: {loss_type}"
+                f"sinkhorn_divergence, sliced_wasserstein, or mmd, got: {loss_type}"
             )
 
         if self.regularizer not in {'l2', 'entropy'}:
@@ -241,7 +299,10 @@ class GeneratedSupportWBLoss(nn.Module):
             return None
 
         h_sel = self._normalize_latent(h[idx])
-        b_sel = self._normalize_latent(b[idx])
+        if self.support_mode == 'prior_generator':
+            b_sel = self._normalize_latent(b)
+        else:
+            b_sel = self._normalize_latent(b[idx])
         cancer_sel = cancer_dom[idx].long()
         y_sel = y[idx] if y is not None else None
 
@@ -256,10 +317,11 @@ class GeneratedSupportWBLoss(nn.Module):
         for k in active:
             keep = keep | (cancer_sel == int(k))
         h_sel = h_sel[keep]
-        b_sel = b_sel[keep]
+        if self.support_mode != 'prior_generator':
+            b_sel = b_sel[keep]
         cancer_sel = cancer_sel[keep]
         y_sel = y_sel[keep] if y_sel is not None else None
-        if h_sel.numel() == 0:
+        if h_sel.numel() == 0 or b_sel.numel() == 0:
             return None
 
         return {
@@ -416,6 +478,60 @@ class GeneratedSupportWBLoss(nn.Module):
             return self._zero(h, requires_grad=True)
         return torch.stack(losses).mean()
 
+    def _build_sigma_list(self, x, y):
+        if self.mmd_sigma is not None:
+            base_sigma = torch.tensor(float(self.mmd_sigma), dtype=x.dtype, device=x.device)
+        else:
+            z = torch.cat([x, y], dim=0)
+            if z.size(0) <= 1:
+                base_sigma = torch.tensor(1.0, dtype=x.dtype, device=x.device)
+            else:
+                sq = torch.cdist(z, z, p=2).pow(2)
+                mask = ~torch.eye(sq.size(0), dtype=torch.bool, device=sq.device)
+                vals = sq[mask]
+                base_sigma = torch.sqrt(vals.mean().clamp_min(1e-12)) if vals.numel() > 0 else torch.tensor(1.0, dtype=x.dtype, device=x.device)
+        center = int(self.mmd_num_kernels) // 2
+        return [
+            (base_sigma * (float(self.mmd_kernel_mul) ** (i - center))).clamp_min(1e-6)
+            for i in range(int(self.mmd_num_kernels))
+        ]
+
+    def _rbf_kernel(self, x, y, sigma_list):
+        sq = torch.cdist(x, y, p=2).pow(2)
+        k = torch.zeros_like(sq)
+        for sigma in sigma_list:
+            gamma = 1.0 / (2.0 * sigma.pow(2).clamp_min(1e-12))
+            k = k + torch.exp(-sq * gamma)
+        return k
+
+    def _mmd2_unbiased(self, x, y, sigma_list):
+        n = int(x.size(0))
+        m = int(y.size(0))
+        if n < 2 or m < 2:
+            return self._zero(x if x.numel() > 0 else y, requires_grad=True)
+        k_xx = self._rbf_kernel(x, x, sigma_list)
+        k_yy = self._rbf_kernel(y, y, sigma_list)
+        k_xy = self._rbf_kernel(x, y, sigma_list)
+        sum_xx = (k_xx.sum() - torch.diagonal(k_xx).sum()) / float(n * (n - 1))
+        sum_yy = (k_yy.sum() - torch.diagonal(k_yy).sum()) / float(m * (m - 1))
+        return torch.clamp(sum_xx + sum_yy - 2.0 * k_xy.mean(), min=0.0)
+
+    def _mmd_barycenter_loss(self, prepared, generator=None):
+        h = prepared['h']
+        b_support = self._support_subset(prepared['b'], generator=generator)
+        cancer = prepared['cancer']
+        active = prepared['active_domains']
+        losses = []
+        for k in active:
+            xk = h[cancer == int(k)]
+            if xk.size(0) < int(self.min_spots) or b_support.size(0) < 2:
+                continue
+            sigma_list = self._build_sigma_list(xk, b_support)
+            losses.append(self._mmd2_unbiased(xk, b_support, sigma_list))
+        if not losses:
+            return self._zero(h, requires_grad=True)
+        return torch.stack(losses).mean()
+
     def _sliced_wasserstein_loss(self, prepared, generator=None):
         h = prepared['h']
         b_support = self._support_subset(prepared['b'], generator=generator)
@@ -515,7 +631,49 @@ class GeneratedSupportWBLoss(nn.Module):
             z = self._zero(h, requires_grad=True) + self._zero(b, requires_grad=True)
             return z, z, self._empty_stats(valid=False)
 
-        shape_loss, shape_count = self._state_direction_loss(prepared)
+        if self.support_mode == 'prior_generator':
+            shape_loss = self._zero(prepared['h'], requires_grad=True)
+            shape_count = 0
+        else:
+            shape_loss, shape_count = self._state_direction_loss(prepared)
+
+        if self.support_mode == 'prior_generator':
+            anchor = self._zero(prepared['b'], requires_grad=True)
+            if self.loss_type == 'sinkhorn_divergence':
+                bary_loss = self._sinkhorn_divergence_loss(prepared)
+                sinkhorn_stat = bary_loss.detach()
+                sliced_stat = h.new_tensor(float('nan'))
+                mmd_stat = h.new_tensor(float('nan'))
+            elif self.loss_type == 'sliced_wasserstein':
+                bary_loss = self._sliced_wasserstein_loss(prepared, generator=generator)
+                if bary_loss is None:
+                    z = self._zero(h, requires_grad=True) + self._zero(b, requires_grad=True)
+                    return z, anchor, self._empty_stats(valid=False)
+                sinkhorn_stat = h.new_tensor(float('nan'))
+                sliced_stat = bary_loss.detach()
+                mmd_stat = h.new_tensor(float('nan'))
+            elif self.loss_type == 'mmd':
+                bary_loss = self._mmd_barycenter_loss(prepared, generator=generator)
+                sinkhorn_stat = h.new_tensor(float('nan'))
+                sliced_stat = h.new_tensor(float('nan'))
+                mmd_stat = bary_loss.detach()
+            else:
+                raise ValueError(f'Unsupported prior_generator loss_type: {self.loss_type}')
+            raw_loss = bary_loss
+            stats = self._stats_from_prepared(prepared)
+            stats.update({
+                'valid': True,
+                'wb_loss': raw_loss.detach(),
+                'wb_dual_obj': h.new_tensor(float('nan')),
+                'wb_euclid_pairwise': h.new_tensor(float('nan')),
+                'wb_sinkhorn': sinkhorn_stat,
+                'wb_sliced_wasserstein': sliced_stat,
+                'wb_mmd': mmd_stat,
+                'wb_anchor': anchor.detach(),
+                'wb_state_direction': shape_loss.detach(),
+                'wb_state_direction_count': float(shape_count),
+            })
+            return raw_loss, anchor, stats
 
         if self.loss_type == 'dual_potential':
             anchor = self._anchor_loss(prepared)
@@ -529,6 +687,7 @@ class GeneratedSupportWBLoss(nn.Module):
                 'wb_euclid_pairwise': h.new_tensor(float('nan')),
                 'wb_sinkhorn': h.new_tensor(float('nan')),
                 'wb_sliced_wasserstein': h.new_tensor(float('nan')),
+                'wb_mmd': h.new_tensor(float('nan')),
                 'wb_anchor': anchor.detach(),
                 'wb_state_direction': shape_loss.detach(),
                 'wb_state_direction_count': float(shape_count),
@@ -547,6 +706,7 @@ class GeneratedSupportWBLoss(nn.Module):
                 'wb_euclid_pairwise': h.new_tensor(float('nan')),
                 'wb_sinkhorn': sinkhorn_loss.detach(),
                 'wb_sliced_wasserstein': h.new_tensor(float('nan')),
+                'wb_mmd': h.new_tensor(float('nan')),
                 'wb_anchor': anchor.detach(),
                 'wb_state_direction': shape_loss.detach(),
                 'wb_state_direction_count': float(shape_count),
@@ -568,6 +728,7 @@ class GeneratedSupportWBLoss(nn.Module):
                 'wb_euclid_pairwise': h.new_tensor(float('nan')),
                 'wb_sinkhorn': h.new_tensor(float('nan')),
                 'wb_sliced_wasserstein': sliced_loss.detach(),
+                'wb_mmd': h.new_tensor(float('nan')),
                 'wb_anchor': anchor.detach(),
                 'wb_state_direction': shape_loss.detach(),
                 'wb_state_direction_count': float(shape_count),
@@ -591,6 +752,7 @@ class GeneratedSupportWBLoss(nn.Module):
             'wb_euclid_pairwise': pair_loss.detach(),
             'wb_sinkhorn': h.new_tensor(float('nan')),
             'wb_sliced_wasserstein': h.new_tensor(float('nan')),
+            'wb_mmd': h.new_tensor(float('nan')),
             'wb_anchor': anchor.detach(),
             'wb_state_direction': shape_loss.detach(),
             'wb_state_direction_count': float(shape_count),
@@ -599,9 +761,19 @@ class GeneratedSupportWBLoss(nn.Module):
         return raw_loss, anchor, stats
 
     def _stats_from_prepared(self, prepared):
+        h = prepared['h']
+        b = prepared['b']
+        h_std = h.std(dim=0, unbiased=False)
+        b_std = b.std(dim=0, unbiased=False)
         return {
             'wb_active_cancers': float(len(prepared['active_domains'])),
-            'wb_active_spots': float(prepared['h'].size(0)),
+            'wb_active_spots': float(h.size(0)),
+            'wb_support_norm': b.norm(dim=1).mean().detach(),
+            'wb_support_std': b_std.mean().detach(),
+            'wb_h_norm': h.norm(dim=1).mean().detach(),
+            'wb_h_std': h_std.mean().detach(),
+            'wb_mean_gap': (h.mean(dim=0) - b.mean(dim=0)).norm().detach(),
+            'wb_std_gap': (h_std - b_std).norm().detach(),
         }
 
     def _empty_stats(self, valid=False):
@@ -609,4 +781,10 @@ class GeneratedSupportWBLoss(nn.Module):
             'valid': bool(valid),
             'wb_active_cancers': 0.0,
             'wb_active_spots': 0.0,
+            'wb_support_norm': float('nan'),
+            'wb_support_std': float('nan'),
+            'wb_h_norm': float('nan'),
+            'wb_h_std': float('nan'),
+            'wb_mean_gap': float('nan'),
+            'wb_std_gap': float('nan'),
         }
