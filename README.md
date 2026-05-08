@@ -1,25 +1,30 @@
-# STOnco: Spatial Transcriptomics Tumor Region Identification with Dual-Domain Adversarial Learning
+# STOnco: Pan-Cancer Spatial Tumor Region Identification with Continuous Wasserstein Barycenter Learning
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-STOnco is a PyTorch Geometric-based framework for tumor/non-tumor binary classification in 10x Visium spatial transcriptomics data. It features dual-domain adversarial learning to improve model generalization across different cancer types and experimental batches.
+STOnco is a graph neural network framework for tumor region identification in spatial transcriptomics data. It uses Continuous Wasserstein Barycenter Learning to learn a shared pan-cancer latent barycenter, enabling cancer-specific spot-level latent distributions to form consistent representations in a common latent space and improving generalization across cancer types and experimental batches.
+
+The Continuous Wasserstein Barycenter (CWB) module is used only during training. Inference remains a standard and lightweight prediction path:
+
+```text
+input graph -> GNN encoder -> spot latent h -> classifier head -> tumor probability
+```
 
 <img width="1468" height="406" alt="image" src="https://github.com/user-attachments/assets/4b2f0acf-65d9-4a81-b52d-dc33e0460e36" />
 
 
 ## Key Features
 
-- **Dual-Domain Adversarial Learning**: Reduces dependency on cancer-specific signals and batch effects
-- **Spot-Level Domain Heads + GRL Scheduling**: Domain adversarial learning at the spot level with decoupled loss weight and GRL strength
-- **Multiple GNN Architectures**: Support for GATv2, GCN, and GraphSAGE models
-- **Optional Image Feature Early Fusion (Scheme 1)**: Concatenate per-spot image features into node inputs with independent preprocessing (StandardScaler + optional PCA)
-- **Complete Pipeline**: From data preparation to training, inference, and visualization
-- **Hyperparameter Optimization**: Built-in HPO with multi-stage pipeline
-- **Batch Processing**: Efficient inference on multiple samples
-- **Rich Visualization**: Comprehensive plotting and analysis tools
-- **Latent Export + UMAP/t-SNE**: Export 64-d spot embeddings and visualize with UMAP and t-SNE
+- **Continuous Wasserstein Barycenter Learning**: Learns a shared pan-cancer latent barycenter that regularizes cancer-specific spot-level latent distributions into a common representation space.
+- **Prior-Generated Continuous Support**: Parameterizes the shared barycenter distribution with a training-only generator `b = G_psi(z)`, where `z` is sampled from a normal or uniform prior.
+- **Wasserstein-Style Distribution Losses**: Supports `sliced_wasserstein`, `sinkhorn_divergence`, and fixed-kernel `mmd` for prior-generator barycenter learning.
+- **Spot-Level Tumor Region Classification**: Predicts tumor/non-tumor labels for each spatial spot from gene-expression graphs.
+- **Flexible GNN Backbones**: Supports GATv2, GCN, and GraphSAGE models.
+- **Optional Dual-Domain Adversarial Learning**: Adds batch-domain and cancer-domain adversarial heads when domain confusion is desired as an extra regularizer.
+- **Optional Image Feature Fusion**: Supports per-spot image features with independent preprocessing and optional PCA.
+- **Embedding Export + UMAP/t-SNE**: Exports spot-level latent embeddings and visualizes them with UMAP and t-SNE.
 
 ## Installation
 
@@ -65,30 +70,48 @@ python -m stonco.utils.prepare_data build-val-npz \
     --label_col true_label
 ```
 
-### 2. Model Training
+### 2. Baseline Training
 
 ```bash
 python -m stonco.core.train \
     --train_npz ./processed_data/train_data.npz \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_baseline \
     --model gatv2
 ```
 
-Enable image feature early fusion (Scheme 1):
+### 3. Training with Continuous Wasserstein Barycenter Learning
+
+The recommended CWB configuration uses `wb_support_mode=prior_generator` and `wb_loss_type=sliced_wasserstein`. This learns a prior-generated shared support distribution and regularizes cancer-specific spot-level latent distributions toward the learned pan-cancer barycenter.
 
 ```bash
 python -m stonco.core.train \
     --train_npz ./processed_data/train_data.npz \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --model gatv2 \
-    --use_image_features 1 \
-    --img_use_pca 1 \
-    --img_pca_dim 256
+    --use_wb_align 1 \
+    --wb_support_mode prior_generator \
+    --wb_loss_type sliced_wasserstein \
+    --lambda_wb 0.15 \
+    --wb_warmup_epochs 10 \
+    --wb_ramp_epochs 20 \
+    --wb_spots_per_graph 512 \
+    --wb_support_size 256 \
+    --wb_sw_num_projections 64
 ```
 
-When `--use_image_features 1`, training also saves the image preprocessor artifacts to `--artifacts_dir`:
-`img_feature_names.txt`, `img_scaler.joblib`, and (if `--img_use_pca 1`) `img_pca.joblib`.
-If `--img_use_pca 1`, training requires the number of valid image spots (where `img_mask==1`) to be at least `--img_pca_dim`.
+For a debiased Sinkhorn divergence variant, keep the same command and replace the WB-specific options with:
+
+```bash
+--wb_support_mode prior_generator \
+--wb_loss_type sinkhorn_divergence \
+--lambda_wb 0.15 \
+--wb_epsilon 0.1 \
+--wb_sinkhorn_iters 50 \
+--wb_spots_per_graph 128 \
+--wb_support_size 256
+```
+
+The prior generator is training-only. At inference time, STOnco uses only the trained encoder and classifier head.
 
 Training outputs include `loss_components.csv`, `train_loss.svg`, and `train_val_metrics.svg` in `--artifacts_dir`. Use `--val_sample_dir` to include external validation NPZs in validation metrics. The `meta.json` now records `train_ids`, `val_ids`, and `metrics` for reproducibility. You can control validation splitting with `--val_ratio` (default 0.2) or disable stratification via `--no_stratify_by_cancer`.
 You can also adjust the classifier/domain-head widths via `--clf_hidden` (comma-separated positive integers, variable depth) and `--dom_hidden` (one hidden layer for both domain heads); values are saved into `meta.json` to keep inference consistent.
@@ -103,19 +126,35 @@ python -m stonco.core.train \
     --early_patience 0
 ```
 
-### 3. Inference
+### 4. Optional Image Feature Fusion
+
+```bash
+python -m stonco.core.train \
+    --train_npz ./processed_data/train_data.npz \
+    --artifacts_dir ./artifacts_image \
+    --model gatv2 \
+    --use_image_features 1 \
+    --img_use_pca 1 \
+    --img_pca_dim 256
+```
+
+When `--use_image_features 1`, training also saves the image preprocessor artifacts to `--artifacts_dir`:
+`img_feature_names.txt`, `img_scaler.joblib`, and (if `--img_use_pca 1`) `img_pca.joblib`.
+If `--img_use_pca 1`, training requires the number of valid image spots (where `img_mask==1`) to be at least `--img_pca_dim`.
+
+### 5. Inference
 
 ```bash
 # Single sample inference
 python -m stonco.core.infer \
     --npz sample.npz \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --out_csv predictions.csv
 
 # Batch inference
 python -m stonco.core.batch_infer \
     --npz_glob "./test_samples/*.npz" \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --out_csv ./predictions/batch_predictions.csv
 ```
 
@@ -125,7 +164,7 @@ Batch inference also supports predicting internal validation slides + external N
 python -m stonco.core.batch_infer \
     --train_npz ./processed_data/train_data.npz \
     --external_val_dir ./processed_data/val_npz \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --out_csv ./predictions/batch_predictions.csv
 ```
 Batch inference writes spot-level predictions to `out_csv` and also emits a slide-level summary CSV (`batch_preds_summary.csv`) in the same directory.
@@ -161,79 +200,159 @@ for i in {1..10}; do
 done
 ```
 
-### 4. Visualization
+### 6. Visualization
 
 ```bash
 python -m stonco.utils.visualize_prediction \
     --npz sample.npz \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --out_svg visualization.svg
 ```
 
-### 5. Export Spot Embeddings (h / z_clf) + UMAP/t-SNE
+### 7. Export Spot Embeddings (h / z_clf) + UMAP/t-SNE
 
 Export 64-d spot embeddings from the trained model:
 
 ```bash
 python -m stonco.utils.export_spot_embeddings \
-    --artifacts_dir ./artifacts \
+    --artifacts_dir ./artifacts_cwb \
     --npz_glob "./processed_data/val_npz/*.npz" \
-    --out_csv ./artifacts/spot_embeddings_val_npz.csv
+    --out_csv ./artifacts_cwb/spot_embeddings_val_npz.csv
 ```
 
 Visualize the exported embeddings with UMAP + t-SNE (requires `umap-learn`, included in `requirements.txt`):
 
 ```bash
 python -m stonco.utils.visualize_umap_tsne \
-    --embeddings_csv ./artifacts/spot_embeddings_val_npz.csv \
-    --out_dir ./artifacts/embedding_plots \
+    --embeddings_csv ./artifacts_cwb/spot_embeddings_val_npz.csv \
+    --out_dir ./artifacts_cwb/embedding_plots \
     --max_points 50000 \
     --seed 42
 ```
 
 ## Model Architecture
 
-STOnco employs a unified `STOnco_Classifier` architecture with:
+STOnco consists of three main training-time components:
 
-- **GNN Backbone**: Configurable graph neural network (GATv2/GCN/GraphSAGE)
-- **Task Head**: Spot-level tumor/non-tumor prediction with a fixed MLP head `[256, 128, 64, 1]`
-- **Domain Heads**: Optional adversarial heads (spot-level) for cancer type and batch domain adaptation
+1. A GNN encoder that maps each spatial spot to a latent representation `h`.
+2. A tumor/non-tumor classifier head that predicts spot-level tumor probability from `h`.
+3. A Continuous Wasserstein Barycenter Learning module that learns a shared pan-cancer latent barycenter and regularizes cancer-specific latent distributions toward it.
 
-### Dual-Domain Adversarial Learning
+### Continuous Wasserstein Barycenter Learning
 
+For cancer type `k`, let `P_k^h` denote the empirical distribution of spot-level GNN latents. STOnco learns a shared support distribution:
+
+```text
+z ~ p(z)
+b = G_psi(z)
+Q_psi = Law(G_psi(z))
 ```
-Total_Loss = Task_Loss + λ_slide × Batch_Domain_Loss + λ_cancer × Cancer_Domain_Loss
+
+and minimizes a barycenter regularization term:
+
+```text
+L_CWB = sum_k D(P_k^h, Q_psi)
 ```
 
-In `train.py`:
+where `D` can be `sliced_wasserstein`, `sinkhorn_divergence`, or fixed-kernel `mmd`. This is a distribution-level constraint: it does not force one-to-one spot matching across cancer types. Instead, it encourages different cancer-specific spot-level latent distributions to share a common pan-cancer geometry while preserving the supervised tumor/non-tumor objective.
 
-- `--lambda_slide` / `--lambda_cancer` are **loss weights (alpha)**.
-- GRL strength (beta) is controlled by `--grl_beta_mode`:
-  - `dann` (default): DANN-style schedule from 0 → target, with `--grl_beta_slide_target`, `--grl_beta_cancer_target` (default `1.0/0.5`) and `--grl_beta_gamma` (default `10`)
-  - `constant`: beta is fixed to `*_target` for the whole training (gamma is ignored)
-- Domain labels are read from `data/cancer_sample_labels.csv`: `cancer_type` and `Batch_id` (`Batch_id` falls back to `slide_id` if missing). Domain class counts are inferred per run/fold.
+The overall training objective is:
+
+```text
+L_total = L_task
+        + optional domain adversarial losses
+        + optional MMD losses
+        + lambda_wb(t) * L_CWB
+```
+
+`lambda_wb(t)` follows a warmup and ramp schedule controlled by `--wb_warmup_epochs`, `--wb_ramp_epochs`, and `--lambda_wb`.
+
+### Support Modes
+
+STOnco supports two barycenter support modes:
+
+| `wb_support_mode` | Support definition | Main use |
+|---|---|---|
+| `prior_generator` | `b = G_psi(z)` from random prior samples | Recommended CWB mode. Learns an independent continuous pan-cancer support distribution. |
+| `generated_support` | `b = T_phi(h)` from spot latents | Legacy generated-support mode with spot-wise transformed support points. |
+
+In `prior_generator` mode, pointwise anchor loss is disabled and logged as `wb_anchor=0`, because generated support samples are independent of individual spots.
+
+### WB Loss Choices
+
+| `wb_loss_type` | Supported support modes | Description |
+|---|---|---|
+| `sliced_wasserstein` | `prior_generator`, `generated_support` | Efficient Wasserstein-style distribution matching through random 1D projections. Recommended default for CWB experiments. |
+| `sinkhorn_divergence` | `prior_generator`, `generated_support` | Debiased entropy-regularized OT distance. More expensive, but closer to standard optimal transport. |
+| `mmd` | `prior_generator` only | Fixed-kernel MMD barycenter ablation. |
+| `euclidean_pairwise` | `generated_support` only | Lightweight legacy generated-support surrogate. |
+| `dual_potential` | `generated_support` only | Neural dual-potential WB surrogate. |
+
+### Optional Dual-Domain Adversarial Learning
+
+STOnco can optionally add spot-level adversarial heads for batch and cancer domains. These losses are controlled by:
+
+- `--use_domain_adv_slide`, `--lambda_slide`
+- `--use_domain_adv_cancer`, `--lambda_cancer`
+- `--grl_beta_mode` and the corresponding GRL target, delay, and warmup arguments
+
+Domain labels are read from `data/cancer_sample_labels.csv`: `cancer_type` and `Batch_id`. If `Batch_id` is missing, it falls back to `slide_id`. Domain class counts are inferred for each run or fold.
+
+## Training Artifacts
+
+Standard training outputs include:
+
+- `model.pt`: final or best model, depending on `--save_last` and early stopping.
+- `model_best.pt`: best validation checkpoint when available.
+- `meta.json`: full training configuration, train/validation slide IDs, metrics, and checkpoint metadata.
+- `genes_hvg.txt`, `scaler.joblib`, `pca.joblib`: gene preprocessing artifacts.
+- `train_loss.svg`, `train_val_loss.svg`, `train_val_metrics.svg`, `lr.svg`: training curves.
+- `loss_components.csv`: epoch-level loss components and validation metrics.
+
+When `--use_wb_align 1` is enabled, STOnco additionally saves:
+
+- `wb_support_map_last.pt`: trained support map or prior generator state.
+- `wb_potentials_last.pt`: WB module state, kept for a consistent artifact layout.
+- `wb_config.json`: WB/CWB configuration.
+- `wb_train_loss.svg`: WB loss and diagnostic curves.
+- `wb_support_diagnostics.svg`: prior-support diagnostics when `wb_support_mode=prior_generator`.
+
+`loss_components.csv` includes WB/CWB metrics when available, such as:
+
+- `avg_wb_loss`
+- `avg_wb_sliced_wasserstein`
+- `avg_wb_sinkhorn`
+- `avg_wb_mmd`
+- `avg_wb_active_cancers`
+- `avg_wb_active_spots`
+- `wb_lambda`
+
+If `--wb_eval_loss 1` is enabled, validation-side WB diagnostics are also recorded, for example `val_avg_wb_loss`, `val_avg_wb_sliced_wasserstein`, `val_avg_wb_sinkhorn`, and `val_avg_wb_mmd`.
 
 ## Project Structure
 
 ```
 STOnco/
 ├── stonco/
-│   ├── core/                 # Core training and inference modules
-│   │   ├── models.py         # Model architectures
-│   │   ├── train.py          # Training script
+│   ├── core/
+│   │   ├── models.py         # GNN encoder, classifier, and domain heads
+│   │   ├── train.py          # Training CLI and CWB/WB integration
+│   │   ├── wb_potentials.py  # Support generators and WB/CWB losses
 │   │   ├── train_hpo.py      # Hyperparameter optimization
-│   │   ├── infer.py          # Single sample inference
-│   │   └── batch_infer.py    # Batch inference
-│   └── utils/                # Utility functions
-│       ├── prepare_data.py   # Data preprocessing
-│       ├── evaluate_models.py # Model evaluation
-│       ├── visualize_prediction.py # Visualization
-│       ├── export_spot_embeddings.py # Export h / z_clf embeddings
-│       ├── visualize_umap_tsne.py # UMAP + t-SNE visualization
+│   │   ├── infer.py          # Single-sample inference
+│   │   ├── batch_infer.py    # Batch inference
+│   │   └── sampler.py        # Training samplers
+│   └── utils/
+│       ├── prepare_data.py
+│       ├── evaluate_models.py
+│       ├── visualize_prediction.py
+│       ├── export_spot_embeddings.py
+│       ├── visualize_umap_tsne.py
+│       ├── evaluate_embedding_mixing.py
 │       └── ...
-├── examples/                 # Example scripts and tutorials
-├── synthetic_data/           # (Generated) synthetic data for testing
-├── docs/                     # Documentation
+├── docs/
+├── examples/
+├── tests/
 └── requirements.txt
 ```
 
@@ -315,6 +434,13 @@ Check out the `examples/` directory for:
 - `*_gatv2.py`: GATv2-specific implementations
 - Complete end-to-end workflows
 
+## References
+
+- `docs/PLAN_prior_generator_barycenter_STOnco.md`
+- `docs/PLAN_sliced_wasserstein_WB_STOnco.md`
+- `docs/PLAN_sinkhorn_divergence_WB_STOnco.md`
+- `docs/Tutorial.md`
+
 
 ## Contributing
 
@@ -331,5 +457,5 @@ For questions and support, please open an issue on GitHub or contact the develop
 ## Acknowledgments
 
 - Built with [PyTorch Geometric](https://pytorch-geometric.readthedocs.io/)
-- Inspired by advances in spatial transcriptomics analysis
+- Inspired by advances in spatial transcriptomics, optimal transport, and pan-cancer representation learning
 - Thanks to all contributors and the open-source community

@@ -1,638 +1,641 @@
-# STOnco Model Architecture Figure (Current Code, Block-Level)
+# STOnco 模型结构图（当前代码）
 
-This note is a paper figure drafting spec synchronized with the current code:
+本文档只描述当前仓库中已经实现的 STOnco 结构和相关数据流，不扩展论文解释或未落到代码中的设计。
 
-- Model: `stonco/core/models.py` (`STOnco_Classifier`, `GNNBackbone`)
-- Feature construction and graph construction: `stonco/utils/preprocessing.py`
-- Training data assembly and losses: `stonco/core/train.py`
-- Inference path: `stonco/core/infer.py`, `stonco/core/batch_infer.py`
+STOnco 当前代码中的核心任务是：在多癌种、多切片的 10x Visium 空间转录组数据上，学习一个可跨癌种复用的空间点级癌灶区域识别模型。模型的直接输出不是切片分类，也不是癌种分类，而是每个空间点属于肿瘤区域的概率 `p_tumor`。因此，主干结构围绕“基因表达特征 + 空间邻域图 -> 共享空间点表示 `h` -> 肿瘤/非肿瘤 logit”构建；域对抗、MMD 和 WB 对齐都是训练阶段围绕 `h` 加上的泛化约束，用于减少模型对特定切片、批次或癌种来源信号的依赖。
 
-The current implementation is no longer a fixed "GATv2 only + LapPE shown but not concatenated" architecture. The model is a configurable GNN framework with optional image-feature fusion, optional LapPE concatenation, optional dual-domain adversarial heads, and optional MMD alignment on the shared GNN representation.
+对应代码位置：
+
+- 模型：`stonco/core/models.py`
+- 模型构建工具：`stonco/core/model_utils.py`
+- 特征预处理和图构建：`stonco/utils/preprocessing.py`
+- 训练数据组装和损失：`stonco/core/train.py`
+- 推理：`stonco/core/infer.py`、`stonco/core/batch_infer.py`
+- WB 训练模块：`stonco/core/wb_potentials.py`
+
+### 模块实际作用速览
+
+| 模块 | 实际作用 |
+|---|---|
+| `Preprocessor` | 把不同切片、不同癌种来源的原始表达矩阵映射到统一基因特征空间，包括归一化、log、HVG/全基因选择、标准化和可选 PCA，是跨样本复用模型的输入基础。 |
+| `ImagePreprocessor` | 对可用的空间点图像特征做标准化和可选 PCA；无效图像空间点输出零向量，并保留 `img_mask`，使模型可以在有/无图像信息的空间点上保持一致输入语义。 |
+| `GraphBuilder` | 根据空间点坐标构建 KNN 图，同时生成 `edge_index` 和 Gaussian `edge_weight`；也负责可选 LapPE，使模型在局部空间邻域内识别连续癌灶区域。 |
+| `build_node_feature_fields(...)` | 按 `image_fusion_mode` 把预处理后的基因、图像、mask、LapPE 组织成 PyG `Data` 需要的字段。 |
+| `GNNBackbone` | 在空间图上传播和变换节点特征，输出每个空间点的共享表示 `h`；这是癌灶分类、域对抗、MMD 和 WB 对齐共同使用的中心表示。 |
+| `WeightedSAGEConv` | GraphSAGE 的加权版本，用 `edge_weight` 做邻居加权均值。 |
+| `ResidualGatedFusion` | 在双分支图像融合模式中，把图像分支表示投影到基因分支维度，并用 gate 控制图像残差加到基因表示上的幅度。 |
+| `ClassifierHead` | 将共享节点表示 `h` 映射为每个空间点的肿瘤/非肿瘤 logit，是癌灶区域识别的任务输出头。 |
+| `DomainHead` + `grad_reverse` | 训练时可选的域对抗分支，用切片/批次或癌种标签约束共享表示的域信息，目标是提升跨批次、跨癌种泛化能力；推理不依赖域头输出。 |
+| MMD loss | 训练时可选的表示对齐项，在共享表示 `h` 上按切片/癌种域计算，作为域不变表示学习的额外正则。 |
+| WB modules | 训练时可选的 WB 对齐模块，在 `STOnco_Classifier` 外部构建并作用于共享表示 `h`，用于把不同癌种的空间点表示分布推向共享支撑集/重心。 |
+| `InferenceEngine` | 推理时复用保存的预处理器和模型配置，构图后加载模型并输出 `sigmoid(logits)`。 |
 
 ---
 
-## 1. Current Defaults and Configurable Branches
+## 0. 面向泛癌种癌灶识别的结构主线
 
-Default training configuration in `stonco/core/train.py`:
+从研究目的看，当前 STOnco 结构可以分成四个功能层：
 
-| Component | Current default | Configurable behavior |
+1. **跨样本输入标准化**：`Preprocessor` 把各切片的表达矩阵对齐到同一特征空间；可选的 `ImagePreprocessor` 对空间点图像特征做同样的训练集拟合、推理集复用处理。
+2. **空间上下文建模**：`GraphBuilder` 以空间点坐标构建切片内 KNN 图，使 GNN 不只看单个空间点的表达，还聚合局部空间邻域信息，服务于空间上连续的癌灶区域识别。
+3. **共享空间点表示学习**：`STOnco_Classifier.encode(...)` 通过单分支 GNN 或基因/图像双分支残差门控融合生成共享表示 `h`。后续所有任务输出和训练期对齐项都围绕 `h` 展开。
+4. **任务输出与泛化约束**：`ClassifierHead` 对每个空间点输出肿瘤 logit；可选的切片/批次域头、癌种域头、MMD 和 WB 对齐在训练阶段约束 `h`，使它更偏向肿瘤区域相关模式，而不是某个特定癌种或批次的来源信息。
+
+因此，画模型结构图时建议把 `h` 放在中心：主路径是“表达矩阵/可选图像特征 + 坐标 -> 图节点特征 -> GNN 编码器 -> `h` -> 肿瘤概率”；训练期辅助路径是“`h` -> 域对抗/MMD/WB 损失”。
+
+---
+
+## 1. 当前训练默认配置
+
+`stonco/core/train.py` 中主训练入口的默认配置如下：
+
+| 项目 | 默认值 | 代码行为 |
 |---|---:|---|
-| GNN backbone | `gatv2` | `gatv2`, `gcn`, or `sage` via `--model` |
-| GNN hidden dims | `[256, 128, 64]` | scalar repeated by `num_layers`, or comma/list dims via `GNN_hidden` |
-| GATv2 heads | `4` | used only when `model='gatv2'` |
-| Gene PCA | off (`use_pca=False`) | if on, gene dim becomes `pca_dim` |
-| HVG count | `n_hvg='all'` | integer top-HVG count or all genes |
-| Image fusion | off | if on, choose `early_concat` or `dual_branch_residual_gate` |
-| LapPE | off (`lap_pe_dim=0`) | if `lap_pe_dim>0`, compute PE; append only when `concat_lap_pe=True` |
-| LapPE weights | unweighted | can use Gaussian edge weights via `lap_pe_use_gaussian=True` |
-| Slide/batch domain head | off by default | enabled only if `use_domain_adv_slide=True` and a domain count is available |
-| Cancer-type domain head | off by default | enabled only if `use_domain_adv_cancer=True` and a domain count is available |
-| MMD alignment | off | if on, applies pairwise multi-domain RBF MMD on `h` |
+| GNN 主干 | `gatv2` | 可配置为 `gatv2`、`gcn`、`sage` |
+| GNN 隐藏维度 | `[256, 128, 64]` | 由 `normalize_gnn_config(...)` 规范化；标量会按 `num_layers` 重复 |
+| GNN 层数 | `3` | 若 `GNN_hidden` 是列表，实际层数等于列表长度 |
+| GATv2 注意力头数 | `4` | 只用于 `model='gatv2'` |
+| Dropout | `0.3` | `gnn_dropout`、`clf_dropout`、`dom_dropout` 未显式设置时使用 `dropout` |
+| 基因 PCA | `False` | `use_pca=False` 时直接使用标准化后的基因特征 |
+| HVG | `all` | `n_hvg='all'` 时使用输入 NPZ 中所有基因 |
+| 图像特征 | `False` | `use_image_features=True` 时才读取 `X_imgs`、`img_masks`、`img_feature_names` |
+| 图像融合模式 | `early_concat` | 另一种已实现模式为 `dual_branch_residual_gate` |
+| LapPE | `lap_pe_dim=0` | 大于 0 时计算 LapPE；只有 `concat_lap_pe=True` 才进入模型输入 |
+| 域头 | 关闭 | `use_domain_adv_slide/cancer=True` 且域数量存在时才构建 |
+| MMD | 关闭 | `use_mmd=True` 时在训练中使用 `h` 计算 |
+| WB 对齐 | 关闭 | `use_wb_align=True` 时在训练中使用额外 WB 模块 |
+| 分类头隐藏维度 | `[256, 128, 64]` | `ClassifierHead` 的多层 MLP 隐藏维度 |
 
-Current code default for `image_fusion_mode` is `early_concat`.
-
-Figure recommendation:
-
-- Draw the main path as gene features -> graph -> GNN -> tumor probability.
-- Draw image features, LapPE, domain heads, and MMD as optional/config-controlled branches.
-- For a default-config figure, hide image fusion, hide LapPE, hide MMD, and hide both domain heads.
+默认训练损失只有带标签空间点上的二分类 BCE。域对抗、MMD、WB 都是显式开启后才加入。
 
 ---
 
-## 2. Symbols and Tensor Shapes
+## 2. 符号和张量
 
-Per slide:
+单张切片：
 
-- `N`: number of spots/nodes
-- `G`: number of genes in raw expression matrix
-- `G_hvg`: selected gene count (`n_hvg`, or all genes)
-- `D_gene`: output dimension of gene preprocessing
-  - `D_gene = pca_dim` if `use_pca=True`
-  - `D_gene = G_hvg` if `use_pca=False`
-- `D_img_raw`: raw image feature dimension, typically 2048 when image features are present
-- `D_img`: processed image feature dimension
-  - `D_img = img_pca_dim` if `img_use_pca=True`
-  - `D_img = D_img_raw` if `img_use_pca=False`
-- `K`: LapPE dimension, `K = lap_pe_dim`
-- `E`: number of directed PyG edges after KNN symmetrization, typically near `2*N*k`
-- `H`: GATv2 attention heads, `H = heads`
-- `L`: effective number of GNN layers, equal to `len(GNN_hidden)` after config normalization
-- `g_i`: hidden dim configured for GNN layer `i`
-- `d_gnn`: final GNN node embedding dimension
-  - GATv2: `d_gnn = g_L * H` because `concat=True`
-  - GCN or GraphSAGE: `d_gnn = g_L`
-- `C_clf`: classifier latent dimension, equal to the last value in `clf_hidden`
-- `K_slide`: number of slide/batch domains
-- `K_cancer`: number of cancer-type domains
+- `N`：空间点/node 数
+- `G`：输入基因数
+- `D_gene`：基因预处理输出维度
+  - `use_pca=True` 时为 `pca_dim`
+  - `use_pca=False` 时为实际 HVG/基因数量
+- `D_img`：图像预处理输出维度
+  - `img_use_pca=True` 时为图像 PCA 维度
+  - `img_use_pca=False` 时为原始图像特征维度
+- `K`：LapPE 维度，即 `lap_pe_dim`
+- `E`：PyG 图边数；KNN 边会加入反向边
+- `H`：GATv2 注意力头数
+- `g_i`：第 `i` 个 GNN layer 的隐藏维度
+- `d_gnn`：GNN 编码输出维度
+  - GATv2：最后一层 `g_L * H`
+  - GCN/SAGE：最后一层 `g_L`
+- `C_clf`：分类头最后一层隐藏维度，即 `clf_hidden[-1]`
 
-Final node input dimension:
+`early_concat` 模式的节点输入：
+
+```text
+x = [Xp_gene]
+if use_image_features: x = [Xp_gene, Xp_img, img_mask_col]
+if concat_lap_pe and PE exists: x = [previous_x, PE]
+```
+
+维度：
 
 ```text
 D_in = D_gene
      + I_image * (D_img + 1)
-     + I_lap_concat * K
+     + I_lap * K
 ```
 
-Where:
+`dual_branch_residual_gate` 模式的图字段：
 
-- `I_image = 1` only when `use_image_features=True`; the extra `+1` is the appended `img_mask` column.
-- `I_lap_concat = 1` only when `lap_pe_dim>0`, PE is computed, and `concat_lap_pe=True`.
+```text
+x      = Xp_gene
+x_gene = Xp_gene
+x_img  = Xp_img
+img_mask = img_mask
+pe_gene = PE          # 仅在 concat_lap_pe=True 且 PE 存在时写入
+```
+
+该模式中 `pe_gene` 在 `STOnco_Classifier.encode(...)` 内部拼到 `x_gene` 上。
 
 ---
 
-## 3. Data and Feature Construction
+## 3. 数据、特征和图构建
 
-### 3.1 Inputs
+### 3.1 输入数据
 
-Training NPZ path uses batched arrays such as:
+训练 NPZ 使用：
 
-- Gene expression: `Xs`, each slide `X in R^(N x G)`
-- Coordinates: `xys`, each slide `xy in R^(N x 2)`
-- Labels: `ys`, each slide `y in {0,1,-1}^N`
-- Slide IDs: `slide_ids`
-- Gene names: `gene_names`
-- Optional image features when `use_image_features=True`: `X_imgs`, `img_masks`, `img_feature_names`
+- `Xs`：每张切片的表达矩阵
+- `xys`：每张切片的二维坐标
+- `ys`：空间点标签
+- `slide_ids`
+- `gene_names`
+- 可选图像字段：`X_imgs`、`img_masks`、`img_feature_names`
 
-Single-slide inference NPZ uses keys such as `X`, `xy`, `gene_names`, and optional image keys. If a trained image-fusion model receives an inference slide without image keys, inference falls back to zero image features and `img_mask=0`.
+标签约定：
 
-Label convention:
+- `1`：肿瘤
+- `0`：非肿瘤
+- `-1`：无标签；训练 BCE 中被 mask 掉
 
-- `y=1`: tumor
-- `y=0`: non-tumor
-- `y=-1`: unlabeled node; excluded from task BCE loss
+### 3.2 基因预处理
 
-### 3.2 Gene Preprocessing
+`Preprocessor` 当前流程：
 
-Module: `Preprocessor` in `stonco/utils/preprocessing.py`
+实际作用：将不同切片的原始表达矩阵转换到同一套基因特征空间，并保存训练时拟合出的 HVG 列表、scaler 和 PCA 信息，供推理复用。
 
-Current processing sequence:
+1. 文库大小归一化到 `norm_target=1e4`
+2. 可选 `log1p`
+3. HVG 选择：Scanpy `seurat_v3` 可用时使用 Scanpy，否则按方差排序
+4. 1%/99% 分位数截断
+5. `StandardScaler`
+6. clip 到 `[-zclip, zclip]`
+7. 可选 PCA
 
-1. Library-size normalization to CP10K.
-2. Optional `log1p` transform (`do_log1p=True` by default).
-3. HVG selection using Scanpy `seurat_v3` if available; otherwise top variance genes.
-4. Percentile clipping at 1% and 99%.
-5. StandardScaler Z-score normalization.
-6. Clip normalized values to `[-zclip, zclip]`.
-7. Optional PCA.
-
-Output:
+输出：
 
 ```text
 Xp_gene in R^(N x D_gene)
 ```
 
-Important current default:
+### 3.3 图像特征预处理
 
-- `n_hvg='all'`
-- `use_pca=False`
-- Therefore the default gene feature dimension is all selected genes, not `pca_dim=64`.
+`ImagePreprocessor` 只在 `use_image_features=True` 时使用。
 
-### 3.3 Optional Image Feature Preprocessing
+实际作用：只用 `img_mask==1` 的空间点拟合图像特征预处理器；transform 时保持空间点数量不变，使没有有效图像特征的位置为零，同时把图像是否可用的信息交给后续融合模块。
 
-Module: `ImagePreprocessor` in `stonco/utils/preprocessing.py`
+当前流程：
 
-Enabled only when `use_image_features=True`.
+1. 用 `img_mask==1` 的行拟合 `StandardScaler`
+2. 可选 PCA
+3. transform 时无效图像行输出为 0
 
-Processing sequence:
-
-1. Use `img_mask` to select valid image-feature rows for fitting.
-2. Fit StandardScaler on valid image features.
-3. Optionally fit PCA (`img_use_pca=True`, default `img_pca_dim=256`).
-4. Transform each slide; invalid image rows become zeros.
-5. Append `img_mask` as a one-column feature.
-
-Output before fusion:
+输出：
 
 ```text
 Xp_img in R^(N x D_img)
-img_mask_col in R^(N x 1)
+img_mask in R^N
 ```
 
-### 3.4 Spatial KNN Graph
+在 `early_concat` 中会额外把 `img_mask` 作为一列拼入 `x`；在 `dual_branch_residual_gate` 中 `img_mask` 作为单独字段进入模型。
 
-Module: `GraphBuilder.build_knn(...)`
+### 3.4 空间 KNN 图
 
-Steps:
+`GraphBuilder.build_knn(...)`：
 
-1. Build KNN graph on spatial coordinates `xy`, using `knn_k`.
-2. Compute Gaussian edge weights:
+实际作用：把每张切片的空间点坐标转换为空间邻接关系，让后续 GNN 在局部空间邻域内聚合信息；`edge_weight` 记录空间距离对应的 Gaussian 权重。
+
+1. 在 `xy` 上构建 `knn_k + 1` 近邻，跳过自身
+2. 计算 Gaussian `edge_weight`
+3. 加入反向边
 
 ```text
-w_ij = exp(- ||xy_i - xy_j||^2 / (2*sigma^2))
+w_ij = exp(- ||xy_i - xy_j||^2 / (2 * sigma^2))
 sigma = gaussian_sigma_factor * mean(nearest-neighbor distance)
-```
-
-3. Symmetrize by adding reverse edges.
-
-PyG graph tensors:
-
-```text
 edge_index in N^(2 x E)
 edge_weight in R^E
 ```
 
-Backbone-specific use of `edge_weight`:
+主干网络对 `edge_weight` 的使用：
 
-- GATv2 ignores `edge_weight`; it uses `edge_index`.
-- GCN receives `edge_weight` when available.
-- GraphSAGE uses the custom `WeightedSAGEConv`, which performs an edge-weighted neighbor mean.
+- GATv2：不使用 `edge_weight`
+- GCN：传入 `GCNConv`
+- SAGE：传入自定义 `WeightedSAGEConv`
 
-### 3.5 Optional Laplacian Positional Encoding
+### 3.5 LapPE
 
-Module: `GraphBuilder.lap_pe(...)`
+`GraphBuilder.lap_pe(...)` 只在 `lap_pe_dim > 0` 时调用。
 
-Enabled only when `lap_pe_dim > 0`.
+实际作用：从当前切片的图结构中计算节点位置编码；是否真正进入模型输入由 `concat_lap_pe` 控制。
 
-Current behavior:
+当前行为：
 
-- Computes normalized Laplacian eigenvector PE with shape `PE in R^(N x K)`.
-- Uses an unweighted adjacency by default.
-- Uses Gaussian edge weights only when `lap_pe_use_gaussian=True`.
-- PE is appended to node features only when `concat_lap_pe=True`.
-
-Feature assembly order in `build_node_features_early_fusion(...)`:
-
-```text
-x = [Xp_gene]
-if image fusion: x = [Xp_gene, Xp_img, img_mask_col]
-if LapPE concat: x = [previous_x, PE]
-```
-
-Output:
-
-```text
-x in R^(N x D_in)
-```
+- 计算归一化图拉普拉斯矩阵的小特征值对应特征向量
+- 默认使用无权邻接矩阵
+- `lap_pe_use_gaussian=True` 且提供 `edge_weight` 时使用 Gaussian 权重
+- 只有 `concat_lap_pe=True` 时才写入模型输入字段
 
 ---
 
-## 4. Model Architecture: `STOnco_Classifier`
+## 4. STOnco_Classifier
 
-### 4.1 GNN Backbone
+### 4.1 GNNBackbone
 
-Module: `GNNBackbone`
+`GNNBackbone.forward(...)`：
 
-Forward:
-
-```text
-h = GNNBackbone(x, edge_index, edge_weight)
-```
-
-Each GNN layer applies:
+实际作用：作为 STOnco 的图编码器，在 KNN 空间图上把每个空间点的输入特征编码为共享节点表示 `h`。后续分类头、域头、MMD 和 WB 都使用这个表示或由它派生的表示。
 
 ```text
-graph convolution -> ReLU -> LayerNorm -> Dropout
+h = x
+对每一层:
+    图卷积
+    ReLU
+    LayerNorm
+    Dropout
 ```
 
-Backbone choices:
+当传入 `node_mask` 时，会在每层前后把被 mask 的节点特征置零；当前主要用于双分支图像 GNN。
 
-| `model` | Layer implementation | Layer output dim | Edge weights |
+| `model` | 层实现 | 输出维度 | 边权重 |
 |---|---|---:|---|
-| `gatv2` | `GATv2Conv(dim_prev, g_i, heads=H, concat=True)` | `g_i * H` | ignored |
-| `gcn` | `GCNConv(dim_prev, g_i)` | `g_i` | used when provided |
-| `sage` | custom `WeightedSAGEConv(dim_prev, g_i)` | `g_i` | used for weighted mean |
+| `gatv2` | `GATv2Conv(..., heads=H, concat=True)` | `g_i * H` | 不使用 |
+| `gcn` | `GCNConv(...)` | `g_i` | 使用 |
+| `sage` | `WeightedSAGEConv(...)` | `g_i` | 使用加权邻居均值 |
 
-Backbone output:
+### 4.2 早期拼接模式
+
+默认 `image_fusion_mode='early_concat'`：
+
+实际作用：在进入 GNN 前完成特征级拼接。模型只看到一个统一的节点特征矩阵 `x`，不会在模型内部区分基因和图像分支。
 
 ```text
-h in R^(N x d_gnn)
+x -> GNNBackbone -> h
 ```
 
-### 4.2 Tumor / Non-Tumor Task Head
+其中 `x` 已经在预处理阶段拼好可用的基因、图像 mask、图像特征和 LapPE。
 
-Module: `ClassifierHead`
+### 4.3 双分支残差门控模式
 
-Config:
+`image_fusion_mode='dual_branch_residual_gate'` 时，模型包含：
 
-- `clf_hidden`, default `[256, 128, 64]`
-- Dropout inside the classifier is currently fixed to `0.1` when constructed by `STOnco_Classifier`
+实际作用：分别用基因 GNN 和图像 GNN 编码两类输入，再由 `ResidualGatedFusion` 根据 `img_mask` 和 gate 值决定每个空间点的图像残差信息是否以及多大程度加入基因表示。
 
-Forward:
+- `gnn_gene = GNNBackbone(...)`
+- `gnn_img = GNNBackbone(...)`
+- `fusion = ResidualGatedFusion(...)`
+
+编码流程：
 
 ```text
-h -> Linear/BN/ReLU/Dropout blocks -> z_clf -> fc_out -> logits
+x_gene (+ pe_gene) -> gnn_gene -> h_gene
+x_img * img_mask   -> gnn_img  -> h_img
+h_gene, h_img, img_mask -> ResidualGatedFusion -> h
 ```
 
-Shapes:
+`ResidualGatedFusion` 当前结构：
 
 ```text
-z_clf in R^(N x C_clf)
+u_img = Linear(h_img) * img_mask
+gate = sigmoid(MLP([LayerNorm(h_gene), LayerNorm(u_img), img_mask])) * img_mask
+h = h_gene + gate * u_img
+```
+
+该模式要求 `use_image_features=True`，并且 forward 时提供 `x_gene`、`x_img`、`img_mask`。
+
+### 4.4 ClassifierHead
+
+分类头接在共享节点表示 `h` 后：
+
+实际作用：把图编码器输出的每个空间点表示转换为二分类 logit；训练时用于 BCE loss，推理时经 sigmoid 变成肿瘤概率。
+
+```text
+h -> [Linear -> BatchNorm1d -> ReLU -> Dropout] * len(clf_hidden)
+  -> z_clf
+  -> Linear(..., 1)
+  -> logits
+```
+
+输出：
+
+```text
 logits in R^N
 p_tumor = sigmoid(logits)
 ```
 
-Compatibility note:
+`forward(..., return_z=True)` 返回 `z_clf`；当 `z_clf.shape[1] == 64` 时兼容性地额外返回 `z64`。`forward(..., return_h=True)` 返回共享表示 `h`。
 
-- `forward(..., return_z=True)` returns `out['z_clf']`.
-- It also returns `out['z64']` only when `C_clf == 64`.
-- Therefore figure labels should use `z_clf` unless the plotted configuration fixes `clf_hidden[-1]=64`.
+### 4.5 可选域头
 
-### 4.3 Optional Dual-Domain Adversarial Heads
+`STOnco_Classifier` 可以构建两个独立域分类头：
 
-Modules:
+实际作用：仅在训练时启用，用 GRL 反向连接到共享表示 `h`，让主编码器在优化任务分类的同时接受域对抗梯度。推理预测不依赖这些域头输出。
 
-- `DomainHead` for slide/batch domain
-- `DomainHead` for cancer-type domain
-- `grad_reverse(...)` implemented by `GradientReversalFunction`
+- `dom_slide`
+- `dom_cancer`
 
-Each domain head is:
+构建条件：
 
 ```text
-Linear(d_gnn, dom_hidden) -> ReLU -> Linear(dom_hidden, n_domains)
+use_domain_adv_slide=True  and n_domains_slide  is not None and > 0
+use_domain_adv_cancer=True and n_domains_cancer is not None and > 0
 ```
 
-Training branches:
+`DomainHead` 结构：
 
 ```text
-h -- GRL(beta_slide)  -> Slide/Batch DomainHead -> dom_logits_slide  in R^(N x K_slide)
-h -- GRL(beta_cancer) -> Cancer-Type DomainHead -> dom_logits_cancer in R^(N x K_cancer)
+Linear(d_gnn, dom_hidden) -> ReLU -> Dropout -> Linear(dom_hidden, n_domains)
 ```
 
-The two heads are independent parallel classifiers attached to the same shared node embedding `h`.
-
-Current code behavior:
-
-- Both domain heads are disabled unless explicitly enabled in config and the corresponding domain count is known.
-- The cancer-domain head is also used when `use_wb_align=True`, because the WB path needs cancer-domain labels.
-
-Inference note:
-
-- Inference constructs the model for the task path and loads weights with `strict=False`.
-- Domain heads are not needed for prediction.
-- When `image_fusion_mode='dual_branch_residual_gate'`, inference must provide `x_gene`, `x_img`, and `img_mask`.
-
-### 4.4 Optional Return of Shared Embedding
-
-`STOnco_Classifier.forward(..., return_h=True)` adds:
+forward 中连接方式：
 
 ```text
-out['h'] = h
+h -> grad_reverse(beta_slide)  -> dom_slide  -> dom_logits_slide
+h -> grad_reverse(beta_cancer) -> dom_cancer -> dom_logits_cancer
 ```
-
-This is used by MMD training and downstream embedding export/analysis paths.
 
 ---
 
-## 5. Training Objective
+## 5. 训练损失
 
-Losses are computed in `stonco/core/train.py`.
+损失在 `stonco/core/train.py` 中计算，不属于 `STOnco_Classifier` 内部成员。
 
-### 5.1 Task Loss
-
-Spot-level binary classification:
+### 5.1 任务 BCE
 
 ```text
-L_task = BCEWithLogits(logits[y>=0], y[y>=0])
+mask = y >= 0
+L_task = BCEWithLogits(logits[mask], y[mask])
 ```
 
-Unlabeled nodes (`y=-1`) are masked out.
+若一个 batch 中没有带标签节点，代码令 `L_task=0`。
 
-### 5.2 Domain Adversarial Losses
+### 5.2 域对抗 CE
 
-Domain labels are graph-level fields:
-
-- `bat_dom`: slide/batch domain index
-- `cancer_dom`: cancer-type domain index
-
-During mini-batch training, graph-level labels are expanded to nodes using `batch.batch`:
+若对应域头存在，图级域标签通过 `batch.batch` 展开到节点：
 
 ```text
 slide_target_nodes  = batch.bat_dom[batch.batch]
 cancer_target_nodes = batch.cancer_dom[batch.batch]
 ```
 
-Optimization uses CrossEntropyLoss. When domain class weights are available, the optimized CE uses graph-frequency weights:
+损失项：
 
 ```text
-w_domain = sqrt(n_graph / (n_domain * graph_count_domain))
+L_slide  = lambda_slide  * CrossEntropy(dom_logits_slide, slide_target_nodes)
+L_cancer = lambda_cancer * CrossEntropy(dom_logits_cancer, cancer_target_nodes)
 ```
 
-Weights are clamped to `[0.5, 5.0]` and mean-normalized.
+训练中可以使用由图数量统计得到的类别权重。GRL beta 支持 `dann`、`constant`、`linear` 三种模式。
 
-Weighted loss terms:
+### 5.3 MMD
 
-```text
-L_slide  = lambda_slide  * CE_weighted(dom_logits_slide,  slide_target_nodes)
-L_cancer = lambda_cancer * CE_weighted(dom_logits_cancer, cancer_target_nodes)
-```
+`use_mmd=True` 时，模型 forward 使用 `return_h=True`，MMD 在共享表示 `h` 上计算。
 
-GRL beta schedule:
+实际作用：作为训练阶段的额外对齐损失，按配置在切片域、癌种域或两者之间约束 `h` 的分布差异。
 
-- `grl_beta_mode='dann'` (default): delayed DANN curve from 0 to the target beta.
-- `grl_beta_mode='constant'`: beta equals the target value for all steps.
-- `grl_beta_mode='linear'`: delayed linear warm-up to the target beta.
+配置项：
 
-Defaults:
+- `mmd_on`: `slide`、`cancer`、`both`
+- `lambda_mmd`
+- `mmd_num_kernels`
+- `mmd_kernel_mul`
+- `mmd_sigma`
+- `mmd_max_pairs`
+- `mmd_spots_per_slide`
 
-- `beta_slide_target = 1.0`
-- `beta_cancer_target = 0.5`
-- slide delay = 1 epoch
-- cancer delay = 3 epochs
+### 5.4 WB 对齐
 
-### 5.3 Optional MMD Alignment
+`use_wb_align=True` 时，训练代码额外构建：
 
-Enabled only when `use_mmd=True`.
+实际作用：作为训练阶段的额外对齐模块，使用 `GeneratedSupportMap` 或 `PriorSupportGenerator` 生成支撑集，再由 `GeneratedSupportWBLoss` 在癌种域标签下计算 WB 相关损失。
 
-MMD operates on the shared GNN embedding `h`, not on `z_clf`.
+- `GeneratedSupportMap` 或 `PriorSupportGenerator`
+- `GeneratedSupportWBLoss`
 
-Config:
+WB 同样使用共享表示 `h`，并依赖 `cancer_dom` 展开后的节点级癌种标签。它不是 `STOnco_Classifier` 的子模块。
 
-- `mmd_on`: `slide`, `cancer`, or `both`
-- `lambda_mmd`: default `0.05`
-- multi-kernel RBF MMD with configurable `mmd_num_kernels`, `mmd_kernel_mul`, and optional fixed `mmd_sigma`
-- optional `mmd_spots_per_slide` node sampling
-- optional `mmd_max_pairs` cap on domain pairs per batch
+### 5.5 总损失
 
-Loss:
-
-```text
-L_mmd = lambda_mmd * MMD_slide   if mmd_on in {slide, both}
-      + lambda_mmd * MMD_cancer  if mmd_on in {cancer, both}
-```
-
-### 5.4 Total Training Loss
-
-Only enabled terms are present:
+训练中总损失按已启用项累加：
 
 ```text
 L_total = L_task
-        + L_slide
-        + L_cancer
-        + L_mmd
+        + enabled(L_slide)
+        + enabled(L_cancer)
+        + enabled(L_mmd)
+        + enabled(L_wb)
 ```
 
-For the default training configuration, this reduces to:
+默认配置下：
 
 ```text
 L_total = L_task
-        + lambda_slide  * L_slide_CE
-        + lambda_cancer * L_cancer_CE
 ```
 
-because MMD is off by default.
+---
+
+## 6. 推理路径
+
+`InferenceEngine` 当前流程：
+
+实际作用：把训练产物中的 `cfg`、预处理器和模型权重串起来，保证推理时的基因空间、图像特征处理、图构建方式和模型结构与训练保存的配置一致。
+
+1. 从 `artifacts_dir/meta.json` 读取 `cfg`
+2. 载入 `Preprocessor`
+3. 若 `use_image_features=True`，载入 `ImagePreprocessor`
+4. 对输入 NPZ 计算 `Xp_gene` 和可选 `Xp_img`
+5. 构建 KNN 图、可选 LapPE、PyG fields
+6. 用首个图的维度延迟构建 `STOnco_Classifier`
+7. `load_model_strict(...)` 以 `strict=True` 加载 `model.pt`
+8. 输出 `sigmoid(logits)`
+
+推理使用和训练相同的模型构建工具 `build_stonco_model_from_cfg(...)`。
 
 ---
 
-## 6. Paper Figure Layout
+## 7. 图示标签
 
-### Recommended three-panel figure
+可用于图中的简短标签：
 
-**(a) Feature and graph construction**
-
-- `X -> gene preprocessing -> Xp_gene`
-- Optional `X_img, img_mask -> image preprocessing -> Xp_img, img_mask_col`
-- `xy -> spatial KNN -> edge_index, edge_weight`
-- Optional `edge_index (+ edge_weight) -> LapPE -> PE`
-- Concatenate enabled node features into `x`
-
-**(b) STOnco encoder and task head**
-
-- `x` for `early_concat`, or `(x_gene, x_img, img_mask)` for `dual_branch_residual_gate`
-- `x, edge_index, optional edge_weight -> configurable GNN backbone -> h`
-- `h -> classifier MLP -> logits -> p_tumor`
-
-**(c) Training-only adaptation losses**
-
-- `h -> GRL(beta_slide) -> slide/batch domain head -> CE`
-- `h -> GRL(beta_cancer) -> cancer-type domain head -> CE`
-- Optional `h -> multi-domain RBF MMD`
-- Optional `h -> generated-support WB` when `use_wb_align=True`
-- Combine enabled losses into `L_total`
+- 任务：`泛癌种空间转录组癌灶区域识别`
+- 输出：`空间点级 p_tumor`
+- 基因预处理：`CP10K + log1p + HVG/全基因 + Z-score + 可选 PCA`
+- 图像预处理：`有效图像特征标准化 + 可选 PCA`
+- 图结构：`空间 KNN 图`
+- 边权重：`Gaussian edge_weight`
+- LapPE：`可选 Laplacian PE`
+- 编码器：`共享空间点编码器：GATv2 / GCN / Weighted GraphSAGE`
+- 早期融合：`拼接已启用的节点特征`
+- 双分支融合：`基因 GNN + 图像 GNN + 残差门控`
+- 共享表示：`h：共享空间点表示`
+- 分类头：`MLP 分类器 -> 肿瘤 logit`
+- GRL：`梯度反转`
+- 域头：`切片/批次域头`、`癌种域头`
+- MMD：`h 上的训练期 MMD`
+- WB：`h 上的训练期 WB 对齐`
 
 ---
 
-## 7. Figure Labels
-
-Suggested English labels:
-
-- **Gene preprocessing**: "CP10K + log1p + HVG/all genes + Z-score + optional PCA"
-- **Image preprocessing**: "Image features + mask, optional PCA"
-- **Feature fusion**: "Early fusion: concat enabled node features"
-- **Graph**: "Spatial KNN graph"
-- **Edge weight**: "Gaussian edge weight"
-- **LapPE**: "Optional Laplacian positional encoding"
-- **Backbone**: "Configurable GNN encoder: GATv2 / GCN / GraphSAGE"
-- **Task head**: "MLP classifier -> tumor probability"
-- **GRL**: "Gradient Reversal Layer"
-- **Domain heads**: "Slide/Batch domain classifier", "Cancer-type domain classifier"
-- **MMD**: "Optional multi-domain RBF MMD on h"
-- **WB**: "Optional generated-support Wasserstein barycenter alignment on h"
-
-Caption note:
-
-- "GATv2 ignores Gaussian edge weights; GCN and weighted GraphSAGE consume them."
-
----
-
-## 8. Mermaid Draft
-
-Paste into a Mermaid renderer and export SVG.
+## 8. Mermaid 草稿
 
 ```mermaid
 flowchart LR
-  %% ===== Inputs =====
-  X["Expression X<br/>(N x G)"] --> GP
-  XY["Coordinates xy<br/>(N x 2)"] --> KNN
-  IMG["Image features<br/>(optional)"] -.-> IP
-  IMGM["img_mask<br/>(optional)"] -.-> IP
+  X["表达矩阵 X<br/>(N x G)"] --> GP
+  XY["空间坐标 xy<br/>(N x 2)"] --> KNN
+  IMG["图像特征<br/>(可选)"] -.-> IP
+  IMGM["img_mask<br/>(可选)"] -.-> IP
 
-  %% ===== Feature Construction =====
-  subgraph S1["Feature Construction"]
-    GP["Gene preprocessing<br/>CP10K + log1p + HVG/all genes + Z-score + optional PCA"]
+  subgraph F["特征构建"]
+    GP["Preprocessor<br/>CP10K + log1p + HVG/全基因<br/>截断 + Z-score + 可选 PCA"]
     XG["Xp_gene<br/>(N x D_gene)"]
-    IP["Image preprocessing<br/>scale + optional PCA"]
-    XI["Xp_img + img_mask_col<br/>(optional)"]
-    FEAT["Node feature x<br/>concat enabled features"]
-    GP --> XG --> FEAT
-    IP -. "if use_image_features" .-> XI -.-> FEAT
+    IP["ImagePreprocessor<br/>有效行标准化 + 可选 PCA"]
+    XI["Xp_img<br/>(N x D_img)"]
+    FE["early_concat x<br/>[基因, 可选图像, 可选 mask, 可选 PE]"]
+    DF["dual_branch 字段<br/>x_gene, x_img, img_mask, 可选 pe_gene"]
+    GP --> XG
+    XG --> FE
+    XG --> DF
+    IP -. "use_image_features=True" .-> XI
+    XI -.-> FE
+    XI -.-> DF
+    IMGM -.-> FE
+    IMGM -.-> DF
   end
 
-  %% ===== Graph Construction =====
-  subgraph S2["Graph Construction"]
-    KNN["Spatial KNN<br/>(k = knn_k)"]
-    EI["edge_index<br/>(2 x E)"]
-    EW["edge_weight<br/>Gaussian (E)"]
-    LPE["LapPE<br/>(optional, N x K)"]
+  subgraph G["图构建"]
+    KNN["空间 KNN"]
+    EI["edge_index"]
+    EW["edge_weight<br/>Gaussian"]
+    PE["LapPE<br/>(可选)"]
     KNN --> EI
     KNN --> EW
-    EI -. "if lap_pe_dim > 0" .-> LPE
-    EW -. "optional weighted LapPE" .-> LPE
+    EI -. "lap_pe_dim > 0" .-> PE
+    EW -. "lap_pe_use_gaussian=True" .-> PE
   end
 
-  LPE -. "if concat_lap_pe" .-> FEAT
+  PE -. "concat_lap_pe" .-> FE
+  PE -. "concat_lap_pe" .-> DF
 
-  %% ===== Model =====
-  subgraph S3["STOnco_Classifier"]
-    B["GNN backbone<br/>GATv2 / GCN / GraphSAGE"]
-    H["shared node embedding h<br/>(N x d_gnn)"]
-    CLF["ClassifierHead<br/>MLP"]
-    LOG["logits<br/>(N)"]
-    PROB["p_tumor = sigmoid(logits)"]
+  subgraph M["STOnco_Classifier：泛癌种空间点级癌灶识别器"]
+    GNN["共享空间点编码器<br/>GATv2 / GCN / WeightedSAGE"]
+    GG["基因 GNN"]
+    IG["图像 GNN"]
+    RG["ResidualGatedFusion"]
+    H["h<br/>共享空间点表示"]
+    CLF["ClassifierHead"]
+    LOG["每个空间点的肿瘤 logit"]
+    PROB["p_tumor = sigmoid(logit)"]
+    DS["切片/批次 DomainHead<br/>(可选)"]
+    DC["癌种 DomainHead<br/>(可选)"]
 
-    FEAT --> B
-    EI --> B
-    EW -. "GCN/SAGE only" .-> B
-    B --> H --> CLF --> LOG --> PROB
-
-    GRLS["GRL beta_slide"]
-    DHS["Slide/Batch DomainHead<br/>(training optional)"]
-    GRLC["GRL beta_cancer"]
-    DHC["Cancer-Type DomainHead<br/>(training optional)"]
-    MMD["Multi-domain RBF MMD<br/>(optional)"]
-
-    H -.-> GRLS --> DHS
-    H -.-> GRLC --> DHC
-    H -. "if use_mmd" .-> MMD
+    FE --> GNN --> H
+    DF --> GG --> RG
+    DF --> IG --> RG
+    RG --> H
+    EI --> GNN
+    EW -. "GCN/SAGE 使用" .-> GNN
+    EI --> GG
+    EI --> IG
+    EW -. "GCN/SAGE 使用" .-> GG
+    EW -. "GCN/SAGE 使用" .-> IG
+    H --> CLF --> LOG --> PROB
+    H -. "GRL beta_slide" .-> DS
+    H -. "GRL beta_cancer" .-> DC
   end
 
-  %% ===== Losses =====
-  subgraph S4["Training Objective"]
-    LT["L_task<br/>BCEWithLogits on labeled nodes"]
-    LS["lambda_slide * CE_slide"]
-    LC["lambda_cancer * CE_cancer"]
-    LM["lambda_mmd * MMD"]
-    LALL["L_total<br/>sum of enabled losses"]
-
-    LOG --> LT
-    DHS --> LS
-    DHC --> LC
-    MMD --> LM
-    LT --> LALL
-    LS --> LALL
-    LC --> LALL
-    LM --> LALL
+  subgraph L["训练损失：任务损失 + 可选泛化约束"]
+    LT["带标签节点 BCE"]
+    LS["lambda_slide * CE"]
+    LC["lambda_cancer * CE"]
+    LM["h 上的 MMD<br/>(可选)"]
+    LW["h 上的 WB 对齐<br/>(可选)"]
+    SUM["已启用损失求和"]
+    LOG --> LT --> SUM
+    DS --> LS --> SUM
+    DC --> LC --> SUM
+    H -. "use_mmd" .-> LM --> SUM
+    H -. "use_wb_align" .-> LW --> SUM
   end
 ```
 
 ---
 
-## 9. Graphviz DOT Draft
+## 9. Graphviz DOT 草稿
 
 ```dot
 digraph STOnco {
   rankdir=LR;
   labelloc="t";
-  label="STOnco Current Architecture: Configurable GNN + Optional Fusion, Domain Adversarial Learning, and MMD";
+  label="STOnco 当前代码结构：泛癌种空间转录组癌灶区域识别";
 
   node [shape=box, style="rounded", fontsize=10];
   edge [fontsize=9];
 
   subgraph cluster_features {
-    label="Feature Construction";
-    X [label="Expression X\n(N x G)"];
-    GP [label="Gene preprocessing\nCP10K + log1p + HVG/all genes\nZ-score + optional PCA"];
-    XG [label="Xp_gene\n(N x D_gene)"];
-    IMG [label="Image features\noptional"];
-    MASK [label="img_mask\noptional"];
-    IP [label="Image preprocessing\nscale + optional PCA"];
-    XI [label="Xp_img + img_mask_col\noptional"];
-    FEAT [label="Node feature x\nconcat enabled features"];
+    label="特征构建";
+    X [label="表达矩阵 X"];
+    GP [label="Preprocessor\nCP10K + log1p + HVG/全基因\n截断 + Z-score + 可选 PCA"];
+    XG [label="Xp_gene"];
+    IMG [label="图像特征\n可选"];
+    MASK [label="img_mask\n可选"];
+    IP [label="ImagePreprocessor\n有效行标准化 + 可选 PCA"];
+    XI [label="Xp_img"];
+    FE [label="early_concat x"];
+    DF [label="dual_branch 字段\nx_gene, x_img, img_mask, 可选 pe_gene"];
 
-    X -> GP -> XG -> FEAT;
-    IMG -> IP [style=dashed, label="if use_image_features"];
+    X -> GP -> XG;
+    XG -> FE;
+    XG -> DF;
+    IMG -> IP [style=dashed, label="use_image_features=True"];
     MASK -> IP [style=dashed];
     IP -> XI [style=dashed];
-    XI -> FEAT [style=dashed];
+    XI -> FE [style=dashed];
+    XI -> DF [style=dashed];
+    MASK -> FE [style=dashed];
+    MASK -> DF [style=dashed];
   }
 
   subgraph cluster_graph {
-    label="Graph Construction";
-    XY [label="Coordinates xy\n(N x 2)"];
-    KNN [label="Spatial KNN\n(k = knn_k)"];
-    EI [label="edge_index\n(2 x E)"];
-    EW [label="edge_weight\nGaussian (E)"];
-    LPE [label="LapPE\noptional (N x K)"];
+    label="图构建";
+    XY [label="空间坐标 xy"];
+    KNN [label="空间 KNN"];
+    EI [label="edge_index"];
+    EW [label="edge_weight\nGaussian"];
+    PE [label="LapPE\n可选"];
 
     XY -> KNN -> EI;
     KNN -> EW;
-    EI -> LPE [style=dashed, label="if lap_pe_dim > 0"];
-    EW -> LPE [style=dashed, label="optional weighted LapPE"];
+    EI -> PE [style=dashed, label="lap_pe_dim > 0"];
+    EW -> PE [style=dashed, label="lap_pe_use_gaussian=True"];
   }
 
-  LPE -> FEAT [style=dashed, label="if concat_lap_pe"];
+  PE -> FE [style=dashed, label="concat_lap_pe"];
+  PE -> DF [style=dashed, label="concat_lap_pe"];
 
   subgraph cluster_model {
-    label="STOnco_Classifier";
-    B [label="GNN backbone\nGATv2 / GCN / GraphSAGE"];
-    H [label="Shared embedding h\n(N x d_gnn)"];
-    CLF [label="ClassifierHead\nMLP"];
-    LOG [label="logits\n(N)"];
-    PROB [label="p_tumor = sigmoid(logits)"];
+    label="STOnco_Classifier：空间点级癌灶识别器";
+    GNN [label="共享空间点编码器\nGATv2 / GCN / WeightedSAGE"];
+    GG [label="基因 GNN"];
+    IG [label="图像 GNN"];
+    RG [label="ResidualGatedFusion"];
+    H [label="h\n共享空间点表示"];
+    CLF [label="ClassifierHead"];
+    LOG [label="每个空间点的肿瘤 logit"];
+    PROB [label="p_tumor = sigmoid(logit)"];
+    DS [label="切片/批次 DomainHead\n可选"];
+    DC [label="癌种 DomainHead\n可选"];
 
-    FEAT -> B;
-    EI -> B;
-    EW -> B [style=dashed, label="GCN/SAGE only"];
-    B -> H -> CLF -> LOG -> PROB;
-
-    GRLS [label="GRL beta_slide"];
-    DHS [label="Slide/Batch DomainHead\ntraining optional"];
-    GRLC [label="GRL beta_cancer"];
-    DHC [label="Cancer-Type DomainHead\ntraining optional"];
-    MMD [label="Multi-domain RBF MMD\noptional"];
-
-    H -> GRLS [style=dashed];
-    GRLS -> DHS;
-    H -> GRLC [style=dashed];
-    GRLC -> DHC;
-    H -> MMD [style=dashed, label="if use_mmd"];
+    FE -> GNN -> H;
+    DF -> GG -> RG;
+    DF -> IG -> RG -> H;
+    EI -> GNN;
+    EW -> GNN [style=dashed, label="GCN/SAGE 使用"];
+    EI -> GG;
+    EI -> IG;
+    EW -> GG [style=dashed, label="GCN/SAGE 使用"];
+    EW -> IG [style=dashed, label="GCN/SAGE 使用"];
+    H -> CLF -> LOG -> PROB;
+    H -> DS [style=dashed, label="GRL beta_slide"];
+    H -> DC [style=dashed, label="GRL beta_cancer"];
   }
 
-  subgraph cluster_loss {
-    label="Training Objective";
-    LT [label="L_task\nBCEWithLogits"];
-    LS [label="lambda_slide * CE_slide"];
-    LC [label="lambda_cancer * CE_cancer"];
-    LM [label="lambda_mmd * MMD"];
-    LALL [label="L_total\nsum of enabled losses"];
+  subgraph cluster_losses {
+    label="训练损失：任务损失 + 可选泛化约束";
+    LT [label="带标签节点 BCE"];
+    LS [label="lambda_slide * CE"];
+    LC [label="lambda_cancer * CE"];
+    LM [label="h 上的 MMD\n可选"];
+    LW [label="h 上的 WB 对齐\n可选"];
+    SUM [label="已启用损失求和"];
 
-    LOG -> LT;
-    DHS -> LS;
-    DHC -> LC;
-    MMD -> LM;
-    LT -> LALL;
-    LS -> LALL;
-    LC -> LALL;
-    LM -> LALL;
+    LOG -> LT -> SUM;
+    DS -> LS -> SUM;
+    DC -> LC -> SUM;
+    H -> LM [style=dashed, label="use_mmd"];
+    H -> LW [style=dashed, label="use_wb_align"];
+    LM -> SUM;
+    LW -> SUM;
   }
 }
 ```
